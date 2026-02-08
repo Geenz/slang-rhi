@@ -587,8 +587,26 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
         m_renderTargetViews[i] = view;
         m_resolveTargetViews[i] = resolveView;
 
+        // Compute effective subresource range.
+        // If attachment.subresourceRange is explicitly set (non-zero counts), treat it as
+        // view-relative and convert to absolute by adding the view's base offset.
+        // Otherwise, fall back to the view's built-in range.
+        const auto& sr = attachment.subresourceRange;
+        SubresourceRange effectiveRange;
+        if (sr.layerCount > 0 || sr.mipCount > 0)
+        {
+            effectiveRange.layer = view->m_desc.subresourceRange.layer + sr.layer;
+            effectiveRange.layerCount = sr.layerCount > 0 ? sr.layerCount : view->m_desc.subresourceRange.layerCount;
+            effectiveRange.mip = view->m_desc.subresourceRange.mip + sr.mip;
+            effectiveRange.mipCount = sr.mipCount > 0 ? sr.mipCount : view->m_desc.subresourceRange.mipCount;
+        }
+        else
+        {
+            effectiveRange = view->m_desc.subresourceRange;
+        }
+
         // Transition state
-        requireTextureState(view->m_texture, view->m_desc.subresourceRange, ResourceState::RenderTarget);
+        requireTextureState(view->m_texture, effectiveRange, ResourceState::RenderTarget);
         if (resolveView)
             requireTextureState(
                 resolveView->m_texture,
@@ -597,20 +615,20 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
             );
 
         // Determine render area
-        const TextureViewDesc& viewDesc = view->m_desc;
         const TextureDesc& textureDesc = view->m_texture->m_desc;
-        uint32_t width = calcMipSize(textureDesc.size.width, viewDesc.subresourceRange.mip);
-        uint32_t height = calcMipSize(textureDesc.size.height, viewDesc.subresourceRange.mip);
+        uint32_t width = calcMipSize(textureDesc.size.width, effectiveRange.mip);
+        uint32_t height = calcMipSize(textureDesc.size.height, effectiveRange.mip);
         renderArea.extent.width = min(renderArea.extent.width, width);
         renderArea.extent.height = min(renderArea.extent.height, height);
         uint32_t attachmentLayerCount = (textureDesc.type == TextureType::Texture3D)
                                             ? textureDesc.size.depth
-                                            : viewDesc.subresourceRange.layerCount;
+                                            : effectiveRange.layerCount;
         layerCount = max(layerCount, attachmentLayerCount);
 
-        // Create attachment info
+        // Create attachment info — use effective range to get/create VkImageView
         VkRenderingAttachmentInfoKHR attachmentInfo = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
-        attachmentInfo.imageView = checked_cast<TextureViewImpl*>(attachment.view)->getRenderTargetView().imageView;
+        attachmentInfo.imageView = view->m_texture->getView(
+            view->m_desc.format, view->m_desc.aspect, effectiveRange, true).imageView;
         attachmentInfo.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         if (attachment.resolveTarget)
         {
@@ -635,41 +653,55 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
 
         m_depthStencilView = checked_cast<TextureViewImpl*>(desc.depthStencilAttachment->view);
 
+        // Compute effective subresource range (view-relative to absolute).
+        const auto& sr = attachment.subresourceRange;
+        SubresourceRange effectiveRange;
+        if (sr.layerCount > 0 || sr.mipCount > 0)
+        {
+            effectiveRange.layer = view->m_desc.subresourceRange.layer + sr.layer;
+            effectiveRange.layerCount = sr.layerCount > 0 ? sr.layerCount : view->m_desc.subresourceRange.layerCount;
+            effectiveRange.mip = view->m_desc.subresourceRange.mip + sr.mip;
+            effectiveRange.mipCount = sr.mipCount > 0 ? sr.mipCount : view->m_desc.subresourceRange.mipCount;
+        }
+        else
+        {
+            effectiveRange = view->m_desc.subresourceRange;
+        }
+
         // Transition state
         requireTextureState(
             view->m_texture,
-            view->m_desc.subresourceRange,
+            effectiveRange,
             attachment.depthReadOnly ? ResourceState::DepthRead : ResourceState::DepthWrite
         );
 
         // Determine render area
-        const TextureViewDesc& viewDesc = view->m_desc;
         const TextureDesc& textureDesc = view->m_texture->m_desc;
-        uint32_t width = calcMipSize(textureDesc.size.width, viewDesc.subresourceRange.mip);
-        uint32_t height = calcMipSize(textureDesc.size.height, viewDesc.subresourceRange.mip);
+        uint32_t width = calcMipSize(textureDesc.size.width, effectiveRange.mip);
+        uint32_t height = calcMipSize(textureDesc.size.height, effectiveRange.mip);
         renderArea.extent.width = min(renderArea.extent.width, width);
         renderArea.extent.height = min(renderArea.extent.height, height);
 
-        // Create attachment info
+        // Create attachment info — use effective range for VkImageView
         if (isDepthFormat(view->m_texture->m_vkformat))
         {
             hasDepthAttachment = true;
-            const auto& dsa = *desc.depthStencilAttachment;
-            depthAttachmentInfo.imageView = checked_cast<TextureViewImpl*>(dsa.view)->getRenderTargetView().imageView;
+            depthAttachmentInfo.imageView = view->m_texture->getView(
+                view->m_desc.format, view->m_desc.aspect, effectiveRange, true).imageView;
             depthAttachmentInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-            depthAttachmentInfo.loadOp = translateLoadOp(dsa.depthLoadOp);
-            depthAttachmentInfo.storeOp = translateStoreOp(dsa.depthStoreOp);
-            depthAttachmentInfo.clearValue.depthStencil.depth = dsa.depthClearValue;
+            depthAttachmentInfo.loadOp = translateLoadOp(attachment.depthLoadOp);
+            depthAttachmentInfo.storeOp = translateStoreOp(attachment.depthStoreOp);
+            depthAttachmentInfo.clearValue.depthStencil.depth = attachment.depthClearValue;
         }
         if (isStencilFormat(view->m_texture->m_vkformat))
         {
             hasStencilAttachment = true;
-            const auto& dsa = *desc.depthStencilAttachment;
-            stencilAttachmentInfo.imageView = checked_cast<TextureViewImpl*>(dsa.view)->getRenderTargetView().imageView;
+            stencilAttachmentInfo.imageView = view->m_texture->getView(
+                view->m_desc.format, view->m_desc.aspect, effectiveRange, true).imageView;
             stencilAttachmentInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-            stencilAttachmentInfo.loadOp = translateLoadOp(dsa.stencilLoadOp);
-            stencilAttachmentInfo.storeOp = translateStoreOp(dsa.stencilStoreOp);
-            stencilAttachmentInfo.clearValue.depthStencil.stencil = dsa.stencilClearValue;
+            stencilAttachmentInfo.loadOp = translateLoadOp(attachment.stencilLoadOp);
+            stencilAttachmentInfo.storeOp = translateStoreOp(attachment.stencilStoreOp);
+            stencilAttachmentInfo.clearValue.depthStencil.stencil = attachment.stencilClearValue;
         }
     }
 
