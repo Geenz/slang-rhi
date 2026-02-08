@@ -2159,6 +2159,7 @@ struct RenderPassColorAttachment
     LoadOp loadOp = LoadOp::Clear;
     StoreOp storeOp = StoreOp::Store;
     float clearValue[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    SubresourceRange subresourceRange = {};
 };
 
 struct RenderPassDepthStencilAttachment
@@ -2172,6 +2173,7 @@ struct RenderPassDepthStencilAttachment
     StoreOp stencilStoreOp = StoreOp::Store;
     uint8_t stencilClearValue = 0;
     bool stencilReadOnly = false;
+    SubresourceRange subresourceRange = {};
 };
 
 struct RenderPassDesc
