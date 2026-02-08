@@ -44,6 +44,7 @@ public:
     short_vector<RefPtr<TextureViewImpl>> m_renderTargetViews;
     short_vector<RefPtr<TextureViewImpl>> m_resolveTargetViews;
     RefPtr<TextureViewImpl> m_depthStencilView;
+    SubresourceRange m_depthStencilEffectiveRange;
 
     bool m_renderPassActive = false;
     bool m_renderStateValid = false;
@@ -652,22 +653,57 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
     short_vector<D3D12_CPU_DESCRIPTOR_HANDLE> renderTargetDescriptors;
     for (uint32_t i = 0; i < desc.colorAttachmentCount; i++)
     {
-        m_renderTargetViews[i] = checked_cast<TextureViewImpl*>(desc.colorAttachments[i].view);
-        m_resolveTargetViews[i] = checked_cast<TextureViewImpl*>(desc.colorAttachments[i].resolveTarget);
-        requireTextureState(
-            m_renderTargetViews[i]->m_texture,
-            m_renderTargetViews[i]->m_desc.subresourceRange,
-            ResourceState::RenderTarget
+        const auto& attachment = desc.colorAttachments[i];
+        TextureViewImpl* view = checked_cast<TextureViewImpl*>(attachment.view);
+        m_renderTargetViews[i] = view;
+        m_resolveTargetViews[i] = checked_cast<TextureViewImpl*>(attachment.resolveTarget);
+
+        // Compute effective subresource range.
+        // If attachment.subresourceRange is explicitly set (non-zero counts), treat it as
+        // view-relative and convert to absolute by adding the view's base offset.
+        // Otherwise, fall back to the view's built-in range.
+        const auto& sr = attachment.subresourceRange;
+        SubresourceRange effectiveRange;
+        if (sr.layerCount > 0 || sr.mipCount > 0)
+        {
+            effectiveRange.layer = view->m_desc.subresourceRange.layer + sr.layer;
+            effectiveRange.layerCount = sr.layerCount > 0 ? sr.layerCount : view->m_desc.subresourceRange.layerCount;
+            effectiveRange.mip = view->m_desc.subresourceRange.mip + sr.mip;
+            effectiveRange.mipCount = sr.mipCount > 0 ? sr.mipCount : view->m_desc.subresourceRange.mipCount;
+        }
+        else
+        {
+            effectiveRange = view->m_desc.subresourceRange;
+        }
+
+        requireTextureState(view->m_texture, effectiveRange, ResourceState::RenderTarget);
+        renderTargetDescriptors.push_back(
+            view->m_texture->getRTV(view->m_desc.format, view->m_texture->m_desc.type, view->m_desc.aspect, effectiveRange)
         );
-        renderTargetDescriptors.push_back(m_renderTargetViews[i]->getRTV());
     }
     if (desc.depthStencilAttachment)
     {
-        m_depthStencilView = checked_cast<TextureViewImpl*>(desc.depthStencilAttachment->view);
+        const auto& attachment = *desc.depthStencilAttachment;
+        m_depthStencilView = checked_cast<TextureViewImpl*>(attachment.view);
+
+        // Compute effective subresource range (view-relative to absolute).
+        const auto& sr = attachment.subresourceRange;
+        if (sr.layerCount > 0 || sr.mipCount > 0)
+        {
+            m_depthStencilEffectiveRange.layer = m_depthStencilView->m_desc.subresourceRange.layer + sr.layer;
+            m_depthStencilEffectiveRange.layerCount = sr.layerCount > 0 ? sr.layerCount : m_depthStencilView->m_desc.subresourceRange.layerCount;
+            m_depthStencilEffectiveRange.mip = m_depthStencilView->m_desc.subresourceRange.mip + sr.mip;
+            m_depthStencilEffectiveRange.mipCount = sr.mipCount > 0 ? sr.mipCount : m_depthStencilView->m_desc.subresourceRange.mipCount;
+        }
+        else
+        {
+            m_depthStencilEffectiveRange = m_depthStencilView->m_desc.subresourceRange;
+        }
+
         requireTextureState(
             m_depthStencilView->m_texture,
-            m_depthStencilView->m_desc.subresourceRange,
-            desc.depthStencilAttachment->depthReadOnly ? ResourceState::DepthRead : ResourceState::DepthWrite
+            m_depthStencilEffectiveRange,
+            attachment.depthReadOnly ? ResourceState::DepthRead : ResourceState::DepthWrite
         );
     }
 
@@ -675,7 +711,12 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
 
     D3D12_CPU_DESCRIPTOR_HANDLE depthStencilDescriptor = {};
     if (m_depthStencilView)
-        depthStencilDescriptor = m_depthStencilView->getDSV();
+        depthStencilDescriptor = m_depthStencilView->m_texture->getDSV(
+            m_depthStencilView->m_desc.format,
+            m_depthStencilView->m_texture->m_desc.type,
+            m_depthStencilView->m_desc.aspect,
+            m_depthStencilEffectiveRange
+        );
 
     m_cmdList->OMSetRenderTargets(
         (UINT)m_renderTargetViews.size(),
@@ -709,7 +750,12 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
         if (clearFlags)
         {
             m_cmdList->ClearDepthStencilView(
-                m_depthStencilView->getDSV(),
+                m_depthStencilView->m_texture->getDSV(
+                    m_depthStencilView->m_desc.format,
+                    m_depthStencilView->m_texture->m_desc.type,
+                    m_depthStencilView->m_desc.aspect,
+                    m_depthStencilEffectiveRange
+                ),
                 (D3D12_CLEAR_FLAGS)clearFlags,
                 attachment.depthClearValue,
                 attachment.stencilClearValue,

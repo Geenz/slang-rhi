@@ -32,6 +32,7 @@ public:
     short_vector<RefPtr<TextureViewImpl>> m_renderTargetViews;
     short_vector<RefPtr<TextureViewImpl>> m_resolveTargetViews;
     RefPtr<TextureViewImpl> m_depthStencilView;
+    short_vector<WGPUTextureView> m_tempRenderPassViews;
 
     bool m_renderPassActive = false;
     bool m_renderStateValid = false;
@@ -406,12 +407,50 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
 {
     const RenderPassDesc& desc = cmd.desc;
 
+    // Release any lingering temporary views from a previous render pass.
+    for (auto tv : m_tempRenderPassViews)
+        m_ctx.api.wgpuTextureViewRelease(tv);
+    m_tempRenderPassViews.clear();
+
     short_vector<WGPURenderPassColorAttachment, 8> colorAttachments(desc.colorAttachmentCount, {});
     for (uint32_t i = 0; i < desc.colorAttachmentCount; ++i)
     {
         const RenderPassColorAttachment& attachmentIn = desc.colorAttachments[i];
+        TextureViewImpl* view = checked_cast<TextureViewImpl*>(attachmentIn.view);
         WGPURenderPassColorAttachment& attachment = colorAttachments[i];
-        attachment.view = checked_cast<TextureViewImpl*>(attachmentIn.view)->m_textureView;
+
+        // Compute effective subresource range.
+        // If attachment.subresourceRange is explicitly set (non-zero counts), treat it as
+        // view-relative and convert to absolute, then create a temporary WGPUTextureView.
+        // Otherwise, use the view's pre-built WGPUTextureView.
+        const auto& sr = attachmentIn.subresourceRange;
+        if (sr.layerCount > 0 || sr.mipCount > 0)
+        {
+            SubresourceRange effectiveRange;
+            effectiveRange.layer = view->m_desc.subresourceRange.layer + sr.layer;
+            effectiveRange.layerCount = sr.layerCount > 0 ? sr.layerCount : view->m_desc.subresourceRange.layerCount;
+            effectiveRange.mip = view->m_desc.subresourceRange.mip + sr.mip;
+            effectiveRange.mipCount = sr.mipCount > 0 ? sr.mipCount : view->m_desc.subresourceRange.mipCount;
+
+            WGPUTextureViewDescriptor viewDesc = {};
+            Format fmt = view->m_desc.format == Format::Undefined ? view->m_texture->m_desc.format : view->m_desc.format;
+            viewDesc.format = translateTextureFormat(fmt);
+            viewDesc.dimension = translateTextureViewDimension(view->m_texture->m_desc.type);
+            viewDesc.baseMipLevel = effectiveRange.mip;
+            viewDesc.mipLevelCount = effectiveRange.mipCount;
+            viewDesc.baseArrayLayer = effectiveRange.layer;
+            viewDesc.arrayLayerCount = effectiveRange.layerCount;
+            viewDesc.aspect = translateTextureAspect(view->m_desc.aspect);
+
+            WGPUTextureView tempView = m_ctx.api.wgpuTextureCreateView(view->m_texture->m_texture, &viewDesc);
+            m_tempRenderPassViews.push_back(tempView);
+            attachment.view = tempView;
+        }
+        else
+        {
+            attachment.view = view->m_textureView;
+        }
+
         attachment.resolveTarget = attachmentIn.resolveTarget
                                        ? checked_cast<TextureViewImpl*>(attachmentIn.resolveTarget)->m_textureView
                                        : nullptr;
@@ -429,8 +468,38 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
     if (desc.depthStencilAttachment)
     {
         const RenderPassDepthStencilAttachment& attachmentIn = *desc.depthStencilAttachment;
+        TextureViewImpl* view = checked_cast<TextureViewImpl*>(attachmentIn.view);
         WGPURenderPassDepthStencilAttachment& attachment = depthStencilAttachment;
-        attachment.view = checked_cast<TextureViewImpl*>(attachmentIn.view)->m_textureView;
+
+        // Compute effective subresource range for depth/stencil.
+        const auto& sr = attachmentIn.subresourceRange;
+        if (sr.layerCount > 0 || sr.mipCount > 0)
+        {
+            SubresourceRange effectiveRange;
+            effectiveRange.layer = view->m_desc.subresourceRange.layer + sr.layer;
+            effectiveRange.layerCount = sr.layerCount > 0 ? sr.layerCount : view->m_desc.subresourceRange.layerCount;
+            effectiveRange.mip = view->m_desc.subresourceRange.mip + sr.mip;
+            effectiveRange.mipCount = sr.mipCount > 0 ? sr.mipCount : view->m_desc.subresourceRange.mipCount;
+
+            WGPUTextureViewDescriptor viewDesc = {};
+            Format fmt = view->m_desc.format == Format::Undefined ? view->m_texture->m_desc.format : view->m_desc.format;
+            viewDesc.format = translateTextureFormat(fmt);
+            viewDesc.dimension = translateTextureViewDimension(view->m_texture->m_desc.type);
+            viewDesc.baseMipLevel = effectiveRange.mip;
+            viewDesc.mipLevelCount = effectiveRange.mipCount;
+            viewDesc.baseArrayLayer = effectiveRange.layer;
+            viewDesc.arrayLayerCount = effectiveRange.layerCount;
+            viewDesc.aspect = translateTextureAspect(view->m_desc.aspect);
+
+            WGPUTextureView tempView = m_ctx.api.wgpuTextureCreateView(view->m_texture->m_texture, &viewDesc);
+            m_tempRenderPassViews.push_back(tempView);
+            attachment.view = tempView;
+        }
+        else
+        {
+            attachment.view = view->m_textureView;
+        }
+
         attachment.depthLoadOp = translateLoadOp(attachmentIn.depthLoadOp);
         attachment.depthStoreOp = translateStoreOp(attachmentIn.depthStoreOp);
         attachment.depthClearValue = attachmentIn.depthClearValue;
@@ -460,6 +529,11 @@ void CommandRecorder::cmdEndRenderPass(const commands::EndRenderPass& cmd)
 {
     endPassEncoder();
     m_renderPassActive = false;
+
+    // Release temporary texture views created for attachment subresource overrides.
+    for (auto tv : m_tempRenderPassViews)
+        m_ctx.api.wgpuTextureViewRelease(tv);
+    m_tempRenderPassViews.clear();
 }
 
 void CommandRecorder::cmdSetRenderState(const commands::SetRenderState& cmd)
