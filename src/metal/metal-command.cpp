@@ -1037,6 +1037,8 @@ uint64_t CommandQueueImpl::updateLastFinishedID()
 
 Result CommandQueueImpl::createCommandEncoder(ICommandEncoder** outEncoder)
 {
+    AUTORELEASEPOOL
+
     RefPtr<CommandEncoderImpl> encoder = new CommandEncoderImpl(m_device, this);
     SLANG_RETURN_ON_FAIL(encoder->init());
     returnComPtr(outEncoder, encoder);
@@ -1195,6 +1197,8 @@ Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingD
 
 Result CommandEncoderImpl::finish(ICommandBuffer** outCommandBuffer)
 {
+    AUTORELEASEPOOL
+
     DeviceImpl* device = getDevice<DeviceImpl>();
     SLANG_RETURN_ON_FAIL(resolvePipelines(device));
     CommandRecorder recorder(device);
