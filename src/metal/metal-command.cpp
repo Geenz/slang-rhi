@@ -113,13 +113,15 @@ Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
 {
     m_commandBuffer = commandBuffer->m_commandBuffer;
 
-    // Synchronize constant and argument buffers.
+#if TARGET_OS_OSX
+    // Synchronize constant and argument buffers (Managed memory coherency — macOS only).
     // TODO(shaderobject): This only needs to be done once after writing,
     // once we cache/reuse binding data this should be revisited.
     for (const auto& buffer : commandBuffer->m_bindingCache.buffers)
     {
         getBlitCommandEncoder()->synchronizeResource(buffer->m_buffer.get());
     }
+#endif
 
     CommandList& commandList = commandBuffer->m_commandList;
     auto command = commandList.getCommands();
@@ -1227,6 +1229,7 @@ CommandBufferImpl::~CommandBufferImpl() {}
 
 Result CommandBufferImpl::init()
 {
+    AUTORELEASEPOOL
     m_commandBuffer = NS::RetainPtr(m_queue->m_commandQueue->commandBuffer());
     if (!m_commandBuffer)
     {
@@ -1243,6 +1246,8 @@ Result CommandBufferImpl::reset()
 
 void CommandBufferImpl::setLabel(const char* label)
 {
+    AUTORELEASEPOOL
+
     if (m_commandBuffer && label)
     {
         m_commandBuffer->setLabel(NS::String::string(label, NS::UTF8StringEncoding));

@@ -1,16 +1,28 @@
 #include "cocoa-util.h"
 
-#import <Cocoa/Cocoa.h>
+#include <TargetConditionals.h>
 #import <QuartzCore/CAMetalLayer.h>
+
+#if TARGET_OS_IPHONE
+#import <UIKit/UIKit.h>
+#else
+#import <Cocoa/Cocoa.h>
+#endif
 
 namespace rhi {
 
-void* CocoaUtil::createMetalLayer(void* nswindow)
+void* CocoaUtil::createMetalLayer(void* windowOrView)
 {
     CAMetalLayer* layer = [CAMetalLayer layer];
-    NSWindow* window = (NSWindow*)nswindow;
+#if TARGET_OS_IPHONE
+    UIView* view = (UIView*)windowOrView;
+    layer.frame = view.bounds;
+    [view.layer addSublayer:layer];
+#else
+    NSWindow* window = (NSWindow*)windowOrView;
     window.contentView.layer = layer;
     window.contentView.wantsLayer = YES;
+#endif
     return layer;
 }
 
