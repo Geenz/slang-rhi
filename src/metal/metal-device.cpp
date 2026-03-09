@@ -133,7 +133,8 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     m_queue->init(m_commandQueue);
     m_queue->setInternalReferenceCount(1);
 
-    // Setup capture manager.
+#if TARGET_OS_OSX
+    // Setup capture manager (GPUTraceDocument destination is macOS-only).
     if (captureEnabled())
     {
         MTL::CaptureManager* captureManager = MTL::CaptureManager::sharedCaptureManager();
@@ -163,6 +164,7 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
             return SLANG_FAIL;
         }
     }
+#endif
 
     // Initialize device info.
     {
@@ -270,9 +272,16 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     }
 
     // Initialize slang context.
+    // On iOS there is no Metal command-line compiler, so emit MSL source
+    // and compile on-device via MTLDevice::newLibraryWithSource.
+#if TARGET_OS_IOS || TARGET_OS_TV || TARGET_OS_VISION
+    SlangCompileTarget metalTarget = SLANG_METAL;
+#else
+    SlangCompileTarget metalTarget = SLANG_METAL_LIB;
+#endif
     SLANG_RETURN_ON_FAIL(m_slangContext.initialize(
         desc.slang,
-        SLANG_METAL_LIB,
+        metalTarget,
         nullptr,
         getCapabilities(),
         std::array{slang::PreprocessorMacroDesc{"__METAL__", "1"}}
@@ -307,7 +316,7 @@ Result DeviceImpl::readBuffer(IBuffer* buffer, Offset offset, Size size, void* o
 
     // create staging buffer
     NS::SharedPtr<MTL::Buffer> stagingBuffer =
-        NS::TransferPtr(m_device->newBuffer(size, MTL::ResourceStorageModeManaged));
+        NS::TransferPtr(m_device->newBuffer(size, RHI_MTL_STAGING_STORAGE_MODE));
     if (!stagingBuffer)
     {
         return SLANG_FAIL;
@@ -316,7 +325,9 @@ Result DeviceImpl::readBuffer(IBuffer* buffer, Offset offset, Size size, void* o
     MTL::CommandBuffer* commandBuffer = m_commandQueue->commandBuffer();
     MTL::BlitCommandEncoder* blitEncoder = commandBuffer->blitCommandEncoder();
     blitEncoder->copyFromBuffer(bufferImpl->m_buffer.get(), offset, stagingBuffer.get(), 0, size);
+#if TARGET_OS_OSX
     blitEncoder->synchronizeResource(stagingBuffer.get());
+#endif
     blitEncoder->endEncoding();
     commandBuffer->commit();
     commandBuffer->waitUntilCompleted();

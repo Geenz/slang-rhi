@@ -2101,6 +2101,7 @@ enum class WindowHandleType
     Undefined,
     HWND,
     NSWindow,
+    UIView,
     XlibWindow,
     AndroidWindow,
 };
@@ -2122,6 +2123,13 @@ struct WindowHandle
         WindowHandle handle = {};
         handle.type = WindowHandleType::NSWindow;
         handle.handleValues[0] = (uint64_t)(nswindow);
+        return handle;
+    }
+    static WindowHandle fromUIView(void* uiview)
+    {
+        WindowHandle handle = {};
+        handle.type = WindowHandleType::UIView;
+        handle.handleValues[0] = (uint64_t)(uiview);
         return handle;
     }
     static WindowHandle fromXlibWindow(void* xdisplay, uint32_t xwindow)

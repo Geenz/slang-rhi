@@ -1,9 +1,20 @@
 #pragma once
 
 #include <slang-rhi.h>
+#include <TargetConditionals.h>
 
 #include "metal-api.h"
 #include "core/common.h"
+
+// iOS uses StorageModeShared (UMA — no managed memory).
+// macOS uses StorageModeManaged for CPU/GPU coherent staging buffers.
+#if TARGET_OS_OSX
+    #define RHI_MTL_STAGING_STORAGE_MODE MTL::ResourceStorageModeManaged
+    #define RHI_MTL_STAGING_TEXTURE_MODE MTL::StorageModeManaged
+#else
+    #define RHI_MTL_STAGING_STORAGE_MODE MTL::ResourceStorageModeShared
+    #define RHI_MTL_STAGING_TEXTURE_MODE MTL::StorageModeShared
+#endif
 
 namespace rhi::metal {
 
