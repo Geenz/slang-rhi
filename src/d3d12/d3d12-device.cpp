@@ -312,7 +312,7 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
         }
     }
 
-    if (SLANG_SUCCEEDED(setupDebugLayer(d3dModule)))
+    if (!SLANG_SUCCEEDED(setupDebugLayer(d3dModule)))
         return SLANG_FAIL;
 
     // Get D3D12 entry points.
@@ -937,8 +937,9 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
         // Enable ray tracing validation if requested
         if (desc.enableRayTracingValidation)
         {
-            if (NvAPI_D3D12_EnableRaytracingValidation(m_device5, NVAPI_D3D12_RAYTRACING_VALIDATION_FLAG_NONE) ==
-                NVAPI_OK)
+            if (m_device5 &&
+                NvAPI_D3D12_EnableRaytracingValidation(m_device5, NVAPI_D3D12_RAYTRACING_VALIDATION_FLAG_NONE) ==
+                    NVAPI_OK)
             {
                 SLANG_RHI_NVAPI_RETURN_ON_FAIL(NvAPI_D3D12_RegisterRaytracingValidationMessageCallback(
                     m_device5,
@@ -947,10 +948,10 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
                     &m_raytracingValidationHandle
                 ));
             }
-        }
-        else
-        {
-            printWarning("Raytracing validation requested but not available.\n");
+            else
+            {
+                printWarning("Raytracing validation requested but not available.\n");
+            }
         }
     }
 #endif // SLANG_RHI_ENABLE_NVAPI
@@ -2047,7 +2048,15 @@ DeviceImpl::~DeviceImpl()
 #endif
 
     m_shaderObjectLayoutCache = decltype(m_shaderObjectLayoutCache)();
-    m_queue.setNull();
+
+    m_uploadHeap.release();
+    m_readbackHeap.release();
+
+    if (m_queue)
+    {
+        m_queue->shutdown();
+        m_queue.setNull();
+    }
 
     m_bindlessDescriptorSet.setNull();
 
@@ -2069,6 +2078,13 @@ DeviceImpl::~DeviceImpl()
             m_validationMessageCallbackCookie = 0;
         }
     }
+}
+
+void DeviceImpl::deferDelete(Resource* resource)
+{
+    SLANG_RHI_ASSERT(m_queue != nullptr);
+    m_queue->deferDelete(resource);
+    resource->breakStrongReferenceToDevice();
 }
 
 } // namespace rhi::d3d12

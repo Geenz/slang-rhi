@@ -140,7 +140,7 @@ endif()
 
 # Fetch slang options
 option(SLANG_RHI_FETCH_SLANG "Fetch slang" ON)
-set(SLANG_RHI_FETCH_SLANG_VERSION "2025.24" CACHE STRING "Slang version to fetch")
+set(SLANG_RHI_FETCH_SLANG_VERSION "2026.4.1" CACHE STRING "Slang version to fetch")
 
 # slang-rhi depends on a few external libraries.
 # These dependencies are fetched automatically if needed, using the URLs defined below.
@@ -838,6 +838,7 @@ if(SLANG_RHI_BUILD_TESTS AND NOT SLANG_RHI_BUILD_SHARED)
         tests/test-acceleration-structure-creation-with-validation.cpp
         tests/test-aftermath.cpp
         tests/test-arena-allocator.cpp
+        tests/test-device-features.cpp
         tests/test-block-allocator.cpp
         tests/test-benchmark-command.cpp
         tests/test-bindless.cpp
@@ -867,6 +868,7 @@ if(SLANG_RHI_BUILD_TESTS AND NOT SLANG_RHI_BUILD_SHARED)
         tests/test-cooperative-matrix.cpp
         tests/test-cooperative-vector.cpp
         tests/test-cuda-external-devices.cpp
+        tests/test-deferred-delete.cpp
         tests/test-device-from-handle.cpp
         tests/test-device-lifetime.cpp
         tests/test-fence.cpp
@@ -889,11 +891,12 @@ if(SLANG_RHI_BUILD_TESTS AND NOT SLANG_RHI_BUILD_SHARED)
         tests/test-ray-tracing-clusters.cpp
         tests/test-ray-tracing-hitobject-intrinsics.cpp
         tests/test-ray-tracing-intrinsics.cpp
-        tests/test-ray-tracing-transform-query.cpp
         tests/test-ray-tracing-lss.cpp
         tests/test-ray-tracing-raygen-entrypoint.cpp
         tests/test-ray-tracing-reorder.cpp
+        tests/test-ray-tracing-shader-table-multi-pipeline.cpp
         tests/test-ray-tracing-sphere.cpp
+        tests/test-ray-tracing-transform-query.cpp
         tests/test-ray-tracing.cpp
         tests/test-resolve-resource-tests.cpp
         tests/test-resource-states.cpp
@@ -905,6 +908,7 @@ if(SLANG_RHI_BUILD_TESTS AND NOT SLANG_RHI_BUILD_SHARED)
         tests/test-shader-cache.cpp
         tests/test-shader-object-large.cpp
         tests/test-shader-object-resource-tracking.cpp
+        tests/test-ring-queue.cpp
         tests/test-short-vector.cpp
         tests/test-staging-heap.cpp
         tests/test-static-vector.cpp

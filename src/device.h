@@ -24,6 +24,8 @@ class Heap;
 namespace testing {
 // Debug option for tests to turn off state tracking (so we can effectively test explicit barriers)
 extern bool gDebugDisableStateTracking;
+// Counter for tracking active Resource instances (for testing deferred delete)
+extern std::atomic<uint64_t> gResourceCount;
 } // namespace testing
 
 // Base class for adapters.
@@ -356,6 +358,11 @@ public:
 
     // Provides a default implementation that reports heaps from m_globalHeaps.
     virtual SLANG_NO_THROW Result SLANG_MCALL reportHeaps(HeapReport* heapReports, uint32_t* heapCount) override;
+
+    // Default no-op implementations for CUDA context management (only meaningful for CUDA backend).
+    virtual SLANG_NO_THROW Result SLANG_MCALL setCudaContextCurrent() override { return SLANG_OK; }
+    virtual SLANG_NO_THROW Result SLANG_MCALL pushCudaContext() override { return SLANG_OK; }
+    virtual SLANG_NO_THROW Result SLANG_MCALL popCudaContext() override { return SLANG_OK; }
 
     // Flush all global heaps managed by this device
     Result flushHeaps();

@@ -61,6 +61,7 @@ public:
     RefPtr<ShaderTableImpl> m_shaderTable;
     D3D12_DISPATCH_RAYS_DESC m_dispatchRaysDesc = {};
     UINT64 m_rayGenTableAddr = 0;
+    UINT64 m_rayGenRecordStride = 0;
 
     BindingDataImpl* m_bindingData = nullptr;
 
@@ -1149,39 +1150,47 @@ void CommandRecorder::cmdSetRayTracingState(const commands::SetRayTracingState& 
     {
         m_shaderTable = checked_cast<ShaderTableImpl*>(cmd.shaderTable);
 
-        BufferImpl* shaderTableBuffer = m_shaderTable->getBuffer(m_rayTracingPipeline);
-        DeviceAddress shaderTableAddr = shaderTableBuffer->getDeviceAddress();
+        ShaderTableImpl::PipelineData* shaderTablePipelineData = m_shaderTable->getPipelineData(m_rayTracingPipeline);
+        if (!shaderTablePipelineData)
+        {
+            m_rayTracingStateValid = false;
+            return;
+        }
+        DeviceAddress shaderTableAddr = shaderTablePipelineData->buffer->getDeviceAddress();
 
         m_dispatchRaysDesc = {};
 
         // Raygen index is set at dispatch time.
-        m_rayGenTableAddr = shaderTableAddr + m_shaderTable->m_rayGenTableOffset;
+        m_rayGenTableAddr = shaderTableAddr + shaderTablePipelineData->rayGenTableOffset;
+        m_rayGenRecordStride = shaderTablePipelineData->rayGenRecordStride;
         m_dispatchRaysDesc.RayGenerationShaderRecord.StartAddress = shaderTableAddr;
-        m_dispatchRaysDesc.RayGenerationShaderRecord.SizeInBytes = m_shaderTable->m_rayGenRecordStride;
+        m_dispatchRaysDesc.RayGenerationShaderRecord.SizeInBytes = shaderTablePipelineData->rayGenRecordStride;
 
         if (m_shaderTable->m_missShaderCount > 0)
         {
-            m_dispatchRaysDesc.MissShaderTable.StartAddress = shaderTableAddr + m_shaderTable->m_missTableOffset;
+            m_dispatchRaysDesc.MissShaderTable.StartAddress =
+                shaderTableAddr + shaderTablePipelineData->missTableOffset;
             m_dispatchRaysDesc.MissShaderTable.SizeInBytes =
-                m_shaderTable->m_missShaderCount * m_shaderTable->m_missRecordStride;
-            m_dispatchRaysDesc.MissShaderTable.StrideInBytes = m_shaderTable->m_missRecordStride;
+                m_shaderTable->m_missShaderCount * shaderTablePipelineData->missRecordStride;
+            m_dispatchRaysDesc.MissShaderTable.StrideInBytes = shaderTablePipelineData->missRecordStride;
         }
 
         if (m_shaderTable->m_hitGroupCount > 0)
         {
-            m_dispatchRaysDesc.HitGroupTable.StartAddress = shaderTableAddr + m_shaderTable->m_hitGroupTableOffset;
+            m_dispatchRaysDesc.HitGroupTable.StartAddress =
+                shaderTableAddr + shaderTablePipelineData->hitGroupTableOffset;
             m_dispatchRaysDesc.HitGroupTable.SizeInBytes =
-                m_shaderTable->m_hitGroupCount * m_shaderTable->m_hitGroupRecordStride;
-            m_dispatchRaysDesc.HitGroupTable.StrideInBytes = m_shaderTable->m_hitGroupRecordStride;
+                m_shaderTable->m_hitGroupCount * shaderTablePipelineData->hitGroupRecordStride;
+            m_dispatchRaysDesc.HitGroupTable.StrideInBytes = shaderTablePipelineData->hitGroupRecordStride;
         }
 
         if (m_shaderTable->m_callableShaderCount > 0)
         {
             m_dispatchRaysDesc.CallableShaderTable.StartAddress =
-                shaderTableAddr + m_shaderTable->m_callableTableOffset;
+                shaderTableAddr + shaderTablePipelineData->callableTableOffset;
             m_dispatchRaysDesc.CallableShaderTable.SizeInBytes =
-                m_shaderTable->m_callableShaderCount * m_shaderTable->m_callableRecordStride;
-            m_dispatchRaysDesc.CallableShaderTable.StrideInBytes = m_shaderTable->m_callableRecordStride;
+                m_shaderTable->m_callableShaderCount * shaderTablePipelineData->callableRecordStride;
+            m_dispatchRaysDesc.CallableShaderTable.StrideInBytes = shaderTablePipelineData->callableRecordStride;
         }
     }
 
@@ -1196,8 +1205,11 @@ void CommandRecorder::cmdDispatchRays(const commands::DispatchRays& cmd)
     if (!m_rayTracingStateValid)
         return;
 
+    if (cmd.rayGenShaderIndex >= m_shaderTable->m_rayGenShaderCount)
+        return;
+
     m_dispatchRaysDesc.RayGenerationShaderRecord.StartAddress =
-        m_rayGenTableAddr + cmd.rayGenShaderIndex * m_shaderTable->m_rayGenRecordStride;
+        m_rayGenTableAddr + cmd.rayGenShaderIndex * m_rayGenRecordStride;
     m_dispatchRaysDesc.Width = cmd.width;
     m_dispatchRaysDesc.Height = cmd.height;
     m_dispatchRaysDesc.Depth = cmd.depth;
@@ -1813,11 +1825,7 @@ CommandQueueImpl::CommandQueueImpl(Device* device, QueueType type)
 {
 }
 
-CommandQueueImpl::~CommandQueueImpl()
-{
-    waitOnHost();
-    ::CloseHandle(m_globalWaitHandle);
-}
+CommandQueueImpl::~CommandQueueImpl() {}
 
 Result CommandQueueImpl::init(uint32_t queueIndex)
 {
@@ -1840,6 +1848,17 @@ Result CommandQueueImpl::init(uint32_t queueIndex)
     m_globalWaitHandle =
         CreateEventEx(nullptr, nullptr, CREATE_EVENT_INITIAL_SET | CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS);
     return SLANG_OK;
+}
+
+void CommandQueueImpl::shutdown()
+{
+    waitOnHost();
+    // Release all command buffers in order to release all resources they may hold.
+    m_commandBuffersPool.clear();
+    // Execute remaining deferred deletes.
+    executeDeferredDeletes();
+    SLANG_RHI_ASSERT(m_deferredDeleteQueue.empty());
+    ::CloseHandle(m_globalWaitHandle);
 }
 
 Result CommandQueueImpl::createCommandBuffer(CommandBufferImpl** outCommandBuffer)
@@ -1896,8 +1915,32 @@ void CommandQueueImpl::retireCommandBuffers()
         }
     }
 
+    // Delete deferred resources that are no longer in use by the GPU.
+    executeDeferredDeletes();
+
     // Flush all device heaps
     getDevice<DeviceImpl>()->flushHeaps();
+}
+
+void CommandQueueImpl::deferDelete(Resource* resource)
+{
+    std::lock_guard<std::mutex> lock(m_deferredDeleteQueueMutex);
+    // Use current submission ID - resource will be released after this submission completes.
+    // This is conservative but simple: the resource may have been used in an earlier submission,
+    // but using the current ID ensures we don't release too early.
+    m_deferredDeleteQueue.push({m_lastSubmittedID, resource});
+}
+
+void CommandQueueImpl::executeDeferredDeletes()
+{
+    uint64_t lastFinishedID = m_lastFinishedID;
+    std::lock_guard<std::mutex> lock(m_deferredDeleteQueueMutex);
+    while (!m_deferredDeleteQueue.empty() && m_deferredDeleteQueue.front().submissionID <= lastFinishedID)
+    {
+        // GPU is done with this resource - delete it.
+        delete m_deferredDeleteQueue.front().resource;
+        m_deferredDeleteQueue.pop();
+    }
 }
 
 uint64_t CommandQueueImpl::updateLastFinishedID()
