@@ -500,6 +500,7 @@ cmrc_add_resource_library(
     NAMESPACE resources
     src/cuda/kernels/clear-texture.cu
     src/metal/shaders/clear-texture.metal
+    src/metal/shaders/encode-indirect.metal
 )
 set_target_properties(slang-rhi-resources PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(slang-rhi PRIVATE slang-rhi-resources)
@@ -735,6 +736,7 @@ if(SLANG_RHI_ENABLE_METAL)
         src/metal/metal-buffer.cpp
         src/metal/metal-clear-engine.cpp
         src/metal/metal-command.cpp
+        src/metal/metal-indirect-engine.cpp
         src/metal/metal-device.cpp
         src/metal/metal-fence.cpp
         src/metal/metal-input-layout.cpp

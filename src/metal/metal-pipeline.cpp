@@ -99,6 +99,11 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
     }
 
     pd->setRasterSampleCount(desc.multisample.sampleCount);
+    // Required for executeCommandsInBuffer (ICB) support used by the countBuffer path
+    // in cmdDrawIndirect/cmdDrawIndexedIndirect. Set on all render pipelines because we don't
+    // know at pipeline creation time whether it will be used with countBuffer.
+    // Apple docs note this "may incur some costs."
+    pd->setSupportIndirectCommandBuffers(true);
 
     if (desc.label)
     {

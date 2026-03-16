@@ -92,6 +92,7 @@ DeviceImpl::~DeviceImpl()
         m_queue.setNull();
     }
 
+    m_indirectEngine.release();
     m_clearEngine.release();
 }
 
@@ -288,6 +289,7 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     ));
 
     SLANG_RETURN_ON_FAIL(m_clearEngine.initialize(m_device.get()));
+    SLANG_RETURN_ON_FAIL(m_indirectEngine.initialize(m_device.get()));
 
     return SLANG_OK;
 }
