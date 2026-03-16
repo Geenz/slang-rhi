@@ -213,8 +213,8 @@
 | `setRenderState`      | :x: | :x:  | yes   | yes   | yes    | yes   | yes  |
 | `draw`                | :x: | :x:  | yes   | yes   | yes    | yes   | yes  |
 | `drawIndexed`         | :x: | :x:  | yes   | yes   | yes    | yes   | yes  |
-| `drawIndirect`        | :x: | :x:  | yes   | yes   | yes    | :x:   | yes  |
-| `drawIndexedIndirect` | :x: | :x:  | yes   | yes   | yes    | :x:   | yes  |
+| `drawIndirect`        | :x: | :x:  | yes   | yes   | yes    | yes   | yes  |
+| `drawIndexedIndirect` | :x: | :x:  | yes   | yes   | yes    | yes   | yes  |
 | `drawMeshTasks`       | :x: | :x:  | :x:   | yes   | yes    | :x:   | :x:  |
 
 ## `IComputePassEncoder` interface
@@ -223,7 +223,7 @@
 |---------------------------|-----|------|-------|-------|--------|-------|------|
 | `bindPipeline`            | yes | yes  | yes   | yes   | yes    | yes   | yes  |
 | `dispatchCompute`         | yes | yes  | yes   | yes   | yes    | yes   | yes  |
-| `dispatchComputeIndirect` | :x: | yes  | yes   | yes   | yes    | :x:   | yes  |
+| `dispatchComputeIndirect` | :x: | yes  | yes   | yes   | yes    | yes   | yes  |
 
 ## `IRayTracingPassEncoder` interface
 

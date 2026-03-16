@@ -53,6 +53,10 @@ public:
 
     BindingDataImpl* m_bindingData = nullptr;
 
+    // Saved render pass descriptor for restart after ICB interrupt
+    NS::SharedPtr<MTL::RenderPassDescriptor> m_renderPassDesc;
+    uint32_t m_colorAttachmentCount = 0;
+
     CommandRecorder(DeviceImpl* device)
         : m_device(device)
     {
@@ -107,6 +111,10 @@ public:
     MTL::AccelerationStructureCommandEncoder* getAccelerationStructureCommandEncoder();
     MTL::BlitCommandEncoder* getBlitCommandEncoder();
     void endCommandEncoder();
+
+    // ICB support: interrupt and restore render encoder without losing state
+    void interruptRenderEncoder();
+    void restoreRenderEncoder();
 };
 
 Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
@@ -465,6 +473,10 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
 
     m_useDepthStencil = desc.depthStencilAttachment != nullptr;
 
+    // Save the render pass descriptor for potential ICB interrupt/restore
+    m_renderPassDesc = renderPassDesc;
+    m_colorAttachmentCount = desc.colorAttachmentCount;
+
     getRenderCommandEncoder(renderPassDesc.get());
 
     m_renderPassActive = true;
@@ -659,14 +671,131 @@ void CommandRecorder::cmdDrawIndexed(const commands::DrawIndexed& cmd)
 
 void CommandRecorder::cmdDrawIndirect(const commands::DrawIndirect& cmd)
 {
-    SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_RenderPassEncoder_drawIndirect);
+    if (!m_renderStateValid)
+        return;
+
+    BufferImpl* argBuffer = checked_cast<BufferImpl*>(cmd.argBuffer.buffer);
+
+    if (!cmd.countBuffer.buffer)
+    {
+        // Tier 1: CPU loop (no countBuffer)
+        for (uint32_t i = 0; i < cmd.maxDrawCount; ++i)
+        {
+            m_renderCommandEncoder->drawPrimitives(
+                m_renderPipeline->m_primitiveType,
+                argBuffer->m_buffer.get(),
+                cmd.argBuffer.offset + i * sizeof(IndirectDrawArguments)
+            );
+        }
+        return;
+    }
+
+    // ICB path for countBuffer
+    BufferImpl* countBuffer = checked_cast<BufferImpl*>(cmd.countBuffer.buffer);
+    auto [icb, icbArgBuffer] = m_device->m_indirectEngine.getOrCreateICB(MTL::IndirectCommandTypeDraw, cmd.maxDrawCount);
+    auto* rangeBuffer = m_device->m_indirectEngine.getRangeBuffer();
+
+    // 1. Interrupt render pass (preserves all state)
+    interruptRenderEncoder();
+
+    // 2. Reset ICB via blit encoder
+    {
+        auto blitEncoder = NS::RetainPtr(m_commandBuffer->blitCommandEncoder());
+        blitEncoder->resetCommandsInBuffer(icb, NS::Range(0, cmd.maxDrawCount));
+        blitEncoder->endEncoding();
+    }
+
+    // 3. Compute pre-pass: populate ICB + write execution range
+    {
+        auto computeEncoder = NS::RetainPtr(m_commandBuffer->computeCommandEncoder());
+        computeEncoder->useResource(icb, MTL::ResourceUsageWrite);
+        m_device->m_indirectEngine.encodeDraw(
+            computeEncoder.get(),
+            argBuffer->m_buffer.get(),
+            cmd.argBuffer.offset,
+            countBuffer->m_buffer.get(),
+            cmd.countBuffer.offset,
+            cmd.maxDrawCount,
+            m_renderPipeline->m_primitiveType,
+            icbArgBuffer,
+            rangeBuffer
+        );
+        computeEncoder->endEncoding();
+    }
+
+    // 4. Restore render pass with LoadAction::Load
+    restoreRenderEncoder();
+
+    // 5. Execute ICB with GPU-driven range
+    m_renderCommandEncoder->executeCommandsInBuffer(icb, rangeBuffer, 0);
 }
 
 void CommandRecorder::cmdDrawIndexedIndirect(const commands::DrawIndexedIndirect& cmd)
 {
-    SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_RenderPassEncoder_drawIndexedIndirect);
+    if (!m_renderStateValid)
+        return;
+
+    BufferImpl* argBuffer = checked_cast<BufferImpl*>(cmd.argBuffer.buffer);
+
+    if (!cmd.countBuffer.buffer)
+    {
+        // Tier 1: CPU loop (no countBuffer)
+        for (uint32_t i = 0; i < cmd.maxDrawCount; ++i)
+        {
+            m_renderCommandEncoder->drawIndexedPrimitives(
+                m_renderPipeline->m_primitiveType,
+                m_indexType,
+                m_indexBuffer->m_buffer.get(),
+                m_indexBufferOffset,
+                argBuffer->m_buffer.get(),
+                cmd.argBuffer.offset + i * sizeof(IndirectDrawIndexedArguments)
+            );
+        }
+        return;
+    }
+
+    // ICB path for countBuffer
+    BufferImpl* countBuffer = checked_cast<BufferImpl*>(cmd.countBuffer.buffer);
+    auto [icb, icbArgBuffer] =
+        m_device->m_indirectEngine.getOrCreateICB(MTL::IndirectCommandTypeDrawIndexed, cmd.maxDrawCount);
+    auto* rangeBuffer = m_device->m_indirectEngine.getRangeBuffer();
+
+    // 1. Interrupt render pass (preserves all state)
+    interruptRenderEncoder();
+
+    // 2. Reset ICB via blit encoder
+    {
+        auto blitEncoder = NS::RetainPtr(m_commandBuffer->blitCommandEncoder());
+        blitEncoder->resetCommandsInBuffer(icb, NS::Range(0, cmd.maxDrawCount));
+        blitEncoder->endEncoding();
+    }
+
+    // 3. Compute pre-pass: populate ICB + write execution range
+    {
+        auto computeEncoder = NS::RetainPtr(m_commandBuffer->computeCommandEncoder());
+        computeEncoder->useResource(icb, MTL::ResourceUsageWrite);
+        m_device->m_indirectEngine.encodeDrawIndexed(
+            computeEncoder.get(),
+            argBuffer->m_buffer.get(),
+            cmd.argBuffer.offset,
+            countBuffer->m_buffer.get(),
+            cmd.countBuffer.offset,
+            cmd.maxDrawCount,
+            m_renderPipeline->m_primitiveType,
+            m_indexBuffer->m_buffer.get(),
+            m_indexBufferOffset,
+            m_indexType,
+            icbArgBuffer,
+            rangeBuffer
+        );
+        computeEncoder->endEncoding();
+    }
+
+    // 4. Restore render pass with LoadAction::Load
+    restoreRenderEncoder();
+
+    // 5. Execute ICB with GPU-driven range
+    m_renderCommandEncoder->executeCommandsInBuffer(icb, rangeBuffer, 0);
 }
 
 void CommandRecorder::cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd)
@@ -731,8 +860,15 @@ void CommandRecorder::cmdDispatchCompute(const commands::DispatchCompute& cmd)
 
 void CommandRecorder::cmdDispatchComputeIndirect(const commands::DispatchComputeIndirect& cmd)
 {
-    SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(S_ComputePassEncoder_dispatchComputeIndirect);
+    if (!m_computeStateValid)
+        return;
+
+    BufferImpl* argBuffer = checked_cast<BufferImpl*>(cmd.argBuffer.buffer);
+    m_computeCommandEncoder->dispatchThreadgroups(
+        argBuffer->m_buffer.get(),
+        cmd.argBuffer.offset,
+        m_computePipeline->m_threadGroupSize
+    );
 }
 
 void CommandRecorder::cmdBeginRayTracingPass(const commands::BeginRayTracingPass& cmd)
@@ -959,6 +1095,109 @@ void CommandRecorder::endCommandEncoder()
         m_blitCommandEncoder.reset();
     }
     m_bindingData = nullptr;
+}
+
+void CommandRecorder::interruptRenderEncoder()
+{
+    m_renderCommandEncoder->endEncoding();
+    m_renderCommandEncoder.reset();
+    // Deliberately preserve: m_renderPipeline, m_renderState, m_bindingData,
+    // m_indexBuffer, m_indexType, m_indexSize, m_indexBufferOffset, m_useDepthStencil
+}
+
+void CommandRecorder::restoreRenderEncoder()
+{
+    // Change all load actions to Load (preserve existing framebuffer contents)
+    for (uint32_t i = 0; i < m_colorAttachmentCount; ++i)
+        m_renderPassDesc->colorAttachments()->object(i)->setLoadAction(MTL::LoadActionLoad);
+    if (m_useDepthStencil)
+    {
+        m_renderPassDesc->depthAttachment()->setLoadAction(MTL::LoadActionLoad);
+        m_renderPassDesc->stencilAttachment()->setLoadAction(MTL::LoadActionLoad);
+    }
+
+    // Create new render encoder
+    m_renderCommandEncoder = NS::RetainPtr(m_commandBuffer->renderCommandEncoder(m_renderPassDesc.get()));
+    MTL::RenderCommandEncoder* encoder = m_renderCommandEncoder.get();
+
+    // Pipeline
+    encoder->setRenderPipelineState(m_renderPipeline->m_pipelineState.get());
+
+    // Shader bindings (vertex/fragment buffers, textures, samplers, resources)
+    encoder->setVertexBuffers(
+        m_bindingData->buffers,
+        m_bindingData->bufferOffsets,
+        NS::Range(0, m_bindingData->bufferCount)
+    );
+    encoder->setFragmentBuffers(
+        m_bindingData->buffers,
+        m_bindingData->bufferOffsets,
+        NS::Range(0, m_bindingData->bufferCount)
+    );
+    encoder->setVertexTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
+    encoder->setFragmentTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
+    encoder->setVertexSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
+    encoder->setFragmentSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
+    encoder->useResources(m_bindingData->usedResources, m_bindingData->usedResourceCount, MTL::ResourceUsageRead);
+    encoder->useResources(
+        m_bindingData->usedRWResources,
+        m_bindingData->usedRWResourceCount,
+        MTL::ResourceUsageRead | MTL::ResourceUsageWrite
+    );
+
+    // Vertex buffers (at m_renderPipeline->m_vertexBufferOffset + i)
+    for (uint32_t i = 0; i < m_renderState.vertexBufferCount; ++i)
+    {
+        BufferImpl* buffer = checked_cast<BufferImpl*>(m_renderState.vertexBuffers[i].buffer);
+        encoder->setVertexBuffer(
+            buffer->m_buffer.get(),
+            m_renderState.vertexBuffers[i].offset,
+            m_renderPipeline->m_vertexBufferOffset + i
+        );
+    }
+
+    // Viewports
+    MTL::Viewport viewports[SLANG_COUNT_OF(RenderState::viewports)];
+    for (uint32_t i = 0; i < m_renderState.viewportCount; ++i)
+    {
+        const Viewport& src = m_renderState.viewports[i];
+        MTL::Viewport& dst = viewports[i];
+        dst.originX = src.originX;
+        dst.originY = src.originY;
+        dst.width = src.extentX;
+        dst.height = src.extentY;
+        dst.znear = src.minZ;
+        dst.zfar = src.maxZ;
+    }
+    encoder->setViewports(viewports, m_renderState.viewportCount);
+
+    // Scissor rects
+    MTL::ScissorRect scissorRects[SLANG_COUNT_OF(RenderState::scissorRects)];
+    for (uint32_t i = 0; i < m_renderState.scissorRectCount; ++i)
+    {
+        const ScissorRect& src = m_renderState.scissorRects[i];
+        MTL::ScissorRect& dst = scissorRects[i];
+        dst.x = src.minX;
+        dst.y = src.minY;
+        dst.width = src.maxX - src.minX;
+        dst.height = src.maxY - src.minY;
+    }
+    encoder->setScissorRects(scissorRects, m_renderState.scissorRectCount);
+
+    // Rasterizer state
+    const RasterizerDesc& rasterizer = m_renderPipeline->m_rasterizerDesc;
+    encoder->setFrontFacingWinding(translateWinding(rasterizer.frontFace));
+    encoder->setCullMode(translateCullMode(rasterizer.cullMode));
+    encoder->setDepthClipMode(rasterizer.depthClipEnable ? MTL::DepthClipModeClip : MTL::DepthClipModeClamp);
+    encoder->setDepthBias(rasterizer.depthBias, rasterizer.slopeScaledDepthBias, rasterizer.depthBiasClamp);
+    encoder->setTriangleFillMode(translateTriangleFillMode(rasterizer.fillMode));
+
+    // Depth/stencil state
+    if (m_useDepthStencil)
+        encoder->setDepthStencilState(m_renderPipeline->m_depthStencilState.get());
+
+    // Stencil reference value
+    encoder->setStencilReferenceValue(m_renderState.stencilRef);
 }
 
 // CommandQueueImpl

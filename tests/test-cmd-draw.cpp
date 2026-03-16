@@ -467,6 +467,211 @@ struct DrawIndexedIndirectTest : BaseDrawTest
     }
 };
 
+struct DrawIndirectCountTest : BaseDrawTest
+{
+    ComPtr<IBuffer> indirectBuffer;
+    ComPtr<IBuffer> countBuffer;
+
+    struct IndirectArgData
+    {
+        float padding;
+        IndirectDrawArguments args;
+    };
+
+    ComPtr<IBuffer> createIndirectBuffer()
+    {
+        static const IndirectArgData kIndirectData = {
+            42.0f,        // padding
+            {6, 2, 0, 0}, // args
+        };
+
+        BufferDesc bufferDesc;
+        bufferDesc.size = sizeof(IndirectArgData);
+        bufferDesc.usage = BufferUsage::IndirectArgument;
+        bufferDesc.defaultState = ResourceState::IndirectArgument;
+        ComPtr<IBuffer> buffer = device->createBuffer(bufferDesc, &kIndirectData);
+        REQUIRE(buffer != nullptr);
+        return buffer;
+    }
+
+    ComPtr<IBuffer> createCountBuffer()
+    {
+        // Count buffer with padding to test offset. The actual count (1) is after the padding.
+        struct CountData
+        {
+            uint32_t padding;
+            uint32_t count;
+        };
+        static const CountData kCountData = {0xDEADBEEF, 1};
+
+        BufferDesc bufferDesc;
+        bufferDesc.size = sizeof(CountData);
+        bufferDesc.usage = BufferUsage::IndirectArgument;
+        bufferDesc.defaultState = ResourceState::IndirectArgument;
+        ComPtr<IBuffer> buffer = device->createBuffer(bufferDesc, &kCountData);
+        REQUIRE(buffer != nullptr);
+        return buffer;
+    }
+
+    void setUpAndDraw()
+    {
+        createRequiredResources();
+
+        auto queue = device->getQueue(QueueType::Graphics);
+        auto commandEncoder = queue->createCommandEncoder();
+
+        RenderPassColorAttachment colorAttachment;
+        colorAttachment.view = colorBufferView;
+        colorAttachment.loadOp = LoadOp::Clear;
+        colorAttachment.storeOp = StoreOp::Store;
+        RenderPassDesc renderPass;
+        renderPass.colorAttachments = &colorAttachment;
+        renderPass.colorAttachmentCount = 1;
+        auto passEncoder = commandEncoder->beginRenderPass(renderPass);
+
+        passEncoder->bindPipeline(pipeline);
+
+        RenderState state;
+        state.vertexBuffers[0] = vertexBuffer;
+        state.vertexBuffers[1] = instanceBuffer;
+        state.vertexBufferCount = 2;
+        state.viewports[0] = Viewport::fromSize(kWidth, kHeight);
+        state.viewportCount = 1;
+        state.scissorRects[0] = ScissorRect::fromSize(kWidth, kHeight);
+        state.scissorRectCount = 1;
+        passEncoder->setRenderState(state);
+
+        uint32_t maxDrawCount = 1;
+        BufferOffsetPair argBuffer = {indirectBuffer, offsetof(IndirectArgData, args)};
+        BufferOffsetPair countBuf = {countBuffer, sizeof(uint32_t)};
+        passEncoder->drawIndirect(maxDrawCount, argBuffer, countBuf);
+        passEncoder->end();
+
+        queue->submit(commandEncoder->finish());
+        queue->waitOnHost();
+    }
+
+    void run()
+    {
+        indirectBuffer = createIndirectBuffer();
+        countBuffer = createCountBuffer();
+
+        setUpAndDraw();
+
+        const int kPixelCount = 4;
+        const int kChannelCount = 4;
+        int testXCoords[kPixelCount] = {64, 192, 64, 192};
+        int testYCoords[kPixelCount] = {100, 100, 250, 250};
+        float testResults[kPixelCount * kChannelCount];
+
+        checkTestResults(kPixelCount, kChannelCount, testXCoords, testYCoords, testResults);
+    }
+};
+
+struct DrawIndexedIndirectCountTest : BaseDrawTest
+{
+    ComPtr<IBuffer> indexBuffer;
+    ComPtr<IBuffer> indirectBuffer;
+    ComPtr<IBuffer> countBuffer;
+
+    struct IndexedIndirectArgData
+    {
+        float padding;
+        IndirectDrawIndexedArguments args;
+    };
+
+    ComPtr<IBuffer> createIndirectBuffer()
+    {
+        static const IndexedIndirectArgData kIndexedIndirectData = {
+            42.0f,           // padding
+            {6, 2, 0, 0, 0}, // args
+        };
+
+        BufferDesc bufferDesc;
+        bufferDesc.size = sizeof(IndexedIndirectArgData);
+        bufferDesc.usage = BufferUsage::IndirectArgument;
+        bufferDesc.defaultState = ResourceState::IndirectArgument;
+        ComPtr<IBuffer> buffer = device->createBuffer(bufferDesc, &kIndexedIndirectData);
+        REQUIRE(buffer != nullptr);
+        return buffer;
+    }
+
+    ComPtr<IBuffer> createCountBuffer()
+    {
+        struct CountData
+        {
+            uint32_t padding;
+            uint32_t count;
+        };
+        static const CountData kCountData = {0xDEADBEEF, 1};
+
+        BufferDesc bufferDesc;
+        bufferDesc.size = sizeof(CountData);
+        bufferDesc.usage = BufferUsage::IndirectArgument;
+        bufferDesc.defaultState = ResourceState::IndirectArgument;
+        ComPtr<IBuffer> buffer = device->createBuffer(bufferDesc, &kCountData);
+        REQUIRE(buffer != nullptr);
+        return buffer;
+    }
+
+    void setUpAndDraw()
+    {
+        createRequiredResources();
+
+        auto queue = device->getQueue(QueueType::Graphics);
+        auto commandEncoder = queue->createCommandEncoder();
+
+        RenderPassColorAttachment colorAttachment;
+        colorAttachment.view = colorBufferView;
+        colorAttachment.loadOp = LoadOp::Clear;
+        colorAttachment.storeOp = StoreOp::Store;
+        RenderPassDesc renderPass;
+        renderPass.colorAttachments = &colorAttachment;
+        renderPass.colorAttachmentCount = 1;
+        auto passEncoder = commandEncoder->beginRenderPass(renderPass);
+
+        passEncoder->bindPipeline(pipeline);
+
+        RenderState state;
+        state.vertexBuffers[0] = vertexBuffer;
+        state.vertexBuffers[1] = instanceBuffer;
+        state.vertexBufferCount = 2;
+        state.indexBuffer = indexBuffer;
+        state.indexFormat = IndexFormat::Uint32;
+        state.viewports[0] = Viewport::fromSize(kWidth, kHeight);
+        state.viewportCount = 1;
+        state.scissorRects[0] = ScissorRect::fromSize(kWidth, kHeight);
+        state.scissorRectCount = 1;
+        passEncoder->setRenderState(state);
+
+        uint32_t maxDrawCount = 1;
+        BufferOffsetPair argBuffer = {indirectBuffer, offsetof(IndexedIndirectArgData, args)};
+        BufferOffsetPair countBuf = {countBuffer, sizeof(uint32_t)};
+        passEncoder->drawIndexedIndirect(maxDrawCount, argBuffer, countBuf);
+        passEncoder->end();
+
+        queue->submit(commandEncoder->finish());
+        queue->waitOnHost();
+    }
+
+    void run()
+    {
+        indexBuffer = createIndexBuffer(device);
+        indirectBuffer = createIndirectBuffer();
+        countBuffer = createCountBuffer();
+
+        setUpAndDraw();
+
+        const int kPixelCount = 4;
+        const int kChannelCount = 4;
+        int testXCoords[kPixelCount] = {64, 192, 64, 192};
+        int testYCoords[kPixelCount] = {32, 100, 150, 250};
+        float testResults[kPixelCount * kChannelCount];
+
+        checkTestResults(kPixelCount, kChannelCount, testXCoords, testYCoords, testResults);
+    }
+};
+
 template<typename T>
 void testDraw(IDevice* device)
 {
@@ -485,12 +690,22 @@ GPU_TEST_CASE("cmd-draw-indexed-instanced", D3D11 | D3D12 | Vulkan | Metal | WGP
     testDraw<DrawIndexedInstancedTest>(device);
 }
 
-GPU_TEST_CASE("cmd-draw-indirect", D3D11 | D3D12 | Vulkan)
+GPU_TEST_CASE("cmd-draw-indirect", D3D11 | D3D12 | Vulkan | Metal)
 {
     testDraw<DrawIndirectTest>(device);
 }
 
-GPU_TEST_CASE("cmd-draw-indexed-indirect", D3D11 | D3D12 | Vulkan)
+GPU_TEST_CASE("cmd-draw-indexed-indirect", D3D11 | D3D12 | Vulkan | Metal)
 {
     testDraw<DrawIndexedIndirectTest>(device);
+}
+
+GPU_TEST_CASE("cmd-draw-indirect-count", D3D12 | Vulkan | Metal)
+{
+    testDraw<DrawIndirectCountTest>(device);
+}
+
+GPU_TEST_CASE("cmd-draw-indexed-indirect-count", D3D12 | Vulkan | Metal)
+{
+    testDraw<DrawIndexedIndirectCountTest>(device);
 }
