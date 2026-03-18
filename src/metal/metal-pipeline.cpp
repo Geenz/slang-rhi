@@ -99,17 +99,14 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
     }
 
     pd->setRasterSampleCount(desc.multisample.sampleCount);
-    // Required for executeCommandsInBuffer (ICB) support used by the countBuffer path
-    // in cmdDrawIndirect/cmdDrawIndexedIndirect. Set on all render pipelines because we don't
-    // know at pipeline creation time whether it will be used with countBuffer.
-    // Apple docs note this "may incur some costs."
-    pd->setSupportIndirectCommandBuffers(true);
 
     if (desc.label)
     {
         pd->setLabel(createString(desc.label).get());
     }
 
+    // Create default pipeline WITHOUT ICB support.
+    // This ensures all shaders compile regardless of ICB compatibility.
     NS::Error* error;
     NS::SharedPtr<MTL::RenderPipelineState> pipelineState =
         NS::TransferPtr(m_device->newRenderPipelineState(pd.get(), &error));
@@ -125,6 +122,17 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
         }
         return SLANG_FAIL;
     }
+
+    // Eagerly attempt ICB-enabled variant for indirect draws.
+    // If the shader uses ICB-incompatible features, this returns null — that's fine.  We fallback in those cases.
+    // This is not particularly ideal - we build the same pipeline twice eagerly.
+    // Ideally we would do this lazily - i.e., only when we first encounter a countBuffer draw.
+    // But that would require some async pipeline creation logic.  Should look into that. at some point.
+    pd->setSupportIndirectCommandBuffers(true);
+    NS::Error* icbError = nullptr;
+    NS::SharedPtr<MTL::RenderPipelineState> icbPipelineState =
+        NS::TransferPtr(m_device->newRenderPipelineState(pd.get(), &icbError));
+    pd->setSupportIndirectCommandBuffers(false);
 
     // Create depth stencil state
     auto createStencilDesc = [](const DepthStencilOpDesc& desc,
@@ -182,6 +190,7 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
     pipeline->m_program = program;
     pipeline->m_rootObjectLayout = program->m_rootObjectLayout;
     pipeline->m_pipelineState = pipelineState;
+    pipeline->m_icbPipelineState = icbPipelineState;
     pipeline->m_depthStencilState = depthStencilState;
     pipeline->m_primitiveType = translatePrimitiveType(desc.primitiveTopology);
     pipeline->m_rasterizerDesc = desc.rasterizer;

@@ -12,6 +12,7 @@ class RenderPipelineImpl : public RenderPipeline
 public:
     RefPtr<RootShaderObjectLayoutImpl> m_rootObjectLayout;
     NS::SharedPtr<MTL::RenderPipelineState> m_pipelineState;
+    NS::SharedPtr<MTL::RenderPipelineState> m_icbPipelineState;
     NS::SharedPtr<MTL::DepthStencilState> m_depthStencilState;
     MTL::PrimitiveType m_primitiveType;
     RasterizerDesc m_rasterizerDesc;
