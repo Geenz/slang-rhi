@@ -1347,6 +1347,66 @@ void CommandQueueImpl::retireCommandBuffers()
                 DebugMessageSource::Driver,
                 fullMsg.c_str()
             );
+
+            // Extract per-encoder error state when enhanced error reporting is enabled.
+            // This tells us which specific encoder (render/compute/blit) caused the fault.
+            if (commandBuffer->m_commandBuffer->errorOptions() & MTL::CommandBufferErrorOptionEncoderExecutionStatus)
+            {
+                if (NS::Error* cbError = commandBuffer->m_commandBuffer->error())
+                {
+                    NS::Dictionary* info = cbError->userInfo();
+                    if (info)
+                    {
+                        // Key defined in MTLDevice.hpp — maps to @"MTLCommandBufferEncoderInfoErrorKey"
+                        NS::Array* encoderInfos = info->object<NS::Array>(MTL::CommandBufferEncoderInfoErrorKey);
+                        if (encoderInfos)
+                        {
+                            for (NS::UInteger i = 0; i < encoderInfos->count(); ++i)
+                            {
+                                auto* ei = encoderInfos->object<MTL::CommandBufferEncoderInfo>(i);
+                                MTL::CommandEncoderErrorState state = ei->errorState();
+
+                                const char* stateStr = "unknown";
+                                switch (state)
+                                {
+                                case MTL::CommandEncoderErrorStateCompleted: stateStr = "completed"; break;
+                                case MTL::CommandEncoderErrorStateAffected: stateStr = "affected"; break;
+                                case MTL::CommandEncoderErrorStatePending: stateStr = "pending"; break;
+                                case MTL::CommandEncoderErrorStateFaulted: stateStr = "FAULTED"; break;
+                                default: break;
+                                }
+
+                                NS::String* encoderLabel = ei->label();
+                                std::string encoderMsg = "  Encoder[" + std::to_string(i) + "] '"
+                                    + std::string(encoderLabel ? encoderLabel->utf8String() : "<no label>")
+                                    + "' state=" + stateStr;
+
+                                // Include debug signposts if any
+                                NS::Array* signposts = ei->debugSignposts();
+                                if (signposts && signposts->count() > 0)
+                                {
+                                    encoderMsg += " signposts=[";
+                                    for (NS::UInteger j = 0; j < signposts->count(); ++j)
+                                    {
+                                        if (j > 0) encoderMsg += ", ";
+                                        auto* sp = signposts->object<NS::String>(j);
+                                        if (sp) encoderMsg += sp->utf8String();
+                                    }
+                                    encoderMsg += "]";
+                                }
+
+                                m_device->handleMessage(
+                                    state == MTL::CommandEncoderErrorStateFaulted
+                                        ? DebugMessageType::Error : DebugMessageType::Warning,
+                                    DebugMessageSource::Driver,
+                                    encoderMsg.c_str()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             commandBuffer->reset();
         }
         else
@@ -1579,7 +1639,14 @@ CommandBufferImpl::~CommandBufferImpl() {}
 Result CommandBufferImpl::init()
 {
     AUTORELEASEPOOL
-    m_commandBuffer = NS::RetainPtr(m_queue->m_commandQueue->commandBuffer());
+
+    // Use descriptor to enable enhanced error reporting.
+    // CommandBufferErrorOptionEncoderExecutionStatus tracks per-encoder fault state,
+    // allowing us to identify which specific render/compute/blit encoder caused a GPU fault.
+    auto desc = NS::TransferPtr(MTL::CommandBufferDescriptor::alloc()->init());
+    desc->setErrorOptions(MTL::CommandBufferErrorOptionEncoderExecutionStatus);
+    desc->setRetainedReferences(true);
+    m_commandBuffer = NS::RetainPtr(m_queue->m_commandQueue->commandBuffer(desc.get()));
     if (!m_commandBuffer)
     {
         return SLANG_FAIL;
