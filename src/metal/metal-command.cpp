@@ -692,7 +692,23 @@ void CommandRecorder::cmdDrawIndirect(const commands::DrawIndirect& cmd)
         return;
     }
 
-    // ICB path for countBuffer
+    // ICB path for countBuffer — requires ICB-enabled pipeline variant
+    auto* icbPipelineState = m_renderPipeline->m_icbPipelineState.get();
+    if (!icbPipelineState)
+    {
+        // Shader is ICB-incompatible — fall back to CPU loop.
+        // countBuffer is ignored (draw count capped at maxDrawCount).
+        for (uint32_t i = 0; i < cmd.maxDrawCount; ++i)
+        {
+            m_renderCommandEncoder->drawPrimitives(
+                m_renderPipeline->m_primitiveType,
+                argBuffer->m_buffer.get(),
+                cmd.argBuffer.offset + i * sizeof(IndirectDrawArguments)
+            );
+        }
+        return;
+    }
+
     BufferImpl* countBuffer = checked_cast<BufferImpl*>(cmd.countBuffer.buffer);
     auto [icb, icbArgBuffer] = m_device->m_indirectEngine.getOrCreateICB(MTL::IndirectCommandTypeDraw, cmd.maxDrawCount);
     auto* rangeBuffer = m_device->m_indirectEngine.getRangeBuffer();
@@ -728,8 +744,11 @@ void CommandRecorder::cmdDrawIndirect(const commands::DrawIndirect& cmd)
     // 4. Restore render pass with LoadAction::Load
     restoreRenderEncoder();
 
-    // 5. Execute ICB with GPU-driven range
+    // 5. Bind ICB-enabled pipeline variant and execute ICB
+    m_renderCommandEncoder->setRenderPipelineState(icbPipelineState);
     m_renderCommandEncoder->executeCommandsInBuffer(icb, rangeBuffer, 0);
+    // Restore default pipeline for any subsequent draw calls in this pass
+    m_renderCommandEncoder->setRenderPipelineState(m_renderPipeline->m_pipelineState.get());
 }
 
 void CommandRecorder::cmdDrawIndexedIndirect(const commands::DrawIndexedIndirect& cmd)
@@ -756,7 +775,26 @@ void CommandRecorder::cmdDrawIndexedIndirect(const commands::DrawIndexedIndirect
         return;
     }
 
-    // ICB path for countBuffer
+    // ICB path for countBuffer — requires ICB-enabled pipeline variant
+    auto* icbPipelineState = m_renderPipeline->m_icbPipelineState.get();
+    if (!icbPipelineState)
+    {
+        // Shader is ICB-incompatible — fall back to CPU loop.
+        // countBuffer is ignored (draw count capped at maxDrawCount).
+        for (uint32_t i = 0; i < cmd.maxDrawCount; ++i)
+        {
+            m_renderCommandEncoder->drawIndexedPrimitives(
+                m_renderPipeline->m_primitiveType,
+                m_indexType,
+                m_indexBuffer->m_buffer.get(),
+                m_indexBufferOffset,
+                argBuffer->m_buffer.get(),
+                cmd.argBuffer.offset + i * sizeof(IndirectDrawIndexedArguments)
+            );
+        }
+        return;
+    }
+
     BufferImpl* countBuffer = checked_cast<BufferImpl*>(cmd.countBuffer.buffer);
     auto [icb, icbArgBuffer] =
         m_device->m_indirectEngine.getOrCreateICB(MTL::IndirectCommandTypeDrawIndexed, cmd.maxDrawCount);
@@ -796,8 +834,11 @@ void CommandRecorder::cmdDrawIndexedIndirect(const commands::DrawIndexedIndirect
     // 4. Restore render pass with LoadAction::Load
     restoreRenderEncoder();
 
-    // 5. Execute ICB with GPU-driven range
+    // 5. Bind ICB-enabled pipeline variant and execute ICB
+    m_renderCommandEncoder->setRenderPipelineState(icbPipelineState);
     m_renderCommandEncoder->executeCommandsInBuffer(icb, rangeBuffer, 0);
+    // Restore default pipeline for any subsequent draw calls in this pass
+    m_renderCommandEncoder->setRenderPipelineState(m_renderPipeline->m_pipelineState.get());
 }
 
 void CommandRecorder::cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd)
