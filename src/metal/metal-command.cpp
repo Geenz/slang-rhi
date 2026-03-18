@@ -377,12 +377,13 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
     uint32_t width = 1;
     uint32_t height = 1;
 
-    auto visitView = [&](TextureViewImpl* view)
+    auto visitView = [&](TextureViewImpl* view, uint32_t additionalMipOffset = 0)
     {
         const TextureDesc& textureDesc = view->m_texture->m_desc;
         const TextureViewDesc& viewDesc = view->m_desc;
-        width = max(1u, uint32_t(textureDesc.size.width >> viewDesc.subresourceRange.mip));
-        height = max(1u, uint32_t(textureDesc.size.height >> viewDesc.subresourceRange.mip));
+        uint32_t absoluteMip = viewDesc.subresourceRange.mip + additionalMipOffset;
+        width = max(1u, uint32_t(textureDesc.size.width >> absoluteMip));
+        height = max(1u, uint32_t(textureDesc.size.height >> absoluteMip));
     };
 
     // Initialize render pass descriptor.
@@ -397,7 +398,24 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
         TextureViewImpl* view = checked_cast<TextureViewImpl*>(attachment.view);
         if (!view)
             return;
-        visitView(view);
+
+        // Compute view-relative level and slice for Metal attachment.
+        // If attachment.subresourceRange is explicitly set (non-zero counts), use its
+        // mip/layer as view-relative offsets and adjust render target dimensions.
+        // Otherwise, use level=0/slice=0 (base of view) with the view's base mip for dimensions.
+        const auto& sr = attachment.subresourceRange;
+        uint32_t level = 0;
+        uint32_t slice = 0;
+        if (sr.layerCount > 0 || sr.mipCount > 0)
+        {
+            level = sr.mip;
+            slice = sr.layer;
+            visitView(view, sr.mip);
+        }
+        else
+        {
+            visitView(view);
+        }
 
         MTL::RenderPassColorAttachmentDescriptor* colorAttachment = renderPassDesc->colorAttachments()->object(i);
         colorAttachment->setLoadAction(translateLoadOp(attachment.loadOp));
@@ -418,8 +436,8 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
             attachment.resolveTarget ? checked_cast<TextureViewImpl*>(attachment.resolveTarget)->m_textureView.get()
                                      : nullptr
         );
-        colorAttachment->setLevel(attachment.subresourceRange.mip);
-        colorAttachment->setSlice(attachment.subresourceRange.layer);
+        colorAttachment->setLevel(level);
+        colorAttachment->setSlice(slice);
     }
 
     // Setup depth stencil attachment.
@@ -429,7 +447,21 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
         TextureViewImpl* view = checked_cast<TextureViewImpl*>(attachment.view);
         if (!view)
             return;
-        visitView(view);
+
+        // Compute view-relative level and slice for depth/stencil attachment.
+        const auto& sr = attachment.subresourceRange;
+        uint32_t level = 0;
+        uint32_t slice = 0;
+        if (sr.layerCount > 0 || sr.mipCount > 0)
+        {
+            level = sr.mip;
+            slice = sr.layer;
+            visitView(view, sr.mip);
+        }
+        else
+        {
+            visitView(view);
+        }
 
         MTL::PixelFormat pixelFormat = translatePixelFormat(view->m_desc.format);
         if (isDepthFormat(pixelFormat))
@@ -442,8 +474,8 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
                 depthAttachment->setClearDepth(attachment.depthClearValue);
             }
             depthAttachment->setTexture(view->m_textureView.get());
-            depthAttachment->setLevel(attachment.subresourceRange.mip);
-            depthAttachment->setSlice(attachment.subresourceRange.layer);
+            depthAttachment->setLevel(level);
+            depthAttachment->setSlice(slice);
         }
         if (isStencilFormat(pixelFormat))
         {
@@ -455,8 +487,8 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
                 stencilAttachment->setClearStencil(attachment.stencilClearValue);
             }
             stencilAttachment->setTexture(view->m_textureView.get());
-            stencilAttachment->setLevel(attachment.subresourceRange.mip);
-            stencilAttachment->setSlice(attachment.subresourceRange.layer);
+            stencilAttachment->setLevel(level);
+            stencilAttachment->setSlice(slice);
         }
     }
 
