@@ -78,6 +78,9 @@ enum class StructType
     DeviceDesc,
     HeapDesc,
 
+    CommandEncoderDesc,
+    CommandBufferDesc,
+
     D3D12DeviceExtendedDesc,
     D3D12ExperimentalFeaturesDesc,
 
@@ -397,6 +400,14 @@ enum class Format
     BC6HSfloat,
     BC7Unorm,
     BC7UnormSrgb,
+
+    // ASTC compressed formats
+    ASTC4x4Unorm,
+    ASTC4x4UnormSrgb,
+    ASTC6x6Unorm,
+    ASTC6x6UnormSrgb,
+    ASTC8x8Unorm,
+    ASTC8x8UnormSrgb,
 
     _Count,
 };
@@ -1435,11 +1446,19 @@ struct AccelerationStructureMotionCreateInfo
     uint32_t maxInstances = 0;
 };
 
+enum class AccelerationStructureKind
+{
+    Unknown,
+    BottomLevel,
+    TopLevel,
+};
+
 struct AccelerationStructureDesc
 {
     StructType structType = StructType::AccelerationStructureDesc;
     const void* next = nullptr;
 
+    AccelerationStructureKind kind = AccelerationStructureKind::Unknown;
     uint64_t size;
     AccelerationStructureBuildFlags flags = AccelerationStructureBuildFlags::None;
 
@@ -1453,6 +1472,7 @@ class IAccelerationStructure : public IResource
     SLANG_COM_INTERFACE(0x38b056d5, 0x63de, 0x49ca, {0xa0, 0xed, 0x62, 0xa1, 0xbe, 0xc3, 0xd4, 0x65});
 
 public:
+    virtual SLANG_NO_THROW const AccelerationStructureDesc& SLANG_MCALL getDesc() = 0;
     virtual SLANG_NO_THROW AccelerationStructureHandle SLANG_MCALL getHandle() = 0;
     virtual SLANG_NO_THROW DeviceAddress SLANG_MCALL getDeviceAddress() = 0;
     virtual SLANG_NO_THROW Result SLANG_MCALL getDescriptorHandle(DescriptorHandle* outHandle) = 0;
@@ -2218,7 +2238,7 @@ class IQueryPool : public ISlangUnknown
 
 public:
     virtual SLANG_NO_THROW const QueryPoolDesc& SLANG_MCALL getDesc() = 0;
-    virtual SLANG_NO_THROW Result SLANG_MCALL getResult(uint32_t queryIndex, uint32_t count, uint64_t* data) = 0;
+    virtual SLANG_NO_THROW Result SLANG_MCALL getResult(uint32_t queryIndex, uint32_t count, uint64_t* outData) = 0;
     virtual SLANG_NO_THROW Result SLANG_MCALL reset() = 0;
 };
 
@@ -2372,11 +2392,22 @@ struct MarkerColor
     float b;
 };
 
+struct CommandBufferDesc
+{
+    StructType structType = StructType::CommandBufferDesc;
+    const void* next = nullptr;
+
+    /// The name of the command buffer for debugging purposes.
+    const char* label = nullptr;
+};
+
 class ICommandBuffer : public ISlangUnknown
 {
     SLANG_COM_INTERFACE(0x58e5d83f, 0xad31, 0x44ea, {0xa4, 0xd1, 0x5e, 0x65, 0x9c, 0xd9, 0xa7, 0x57});
 
 public:
+    virtual SLANG_NO_THROW const CommandBufferDesc& SLANG_MCALL getDesc() = 0;
+
     virtual SLANG_NO_THROW Result SLANG_MCALL getNativeHandle(NativeHandle* outHandle) = 0;
 
     /// Set a debug label for this command buffer.
@@ -2458,11 +2489,22 @@ public:
     ) = 0;
 };
 
+struct CommandEncoderDesc
+{
+    StructType structType = StructType::CommandEncoderDesc;
+    const void* next = nullptr;
+
+    /// The name of the command encoder for debugging purposes.
+    const char* label = nullptr;
+};
+
 class ICommandEncoder : public ISlangUnknown
 {
     SLANG_COM_INTERFACE(0x8ee39d55, 0x2b07, 0x4e61, {0x8f, 0x13, 0x1d, 0x6c, 0x01, 0xa9, 0x15, 0x43});
 
 public:
+    virtual SLANG_NO_THROW const CommandEncoderDesc& SLANG_MCALL getDesc() = 0;
+
     virtual SLANG_NO_THROW IRenderPassEncoder* SLANG_MCALL beginRenderPass(const RenderPassDesc& desc) = 0;
     virtual SLANG_NO_THROW IComputePassEncoder* SLANG_MCALL beginComputePass() = 0;
     virtual SLANG_NO_THROW IRayTracingPassEncoder* SLANG_MCALL beginRayTracingPass() = 0;
@@ -2633,7 +2675,19 @@ public:
 
     virtual SLANG_NO_THROW void SLANG_MCALL writeTimestamp(IQueryPool* queryPool, uint32_t queryIndex) = 0;
 
-    virtual SLANG_NO_THROW Result SLANG_MCALL finish(ICommandBuffer** outCommandBuffer) = 0;
+    virtual SLANG_NO_THROW Result SLANG_MCALL finish(
+        const CommandBufferDesc& desc,
+        ICommandBuffer** outCommandBuffer
+    ) = 0;
+
+    inline Result finish(ICommandBuffer** outCommandBuffer) { return finish(CommandBufferDesc{}, outCommandBuffer); }
+
+    inline ComPtr<ICommandBuffer> finish(const CommandBufferDesc& desc)
+    {
+        ComPtr<ICommandBuffer> commandBuffer;
+        SLANG_RETURN_NULL_ON_FAIL(finish(desc, commandBuffer.writeRef()));
+        return commandBuffer;
+    }
 
     inline ComPtr<ICommandBuffer> finish()
     {
@@ -2689,7 +2743,22 @@ class ICommandQueue : public ISlangUnknown
 public:
     virtual SLANG_NO_THROW QueueType SLANG_MCALL getType() = 0;
 
-    virtual SLANG_NO_THROW Result SLANG_MCALL createCommandEncoder(ICommandEncoder** outEncoder) = 0;
+    virtual SLANG_NO_THROW Result SLANG_MCALL createCommandEncoder(
+        const CommandEncoderDesc& desc,
+        ICommandEncoder** outEncoder
+    ) = 0;
+
+    inline Result createCommandEncoder(ICommandEncoder** outEncoder)
+    {
+        return createCommandEncoder(CommandEncoderDesc{}, outEncoder);
+    }
+
+    inline ComPtr<ICommandEncoder> createCommandEncoder(const CommandEncoderDesc& desc)
+    {
+        ComPtr<ICommandEncoder> encoder;
+        SLANG_RETURN_NULL_ON_FAIL(createCommandEncoder(desc, encoder.writeRef()));
+        return encoder;
+    }
 
     inline ComPtr<ICommandEncoder> createCommandEncoder()
     {

@@ -1058,9 +1058,10 @@ void CommandRecorder::cmdSetComputeState(const commands::SetComputeState& cmd)
     {
         m_bindingData = static_cast<BindingDataImpl*>(cmd.bindingData);
         requireBindingStates(m_bindingData);
-        commitBarriers();
         setBindings(m_bindingData, VK_PIPELINE_BIND_POINT_COMPUTE);
     }
+
+    commitBarriers();
 
     m_computeStateValid = true;
 
@@ -1120,7 +1121,6 @@ void CommandRecorder::cmdSetRayTracingState(const commands::SetRayTracingState& 
     {
         m_bindingData = static_cast<BindingDataImpl*>(cmd.bindingData);
         requireBindingStates(m_bindingData);
-        commitBarriers();
         setBindings(m_bindingData, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
     }
 
@@ -1133,6 +1133,7 @@ void CommandRecorder::cmdSetRayTracingState(const commands::SetRayTracingState& 
             m_rayTracingStateValid = false;
             return;
         }
+        requireBufferState(m_shaderTablePipelineData->buffer, ResourceState::ShaderResource);
         DeviceAddress shaderTableAddr = m_shaderTablePipelineData->buffer->getDeviceAddress();
 
         // Raygen address, stride, and size are set at dispatch time since each raygen
@@ -1151,6 +1152,8 @@ void CommandRecorder::cmdSetRayTracingState(const commands::SetRayTracingState& 
         m_callableSBT.stride = m_shaderTablePipelineData->callableRecordStride;
         m_callableSBT.size = m_shaderTablePipelineData->callableTableSize;
     }
+
+    commitBarriers();
 
     m_rayTracingStateValid = true;
 
@@ -2023,9 +2026,9 @@ uint64_t CommandQueueImpl::updateLastFinishedID()
     return m_lastFinishedID;
 }
 
-Result CommandQueueImpl::createCommandEncoder(ICommandEncoder** outEncoder)
+Result CommandQueueImpl::createCommandEncoder(const CommandEncoderDesc& desc, ICommandEncoder** outEncoder)
 {
-    RefPtr<CommandEncoderImpl> encoder = new CommandEncoderImpl(m_device, this);
+    RefPtr<CommandEncoderImpl> encoder = new CommandEncoderImpl(m_device, this, desc);
     SLANG_RETURN_ON_FAIL(encoder->init());
     returnComPtr(outEncoder, encoder);
     return SLANG_OK;
@@ -2146,8 +2149,8 @@ Result CommandQueueImpl::getNativeHandle(NativeHandle* outHandle)
 
 // CommandEncoderImpl
 
-CommandEncoderImpl::CommandEncoderImpl(Device* device, CommandQueueImpl* queue)
-    : CommandEncoder(device)
+CommandEncoderImpl::CommandEncoderImpl(Device* device, CommandQueueImpl* queue, const CommandEncoderDesc& desc)
+    : CommandEncoder(device, desc)
     , m_queue(queue)
 {
 }
@@ -2186,8 +2189,19 @@ Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingD
     );
 }
 
-Result CommandEncoderImpl::finish(ICommandBuffer** outCommandBuffer)
+Result CommandEncoderImpl::finish(const CommandBufferDesc& desc, ICommandBuffer** outCommandBuffer)
 {
+    DeviceImpl* device = getDevice<DeviceImpl>();
+    bool hadLabel = m_commandBuffer->m_desc.label != nullptr;
+    m_commandBuffer->setDesc(desc);
+    if (hadLabel)
+    {
+        device->_labelObject(
+            (uint64_t)m_commandBuffer->m_commandBuffer,
+            VK_OBJECT_TYPE_COMMAND_BUFFER,
+            m_commandBuffer->m_desc.label
+        );
+    }
     SLANG_RETURN_ON_FAIL(resolvePipelines(m_device));
     m_commandBuffer->m_constantBufferPool.finish();
     CommandRecorder recorder(getDevice<DeviceImpl>());
