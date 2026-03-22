@@ -597,20 +597,47 @@ void CommandRecorder::cmdSetRenderState(const commands::SetRenderState& cmd)
     if (updateBindings)
     {
         m_bindingData = static_cast<BindingDataImpl*>(cmd.bindingData);
-        encoder->setVertexBuffers(
-            m_bindingData->buffers,
-            m_bindingData->bufferOffsets,
-            NS::Range(0, m_bindingData->bufferCount)
-        );
-        encoder->setFragmentBuffers(
-            m_bindingData->buffers,
-            m_bindingData->bufferOffsets,
-            NS::Range(0, m_bindingData->bufferCount)
-        );
-        encoder->setVertexTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
-        encoder->setFragmentTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
-        encoder->setVertexSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
-        encoder->setFragmentSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
+        if (m_renderPipeline->m_isMeshPipeline)
+        {
+            encoder->setObjectBuffers(
+                m_bindingData->buffers,
+                m_bindingData->bufferOffsets,
+                NS::Range(0, m_bindingData->bufferCount)
+            );
+            encoder->setMeshBuffers(
+                m_bindingData->buffers,
+                m_bindingData->bufferOffsets,
+                NS::Range(0, m_bindingData->bufferCount)
+            );
+            encoder->setFragmentBuffers(
+                m_bindingData->buffers,
+                m_bindingData->bufferOffsets,
+                NS::Range(0, m_bindingData->bufferCount)
+            );
+            encoder->setObjectTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
+            encoder->setMeshTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
+            encoder->setFragmentTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
+            encoder->setObjectSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
+            encoder->setMeshSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
+            encoder->setFragmentSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
+        }
+        else
+        {
+            encoder->setVertexBuffers(
+                m_bindingData->buffers,
+                m_bindingData->bufferOffsets,
+                NS::Range(0, m_bindingData->bufferCount)
+            );
+            encoder->setFragmentBuffers(
+                m_bindingData->buffers,
+                m_bindingData->bufferOffsets,
+                NS::Range(0, m_bindingData->bufferCount)
+            );
+            encoder->setVertexTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
+            encoder->setFragmentTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
+            encoder->setVertexSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
+            encoder->setFragmentSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
+        }
         encoder->useResources(m_bindingData->usedResources, m_bindingData->usedResourceCount, MTL::ResourceUsageRead);
         encoder->useResources(
             m_bindingData->usedRWResources,
@@ -910,8 +937,16 @@ void CommandRecorder::cmdDrawIndexedIndirect(const commands::DrawIndexedIndirect
 
 void CommandRecorder::cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd)
 {
-    SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(IRenderPassEncoder, drawMeshTasks);
+    if (!m_renderStateValid)
+        return;
+
+    MTL::Size threadgroupsPerGrid = MTL::Size::Make(cmd.x, cmd.y, cmd.z);
+
+    m_renderCommandEncoder->drawMeshThreadgroups(
+        threadgroupsPerGrid,
+        m_renderPipeline->m_objectThreadgroupSize,
+        m_renderPipeline->m_meshThreadgroupSize
+    );
 }
 
 void CommandRecorder::cmdBeginComputePass(const commands::BeginComputePass& cmd)
@@ -1233,21 +1268,48 @@ void CommandRecorder::restoreRenderEncoder()
     // Pipeline
     encoder->setRenderPipelineState(m_renderPipeline->m_pipelineState.get());
 
-    // Shader bindings (vertex/fragment buffers, textures, samplers, resources)
-    encoder->setVertexBuffers(
-        m_bindingData->buffers,
-        m_bindingData->bufferOffsets,
-        NS::Range(0, m_bindingData->bufferCount)
-    );
-    encoder->setFragmentBuffers(
-        m_bindingData->buffers,
-        m_bindingData->bufferOffsets,
-        NS::Range(0, m_bindingData->bufferCount)
-    );
-    encoder->setVertexTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
-    encoder->setFragmentTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
-    encoder->setVertexSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
-    encoder->setFragmentSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
+    // Shader bindings (buffers, textures, samplers, resources)
+    if (m_renderPipeline->m_isMeshPipeline)
+    {
+        encoder->setObjectBuffers(
+            m_bindingData->buffers,
+            m_bindingData->bufferOffsets,
+            NS::Range(0, m_bindingData->bufferCount)
+        );
+        encoder->setMeshBuffers(
+            m_bindingData->buffers,
+            m_bindingData->bufferOffsets,
+            NS::Range(0, m_bindingData->bufferCount)
+        );
+        encoder->setFragmentBuffers(
+            m_bindingData->buffers,
+            m_bindingData->bufferOffsets,
+            NS::Range(0, m_bindingData->bufferCount)
+        );
+        encoder->setObjectTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
+        encoder->setMeshTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
+        encoder->setFragmentTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
+        encoder->setObjectSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
+        encoder->setMeshSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
+        encoder->setFragmentSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
+    }
+    else
+    {
+        encoder->setVertexBuffers(
+            m_bindingData->buffers,
+            m_bindingData->bufferOffsets,
+            NS::Range(0, m_bindingData->bufferCount)
+        );
+        encoder->setFragmentBuffers(
+            m_bindingData->buffers,
+            m_bindingData->bufferOffsets,
+            NS::Range(0, m_bindingData->bufferCount)
+        );
+        encoder->setVertexTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
+        encoder->setFragmentTextures(m_bindingData->textures, NS::Range(0, m_bindingData->textureCount));
+        encoder->setVertexSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
+        encoder->setFragmentSamplerStates(m_bindingData->samplers, NS::Range(0, m_bindingData->samplerCount));
+    }
     encoder->useResources(m_bindingData->usedResources, m_bindingData->usedResourceCount, MTL::ResourceUsageRead);
     encoder->useResources(
         m_bindingData->usedRWResources,

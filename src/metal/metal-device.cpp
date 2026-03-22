@@ -231,6 +231,11 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
         addFeature(Feature::ParameterBlock);
     }
 
+    if (m_device->supportsFamily(MTL::GPUFamilyMetal3))
+    {
+        addFeature(Feature::MeshShader);
+    }
+
     addCapability(Capability::metal);
 
     auto supportsAnyGPUFamilyInRange = [&](MTL::GPUFamily first, MTL::GPUFamily last)

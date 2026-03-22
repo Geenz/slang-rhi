@@ -17,6 +17,9 @@ public:
     MTL::PrimitiveType m_primitiveType;
     RasterizerDesc m_rasterizerDesc;
     NS::UInteger m_vertexBufferOffset;
+    bool m_isMeshPipeline = false;
+    MTL::Size m_objectThreadgroupSize = MTL::Size::Make(1, 1, 1);
+    MTL::Size m_meshThreadgroupSize = MTL::Size::Make(1, 1, 1);
 
     RenderPipelineImpl(Device* device, const RenderPipelineDesc& desc);
 

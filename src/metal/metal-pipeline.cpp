@@ -31,108 +31,187 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
         return SLANG_FAIL;
     SLANG_RHI_ASSERT(!program->m_modules.empty());
 
-    NS::SharedPtr<MTL::RenderPipelineDescriptor> pd = NS::TransferPtr(MTL::RenderPipelineDescriptor::alloc()->init());
+    bool isMeshPipeline = program->isMeshShaderProgram();
+    NS::SharedPtr<MTL::RenderPipelineState> pipelineState;
+    NS::SharedPtr<MTL::RenderPipelineState> icbPipelineState;
+    NS::UInteger vertexBufferOffset = 0;
+    MTL::Size objectThreadgroupSize = MTL::Size::Make(1, 1, 1);
+    MTL::Size meshThreadgroupSize = MTL::Size::Make(1, 1, 1);
 
-    for (const ShaderProgramImpl::Module& module : program->m_modules)
+    // Lambda to configure color/depth/stencil attachments on either pipeline descriptor type.
+    auto configureRenderTargets = [&](auto* pd)
     {
-        auto functionName = createString(module.entryPointName.data());
-        NS::SharedPtr<MTL::Function> function = NS::TransferPtr(module.library->newFunction(functionName.get()));
-        if (!function)
+        pd->setAlphaToCoverageEnabled(desc.multisample.alphaToCoverageEnable);
+
+        for (uint32_t i = 0; i < desc.targetCount; ++i)
+        {
+            const ColorTargetDesc& targetState = desc.targets[i];
+            MTL::RenderPipelineColorAttachmentDescriptor* colorAttachment = pd->colorAttachments()->object(i);
+            colorAttachment->setPixelFormat(translatePixelFormat(targetState.format));
+
+            colorAttachment->setBlendingEnabled(targetState.enableBlend);
+            colorAttachment->setSourceRGBBlendFactor(translateBlendFactor(targetState.color.srcFactor));
+            colorAttachment->setDestinationRGBBlendFactor(translateBlendFactor(targetState.color.dstFactor));
+            colorAttachment->setRgbBlendOperation(translateBlendOperation(targetState.color.op));
+            colorAttachment->setSourceAlphaBlendFactor(translateBlendFactor(targetState.alpha.srcFactor));
+            colorAttachment->setDestinationAlphaBlendFactor(translateBlendFactor(targetState.alpha.dstFactor));
+            colorAttachment->setAlphaBlendOperation(translateBlendOperation(targetState.alpha.op));
+            colorAttachment->setWriteMask(translateColorWriteMask(targetState.writeMask));
+        }
+        if (desc.depthStencil.format != Format::Undefined)
+        {
+            const DepthStencilDesc& depthStencil = desc.depthStencil;
+            MTL::PixelFormat pixelFormat = translatePixelFormat(depthStencil.format);
+            if (isDepthFormat(pixelFormat))
+            {
+                pd->setDepthAttachmentPixelFormat(translatePixelFormat(depthStencil.format));
+            }
+            if (isStencilFormat(pixelFormat))
+            {
+                pd->setStencilAttachmentPixelFormat(translatePixelFormat(depthStencil.format));
+            }
+        }
+
+        pd->setRasterSampleCount(desc.multisample.sampleCount);
+
+        if (desc.label)
+        {
+            pd->setLabel(createString(desc.label).get());
+        }
+    };
+
+    if (isMeshPipeline)
+    {
+        // Mesh shader pipeline path — uses MeshRenderPipelineDescriptor
+        NS::SharedPtr<MTL::MeshRenderPipelineDescriptor> meshPd =
+            NS::TransferPtr(MTL::MeshRenderPipelineDescriptor::alloc()->init());
+
+        for (const ShaderProgramImpl::Module& module : program->m_modules)
+        {
+            auto functionName = createString(module.entryPointName.data());
+            NS::SharedPtr<MTL::Function> function =
+                NS::TransferPtr(module.library->newFunction(functionName.get()));
+            if (!function)
+                return SLANG_FAIL;
+
+            switch (module.stage)
+            {
+            case SLANG_STAGE_MESH:
+                meshPd->setMeshFunction(function.get());
+                break;
+            case SLANG_STAGE_AMPLIFICATION:
+                meshPd->setObjectFunction(function.get());
+                break;
+            case SLANG_STAGE_FRAGMENT:
+                meshPd->setFragmentFunction(function.get());
+                break;
+            default:
+                return SLANG_FAIL;
+            }
+        }
+
+        configureRenderTargets(meshPd.get());
+
+        // Extract threadgroup sizes from Slang reflection.
+        auto programReflection = program->linkedProgram->getLayout();
+        for (SlangUInt i = 0; i < programReflection->getEntryPointCount(); ++i)
+        {
+            auto entryPoint = programReflection->getEntryPointByIndex(i);
+            SlangStage stage = entryPoint->getStage();
+            if (stage == SLANG_STAGE_MESH)
+            {
+                SlangUInt threadGroupSize[3];
+                entryPoint->getComputeThreadGroupSize(3, threadGroupSize);
+                meshThreadgroupSize = MTL::Size::Make(threadGroupSize[0], threadGroupSize[1], threadGroupSize[2]);
+            }
+            else if (stage == SLANG_STAGE_AMPLIFICATION)
+            {
+                SlangUInt threadGroupSize[3];
+                entryPoint->getComputeThreadGroupSize(3, threadGroupSize);
+                objectThreadgroupSize = MTL::Size::Make(threadGroupSize[0], threadGroupSize[1], threadGroupSize[2]);
+            }
+        }
+
+        NS::Error* error = nullptr;
+        pipelineState = NS::TransferPtr(
+            m_device->newRenderPipelineState(meshPd.get(), MTL::PipelineOptionNone, nullptr, &error));
+        if (!pipelineState)
+        {
+            if (error)
+            {
+                handleMessage(
+                    DebugMessageType::Error,
+                    DebugMessageSource::Driver,
+                    error->localizedDescription()->utf8String()
+                );
+            }
             return SLANG_FAIL;
+        }
+        // No ICB variant for mesh pipelines
+    }
+    else
+    {
+        // Traditional vertex/fragment pipeline path
+        NS::SharedPtr<MTL::RenderPipelineDescriptor> pd =
+            NS::TransferPtr(MTL::RenderPipelineDescriptor::alloc()->init());
 
-        switch (module.stage)
+        for (const ShaderProgramImpl::Module& module : program->m_modules)
         {
-        case SLANG_STAGE_VERTEX:
-            pd->setVertexFunction(function.get());
-            break;
-        case SLANG_STAGE_FRAGMENT:
-            pd->setFragmentFunction(function.get());
-            break;
-        default:
+            auto functionName = createString(module.entryPointName.data());
+            NS::SharedPtr<MTL::Function> function =
+                NS::TransferPtr(module.library->newFunction(functionName.get()));
+            if (!function)
+                return SLANG_FAIL;
+
+            switch (module.stage)
+            {
+            case SLANG_STAGE_VERTEX:
+                pd->setVertexFunction(function.get());
+                break;
+            case SLANG_STAGE_FRAGMENT:
+                pd->setFragmentFunction(function.get());
+                break;
+            default:
+                return SLANG_FAIL;
+            }
+        }
+
+        // Create a vertex descriptor with the vertex buffer binding indices being offset.
+        // They need to be in a range not used by any buffers in the root object layout.
+        // The +1 is to account for a potential constant buffer at index 0.
+        vertexBufferOffset = program->m_rootObjectLayout->getTotalBufferCount() + 1;
+        if (inputLayout)
+        {
+            NS::SharedPtr<MTL::VertexDescriptor> vertexDescriptor;
+            vertexDescriptor = inputLayout->createVertexDescriptor(vertexBufferOffset);
+            pd->setVertexDescriptor(vertexDescriptor.get());
+        }
+        pd->setInputPrimitiveTopology(translatePrimitiveTopologyClass(desc.primitiveTopology));
+
+        configureRenderTargets(pd.get());
+
+        // Create default pipeline WITHOUT ICB support.
+        NS::Error* error;
+        pipelineState = NS::TransferPtr(m_device->newRenderPipelineState(pd.get(), &error));
+        if (!pipelineState)
+        {
+            if (error)
+            {
+                handleMessage(
+                    DebugMessageType::Error,
+                    DebugMessageSource::Driver,
+                    error->localizedDescription()->utf8String()
+                );
+            }
             return SLANG_FAIL;
         }
+
+        // Eagerly attempt ICB-enabled variant for indirect draws.
+        pd->setSupportIndirectCommandBuffers(true);
+        NS::Error* icbError = nullptr;
+        icbPipelineState = NS::TransferPtr(m_device->newRenderPipelineState(pd.get(), &icbError));
+        pd->setSupportIndirectCommandBuffers(false);
     }
-
-    // Create a vertex descriptor with the vertex buffer binding indices being offset.
-    // They need to be in a range not used by any buffers in the root object layout.
-    // The +1 is to account for a potential constant buffer at index 0.
-    NS::UInteger vertexBufferOffset = program->m_rootObjectLayout->getTotalBufferCount() + 1;
-    if (inputLayout)
-    {
-        NS::SharedPtr<MTL::VertexDescriptor> vertexDescriptor;
-        vertexDescriptor = inputLayout->createVertexDescriptor(vertexBufferOffset);
-        pd->setVertexDescriptor(vertexDescriptor.get());
-    }
-    pd->setInputPrimitiveTopology(translatePrimitiveTopologyClass(desc.primitiveTopology));
-
-    pd->setAlphaToCoverageEnabled(desc.multisample.alphaToCoverageEnable);
-    // pd->setAlphaToOneEnabled(); // Currently not supported by rhi
-    // pd->setRasterizationEnabled(true); // Enabled by default
-
-    for (uint32_t i = 0; i < desc.targetCount; ++i)
-    {
-        const ColorTargetDesc& targetState = desc.targets[i];
-        MTL::RenderPipelineColorAttachmentDescriptor* colorAttachment = pd->colorAttachments()->object(i);
-        colorAttachment->setPixelFormat(translatePixelFormat(targetState.format));
-
-        colorAttachment->setBlendingEnabled(targetState.enableBlend);
-        colorAttachment->setSourceRGBBlendFactor(translateBlendFactor(targetState.color.srcFactor));
-        colorAttachment->setDestinationRGBBlendFactor(translateBlendFactor(targetState.color.dstFactor));
-        colorAttachment->setRgbBlendOperation(translateBlendOperation(targetState.color.op));
-        colorAttachment->setSourceAlphaBlendFactor(translateBlendFactor(targetState.alpha.srcFactor));
-        colorAttachment->setDestinationAlphaBlendFactor(translateBlendFactor(targetState.alpha.dstFactor));
-        colorAttachment->setAlphaBlendOperation(translateBlendOperation(targetState.alpha.op));
-        colorAttachment->setWriteMask(translateColorWriteMask(targetState.writeMask));
-    }
-    if (desc.depthStencil.format != Format::Undefined)
-    {
-        const DepthStencilDesc& depthStencil = desc.depthStencil;
-        MTL::PixelFormat pixelFormat = translatePixelFormat(depthStencil.format);
-        if (isDepthFormat(pixelFormat))
-        {
-            pd->setDepthAttachmentPixelFormat(translatePixelFormat(depthStencil.format));
-        }
-        if (isStencilFormat(pixelFormat))
-        {
-            pd->setStencilAttachmentPixelFormat(translatePixelFormat(depthStencil.format));
-        }
-    }
-
-    pd->setRasterSampleCount(desc.multisample.sampleCount);
-
-    if (desc.label)
-    {
-        pd->setLabel(createString(desc.label).get());
-    }
-
-    // Create default pipeline WITHOUT ICB support.
-    // This ensures all shaders compile regardless of ICB compatibility.
-    NS::Error* error;
-    NS::SharedPtr<MTL::RenderPipelineState> pipelineState =
-        NS::TransferPtr(m_device->newRenderPipelineState(pd.get(), &error));
-    if (!pipelineState)
-    {
-        if (error)
-        {
-            handleMessage(
-                DebugMessageType::Error,
-                DebugMessageSource::Driver,
-                error->localizedDescription()->utf8String()
-            );
-        }
-        return SLANG_FAIL;
-    }
-
-    // Eagerly attempt ICB-enabled variant for indirect draws.
-    // If the shader uses ICB-incompatible features, this returns null — that's fine.  We fallback in those cases.
-    // This is not particularly ideal - we build the same pipeline twice eagerly.
-    // Ideally we would do this lazily - i.e., only when we first encounter a countBuffer draw.
-    // But that would require some async pipeline creation logic.  Should look into that. at some point.
-    pd->setSupportIndirectCommandBuffers(true);
-    NS::Error* icbError = nullptr;
-    NS::SharedPtr<MTL::RenderPipelineState> icbPipelineState =
-        NS::TransferPtr(m_device->newRenderPipelineState(pd.get(), &icbError));
-    pd->setSupportIndirectCommandBuffers(false);
 
     // Create depth stencil state
     auto createStencilDesc = [](const DepthStencilOpDesc& desc,
@@ -195,6 +274,9 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
     pipeline->m_primitiveType = translatePrimitiveType(desc.primitiveTopology);
     pipeline->m_rasterizerDesc = desc.rasterizer;
     pipeline->m_vertexBufferOffset = vertexBufferOffset;
+    pipeline->m_isMeshPipeline = isMeshPipeline;
+    pipeline->m_objectThreadgroupSize = objectThreadgroupSize;
+    pipeline->m_meshThreadgroupSize = meshThreadgroupSize;
     returnComPtr(outPipeline, pipeline);
     return SLANG_OK;
 }
