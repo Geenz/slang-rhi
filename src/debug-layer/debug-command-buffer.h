@@ -15,7 +15,6 @@ public:
 public:
     virtual SLANG_NO_THROW const CommandBufferDesc& SLANG_MCALL getDesc() override;
     virtual SLANG_NO_THROW Result SLANG_MCALL getNativeHandle(NativeHandle* outHandle) override;
-    virtual SLANG_NO_THROW void SLANG_MCALL setLabel(const char* label) override;
 };
 
 } // namespace rhi::debug

@@ -1353,95 +1353,8 @@ void CommandQueueImpl::retireCommandBuffers()
     for (const auto& commandBuffer : commandBuffers)
     {
         auto status = commandBuffer->m_commandBuffer->status();
-        if (status == MTL::CommandBufferStatusCompleted)
+        if (status == MTL::CommandBufferStatusCompleted || status == MTL::CommandBufferStatusError)
         {
-            commandBuffer->reset();
-        }
-        else if (status == MTL::CommandBufferStatusError)
-        {
-            // Report error via debug callback before resetting
-            NS::Error* error = commandBuffer->m_commandBuffer->error();
-            std::string errorMsg = "Metal command buffer error";
-            if (error)
-            {
-                if (auto desc = error->localizedDescription())
-                {
-                    errorMsg = desc->utf8String();
-                }
-            }
-            // Include command buffer label if available for correlation
-            NS::String* label = commandBuffer->m_commandBuffer->label();
-            std::string fullMsg = "Command buffer " + std::to_string(commandBuffer->m_submissionID);
-            if (label)
-            {
-                fullMsg += " (" + std::string(label->utf8String()) + ")";
-            }
-            fullMsg += " failed: " + errorMsg;
-            m_device->handleMessage(
-                DebugMessageType::Error,
-                DebugMessageSource::Driver,
-                fullMsg.c_str()
-            );
-
-            // Extract per-encoder error state when enhanced error reporting is enabled.
-            // This tells us which specific encoder (render/compute/blit) caused the fault.
-            if (commandBuffer->m_commandBuffer->errorOptions() & MTL::CommandBufferErrorOptionEncoderExecutionStatus)
-            {
-                if (NS::Error* cbError = commandBuffer->m_commandBuffer->error())
-                {
-                    NS::Dictionary* info = cbError->userInfo();
-                    if (info)
-                    {
-                        // Key defined in MTLDevice.hpp — maps to @"MTLCommandBufferEncoderInfoErrorKey"
-                        NS::Array* encoderInfos = info->object<NS::Array>(MTL::CommandBufferEncoderInfoErrorKey);
-                        if (encoderInfos)
-                        {
-                            for (NS::UInteger i = 0; i < encoderInfos->count(); ++i)
-                            {
-                                auto* ei = encoderInfos->object<MTL::CommandBufferEncoderInfo>(i);
-                                MTL::CommandEncoderErrorState state = ei->errorState();
-
-                                const char* stateStr = "unknown";
-                                switch (state)
-                                {
-                                case MTL::CommandEncoderErrorStateCompleted: stateStr = "completed"; break;
-                                case MTL::CommandEncoderErrorStateAffected: stateStr = "affected"; break;
-                                case MTL::CommandEncoderErrorStatePending: stateStr = "pending"; break;
-                                case MTL::CommandEncoderErrorStateFaulted: stateStr = "FAULTED"; break;
-                                default: break;
-                                }
-
-                                NS::String* encoderLabel = ei->label();
-                                std::string encoderMsg = "  Encoder[" + std::to_string(i) + "] '"
-                                    + std::string(encoderLabel ? encoderLabel->utf8String() : "<no label>")
-                                    + "' state=" + stateStr;
-
-                                // Include debug signposts if any
-                                NS::Array* signposts = ei->debugSignposts();
-                                if (signposts && signposts->count() > 0)
-                                {
-                                    encoderMsg += " signposts=[";
-                                    for (NS::UInteger j = 0; j < signposts->count(); ++j)
-                                    {
-                                        if (j > 0) encoderMsg += ", ";
-                                        auto* sp = signposts->object<NS::String>(j);
-                                        if (sp) encoderMsg += sp->utf8String();
-                                    }
-                                    encoderMsg += "]";
-                                }
-
-                                m_device->handleMessage(
-                                    state == MTL::CommandEncoderErrorStateFaulted
-                                        ? DebugMessageType::Error : DebugMessageType::Warning,
-                                    DebugMessageSource::Driver,
-                                    encoderMsg.c_str()
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
             commandBuffer->reset();
         }
         else
@@ -1699,16 +1612,6 @@ Result CommandBufferImpl::reset()
 {
     m_bindingCache.reset();
     return CommandBuffer::reset();
-}
-
-void CommandBufferImpl::setLabel(const char* label)
-{
-    AUTORELEASEPOOL
-
-    if (m_commandBuffer && label)
-    {
-        m_commandBuffer->setLabel(NS::String::string(label, NS::UTF8StringEncoding));
-    }
 }
 
 Result CommandBufferImpl::getNativeHandle(NativeHandle* outHandle)
