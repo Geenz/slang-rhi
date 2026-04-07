@@ -740,6 +740,7 @@ if(SLANG_RHI_ENABLE_METAL)
         src/metal/metal-device.cpp
         src/metal/metal-fence.cpp
         src/metal/metal-input-layout.cpp
+        src/metal/metal-bindless-descriptor-set.cpp
         src/metal/metal-pipeline.cpp
         src/metal/metal-query.cpp
         src/metal/metal-sampler.cpp
@@ -861,6 +862,7 @@ if(SLANG_RHI_BUILD_TESTS AND NOT SLANG_RHI_BUILD_SHARED)
         tests/test-cmd-debug.cpp
         tests/test-cmd-draw.cpp
         tests/test-cmd-draw-mesh.cpp
+        tests/test-cmd-draw-mesh-indirect.cpp
         tests/test-cmd-query.cpp
         tests/test-cmd-upload-buffer.cpp
         tests/test-cmd-upload-texture.cpp

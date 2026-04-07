@@ -1,5 +1,6 @@
 #include "metal-device.h"
 #include "../resource-desc-utils.h"
+#include "metal-bindless-descriptor-set.h"
 #include "metal-command.h"
 #include "metal-buffer.h"
 #include "metal-shader-program.h"
@@ -211,6 +212,17 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
         limits.maxFramebufferDimensions[2] = 2048;
 
         limits.maxShaderVisibleSamplers = 16;
+
+        // Query argument buffer tier before setting texture limits.
+        // Pre-Metal 4: no runtime query for max textures. Values come from Apple's
+        // Metal Feature Set Tables, keyed by argument buffer tier:
+        //   Tier 1: 31 textures per function argument table, no bindless
+        //   Tier 2: 128 textures per function argument table, 500k via argument buffers
+        // Metal 4 (iOS 26+/macOS 26+): use MTL4ArgumentTableDescriptor.maxTextureBindCount
+        // See: https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf
+        m_hasArgumentBufferTier2 = m_device->argumentBuffersSupport() >= MTL::ArgumentBuffersTier2;
+        limits.maxShaderVisibleTextures = m_hasArgumentBufferTier2 ? 128 : 31;
+        limits.maxBindlessTextures = m_hasArgumentBufferTier2 ? 500000 : 31;
     }
 
     // Initialize features & capabilities.
@@ -223,12 +235,11 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     {
         addFeature(Feature::AccelerationStructure);
     }
-
-    m_hasArgumentBufferTier2 = m_device->argumentBuffersSupport() >= MTL::ArgumentBuffersTier2;
     if (m_hasArgumentBufferTier2)
     {
         addFeature(Feature::ArgumentBufferTier2);
         addFeature(Feature::ParameterBlock);
+        addFeature(Feature::Bindless);
     }
 
     if (m_device->supportsFamily(MTL::GPUFamilyMetal3))
@@ -328,6 +339,13 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
 
     SLANG_RETURN_ON_FAIL(m_clearEngine.initialize(m_device.get()));
     SLANG_RETURN_ON_FAIL(m_indirectEngine.initialize(m_device.get()));
+
+    // Initialize bindless descriptor set when argument buffers tier 2 is supported
+    if (m_hasArgumentBufferTier2)
+    {
+        m_bindlessDescriptorSet = new BindlessDescriptorSet(this, desc.bindless);
+        SLANG_RETURN_ON_FAIL(m_bindlessDescriptorSet->initialize());
+    }
 
     return SLANG_OK;
 }

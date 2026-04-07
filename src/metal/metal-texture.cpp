@@ -1,4 +1,5 @@
 #include "metal-texture.h"
+#include "metal-bindless-descriptor-set.h"
 #include "metal-device.h"
 #include "metal-utils.h"
 
@@ -60,6 +61,26 @@ Result TextureViewImpl::getNativeHandle(NativeHandle* outHandle)
 {
     outHandle->type = NativeHandleType::MTLTexture;
     outHandle->value = (uint64_t)m_textureView.get();
+    return SLANG_OK;
+}
+
+Result TextureViewImpl::getDescriptorHandle(DescriptorHandleAccess access, DescriptorHandle* outHandle)
+{
+    DescriptorHandle& cached = m_descriptorHandle[access == DescriptorHandleAccess::Read ? 0 : 1];
+    if (cached)
+    {
+        *outHandle = cached;
+        return SLANG_OK;
+    }
+
+    DeviceImpl* device = getDevice<DeviceImpl>();
+    if (!device->m_bindlessDescriptorSet)
+    {
+        return SLANG_E_NOT_AVAILABLE;
+    }
+
+    SLANG_RETURN_ON_FAIL(device->m_bindlessDescriptorSet->allocTextureHandle(this, access, &cached));
+    *outHandle = cached;
     return SLANG_OK;
 }
 

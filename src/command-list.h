@@ -27,6 +27,7 @@
     x(DrawIndirect) \
     x(DrawIndexedIndirect) \
     x(DrawMeshTasks) \
+    x(DrawMeshTasksIndirect) \
     x(BeginComputePass) \
     x(EndComputePass) \
     x(SetComputeState) \
@@ -201,6 +202,11 @@ struct DrawMeshTasks
     uint32_t x;
     uint32_t y;
     uint32_t z;
+};
+
+struct DrawMeshTasksIndirect
+{
+    BufferOffsetPair argBuffer;
 };
 
 struct BeginComputePass
@@ -418,6 +424,7 @@ public:
     void write(commands::DrawIndirect&& cmd);
     void write(commands::DrawIndexedIndirect&& cmd);
     void write(commands::DrawMeshTasks&& cmd);
+    void write(commands::DrawMeshTasksIndirect&& cmd);
     void write(commands::BeginComputePass&& cmd);
     void write(commands::EndComputePass&& cmd);
     void write(commands::SetComputeState&& cmd);

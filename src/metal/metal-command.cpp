@@ -1,4 +1,5 @@
 #include "metal-command.h"
+#include "metal-bindless-descriptor-set.h"
 #include "metal-device.h"
 #include "metal-buffer.h"
 #include "metal-texture.h"
@@ -81,6 +82,7 @@ public:
     void cmdDrawIndirect(const commands::DrawIndirect& cmd);
     void cmdDrawIndexedIndirect(const commands::DrawIndexedIndirect& cmd);
     void cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd);
+    void cmdDrawMeshTasksIndirect(const commands::DrawMeshTasksIndirect& cmd);
     void cmdBeginComputePass(const commands::BeginComputePass& cmd);
     void cmdEndComputePass(const commands::EndComputePass& cmd);
     void cmdSetComputeState(const commands::SetComputeState& cmd);
@@ -644,6 +646,31 @@ void CommandRecorder::cmdSetRenderState(const commands::SetRenderState& cmd)
             m_bindingData->usedRWResourceCount,
             MTL::ResourceUsageRead | MTL::ResourceUsageWrite
         );
+
+    }
+
+    // Make bindless descriptor set resources resident — must run every draw,
+    // not just when bindings update, because useResource is per-encoder
+    if (m_device->m_bindlessDescriptorSet)
+    {
+        auto& texResources = m_device->m_bindlessDescriptorSet->allocatedTextureResources();
+        if (!texResources.empty())
+        {
+            encoder->useResources(
+                const_cast<MTL::Resource**>(texResources.data()),
+                texResources.size(),
+                MTL::ResourceUsageRead | MTL::ResourceUsageSample
+            );
+        }
+        auto& bufResources = m_device->m_bindlessDescriptorSet->allocatedBufferResources();
+        if (!bufResources.empty())
+        {
+            encoder->useResources(
+                const_cast<MTL::Resource**>(bufResources.data()),
+                bufResources.size(),
+                MTL::ResourceUsageRead | MTL::ResourceUsageWrite
+            );
+        }
     }
 
     if (updateVertexBuffers)
@@ -949,6 +976,21 @@ void CommandRecorder::cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd)
     );
 }
 
+void CommandRecorder::cmdDrawMeshTasksIndirect(const commands::DrawMeshTasksIndirect& cmd)
+{
+    if (!m_renderStateValid)
+        return;
+
+    BufferImpl* argBuffer = checked_cast<BufferImpl*>(cmd.argBuffer.buffer);
+
+    m_renderCommandEncoder->drawMeshThreadgroups(
+        argBuffer->m_buffer.get(),
+        cmd.argBuffer.offset,
+        m_renderPipeline->m_objectThreadgroupSize,
+        m_renderPipeline->m_meshThreadgroupSize
+    );
+}
+
 void CommandRecorder::cmdBeginComputePass(const commands::BeginComputePass& cmd)
 {
     m_computePassActive = true;
@@ -990,6 +1032,29 @@ void CommandRecorder::cmdSetComputeState(const commands::SetComputeState& cmd)
             m_bindingData->usedRWResourceCount,
             MTL::ResourceUsageRead | MTL::ResourceUsageWrite
         );
+
+        // Make bindless descriptor set resources resident
+        if (m_device->m_bindlessDescriptorSet)
+        {
+            auto& texResources = m_device->m_bindlessDescriptorSet->allocatedTextureResources();
+            if (!texResources.empty())
+            {
+                encoder->useResources(
+                    const_cast<MTL::Resource**>(texResources.data()),
+                    texResources.size(),
+                    MTL::ResourceUsageRead | MTL::ResourceUsageSample
+                );
+            }
+            auto& bufResources = m_device->m_bindlessDescriptorSet->allocatedBufferResources();
+            if (!bufResources.empty())
+            {
+                encoder->useResources(
+                    const_cast<MTL::Resource**>(bufResources.data()),
+                    bufResources.size(),
+                    MTL::ResourceUsageRead | MTL::ResourceUsageWrite
+                );
+            }
+        }
     }
 
     m_computeStateValid = true;
@@ -1123,7 +1188,12 @@ void CommandRecorder::cmdConvertCooperativeVectorMatrix(const commands::ConvertC
 
 void CommandRecorder::cmdSetBufferState(const commands::SetBufferState& cmd)
 {
-    SLANG_UNUSED(cmd);
+    // When buffer is null, treat as a pure memory barrier request.
+    // When buffer is non-null, also insert a barrier (compute writes → reads).
+    if (m_computeCommandEncoder)
+    {
+        m_computeCommandEncoder->memoryBarrier(MTL::BarrierScopeBuffers);
+    }
 }
 
 void CommandRecorder::cmdSetTextureState(const commands::SetTextureState& cmd)
@@ -1316,6 +1386,29 @@ void CommandRecorder::restoreRenderEncoder()
         m_bindingData->usedRWResourceCount,
         MTL::ResourceUsageRead | MTL::ResourceUsageWrite
     );
+
+    // Make bindless descriptor set resources resident
+    if (m_device->m_bindlessDescriptorSet)
+    {
+        auto& texResources = m_device->m_bindlessDescriptorSet->allocatedTextureResources();
+        if (!texResources.empty())
+        {
+            encoder->useResources(
+                const_cast<MTL::Resource**>(texResources.data()),
+                texResources.size(),
+                MTL::ResourceUsageRead | MTL::ResourceUsageSample
+            );
+        }
+        auto& bufResources = m_device->m_bindlessDescriptorSet->allocatedBufferResources();
+        if (!bufResources.empty())
+        {
+            encoder->useResources(
+                const_cast<MTL::Resource**>(bufResources.data()),
+                bufResources.size(),
+                MTL::ResourceUsageRead | MTL::ResourceUsageWrite
+            );
+        }
+    }
 
     // Vertex buffers (at m_renderPipeline->m_vertexBufferOffset + i)
     for (uint32_t i = 0; i < m_renderState.vertexBufferCount; ++i)

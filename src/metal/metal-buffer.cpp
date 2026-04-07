@@ -1,4 +1,5 @@
 #include "metal-buffer.h"
+#include "metal-bindless-descriptor-set.h"
 #include "metal-device.h"
 #include "metal-utils.h"
 
@@ -32,6 +33,38 @@ Result BufferImpl::getSharedHandle(NativeHandle* outHandle)
 DeviceAddress BufferImpl::getDeviceAddress()
 {
     return m_buffer->gpuAddress();
+}
+
+Result BufferImpl::getDescriptorHandle(
+    DescriptorHandleAccess access,
+    Format format,
+    BufferRange range,
+    DescriptorHandle* outHandle)
+{
+    if (!outHandle)
+        return SLANG_E_INVALID_ARG;
+
+    DeviceImpl* device = getDevice<DeviceImpl>();
+    if (!device->m_bindlessDescriptorSet)
+        return SLANG_E_NOT_AVAILABLE;
+
+    // Simple cache for whole-buffer handles (most common case)
+    if (range.offset == 0 && range.size == kEntireBuffer.size)
+    {
+        uint32_t cacheIndex = (access == DescriptorHandleAccess::Read) ? 0 : 1;
+        DescriptorHandle& cached = m_descriptorHandle[cacheIndex];
+        if (cached)
+        {
+            *outHandle = cached;
+            return SLANG_OK;
+        }
+        SLANG_RETURN_ON_FAIL(device->m_bindlessDescriptorSet->allocBufferHandle(this, access, format, range, outHandle));
+        cached = *outHandle;
+        return SLANG_OK;
+    }
+
+    // Non-cacheable (sub-range) -- allocate without caching
+    return device->m_bindlessDescriptorSet->allocBufferHandle(this, access, format, range, outHandle);
 }
 
 Result DeviceImpl::createBuffer(const BufferDesc& desc_, const void* initData, IBuffer** outBuffer)

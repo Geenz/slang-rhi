@@ -43,8 +43,13 @@ public:
 
     // ITextureView implementation
     virtual SLANG_NO_THROW ITexture* SLANG_MCALL getTexture() override { return m_texture; }
+    virtual SLANG_NO_THROW Result SLANG_MCALL getDescriptorHandle(
+        DescriptorHandleAccess access,
+        DescriptorHandle* outHandle
+    ) override;
 
 public:
+    DescriptorHandle m_descriptorHandle[2];
     BreakableReference<TextureImpl> m_texture;
     NS::SharedPtr<MTL::Texture> m_textureView;
 };

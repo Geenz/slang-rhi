@@ -8,6 +8,8 @@
 
 namespace rhi::metal {
 
+class BindlessDescriptorSet;
+
 class AdapterImpl : public Adapter
 {
 public:
@@ -168,6 +170,8 @@ public:
     NS::Array* getAccelerationStructureArray();
 
     bool m_hasArgumentBufferTier2 = false;
+
+    RefPtr<BindlessDescriptorSet> m_bindlessDescriptorSet;
 };
 
 } // namespace rhi::metal

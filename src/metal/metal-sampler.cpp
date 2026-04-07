@@ -1,4 +1,5 @@
 #include "metal-sampler.h"
+#include "metal-bindless-descriptor-set.h"
 #include "metal-device.h"
 #include "metal-utils.h"
 
@@ -83,6 +84,25 @@ Result SamplerImpl::getNativeHandle(NativeHandle* outHandle)
 {
     outHandle->type = NativeHandleType::MTLSamplerState;
     outHandle->value = (uint64_t)(m_samplerState.get());
+    return SLANG_OK;
+}
+
+Result SamplerImpl::getDescriptorHandle(DescriptorHandle* outHandle)
+{
+    if (m_descriptorHandle)
+    {
+        *outHandle = m_descriptorHandle;
+        return SLANG_OK;
+    }
+
+    DeviceImpl* device = getDevice<DeviceImpl>();
+    if (!device->m_bindlessDescriptorSet)
+    {
+        return SLANG_E_NOT_AVAILABLE;
+    }
+
+    SLANG_RETURN_ON_FAIL(device->m_bindlessDescriptorSet->allocSamplerHandle(this, &m_descriptorHandle));
+    *outHandle = m_descriptorHandle;
     return SLANG_OK;
 }
 

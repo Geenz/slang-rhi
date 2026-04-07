@@ -8,6 +8,8 @@
 
 #include "reference.h"
 
+#include <unordered_map>
+
 #include "device.h"
 
 #include "rhi-shared-fwd.h"
@@ -15,6 +17,11 @@
 #include <set>
 
 namespace rhi {
+
+static inline uint64_t makeDescriptorHandleKey(uint32_t bindingRangeIndex, uint32_t arrayIndex)
+{
+    return (uint64_t(bindingRangeIndex) << 32) | arrayIndex;
+}
 
 struct ShaderObjectID
 {
@@ -245,6 +252,10 @@ public:
     ExtendedShaderObjectType m_shaderObjectType = {nullptr, kInvalidComponentID};
 
     ShaderObjectSetBindingHook m_setBindingHook = nullptr;
+
+    // Descriptor handle values set via setDescriptorHandle(), keyed by bindingRangeIndex.
+    // Used by Metal's writeArgumentBuffer to write gpuResourceIDs into argument buffers.
+    std::unordered_map<uint64_t, uint64_t> m_descriptorHandles;  // (bindingRange << 32 | arrayIdx) → handle.value
 
 public:
     void breakStrongReferenceToDevice() { m_device.breakStrongReference(); }

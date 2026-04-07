@@ -381,12 +381,15 @@ Result ShaderObject::setDescriptorHandle(const ShaderOffset& offset, const Descr
 {
     SLANG_RETURN_ON_FAIL(checkFinalized());
 
-    if (offset.uniformOffset + 8 > m_data.size())
-    {
-        return SLANG_E_INVALID_ARG;
-    }
+    // Store indexed by binding range for argument buffer backends (Metal)
+    uint64_t key = makeDescriptorHandleKey(offset.bindingRangeIndex, offset.bindingArrayIndex);
+    m_descriptorHandles[key] = handle.value;
 
-    ::memcpy(m_data.data() + offset.uniformOffset, &handle.value, 8);
+    // Also store in uniform data if the offset is valid (D3D12/Vulkan path)
+    if (offset.uniformOffset + 8 <= m_data.size())
+    {
+        ::memcpy(m_data.data() + offset.uniformOffset, &handle.value, 8);
+    }
 
     incrementVersion();
 

@@ -139,6 +139,11 @@ void CommandList::write(commands::DrawMeshTasks&& cmd)
     writeCommand(std::move(cmd));
 }
 
+void CommandList::write(commands::DrawMeshTasksIndirect&& cmd)
+{
+    writeCommand(std::move(cmd));
+}
+
 void CommandList::write(commands::BeginComputePass&& cmd)
 {
     writeCommand(std::move(cmd));

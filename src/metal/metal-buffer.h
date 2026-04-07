@@ -18,10 +18,17 @@ public:
     // IBuffer implementation
     virtual SLANG_NO_THROW Result SLANG_MCALL getSharedHandle(NativeHandle* outHandle) override;
     virtual SLANG_NO_THROW DeviceAddress SLANG_MCALL getDeviceAddress() override;
+    virtual SLANG_NO_THROW Result SLANG_MCALL getDescriptorHandle(
+        DescriptorHandleAccess access,
+        Format format,
+        BufferRange range,
+        DescriptorHandle* outHandle
+    ) override;
 
 public:
     NS::SharedPtr<MTL::Buffer> m_buffer;
     CpuAccessMode m_lastCpuAccessMode;
+    DescriptorHandle m_descriptorHandle[2] = {}; // [0]=Read, [1]=ReadWrite
 };
 
 } // namespace rhi::metal

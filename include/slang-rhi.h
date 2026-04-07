@@ -2447,6 +2447,7 @@ public:
         BufferOffsetPair countBuffer = {}
     ) = 0;
     virtual SLANG_NO_THROW void SLANG_MCALL drawMeshTasks(uint32_t x, uint32_t y, uint32_t z) = 0;
+    virtual SLANG_NO_THROW void SLANG_MCALL drawMeshTasksIndirect(BufferOffsetPair argBuffer) = 0;
 };
 
 class IComputePassEncoder : public IPassEncoder
@@ -3037,6 +3038,12 @@ struct DeviceLimits
 
     /// Maximum samplers visible in a shader stage.
     uint32_t maxShaderVisibleSamplers;
+
+    /// Maximum textures visible in a shader stage (direct binding limit).
+    uint32_t maxShaderVisibleTextures;
+
+    /// Maximum textures accessible via bindless / argument buffers / descriptor heaps.
+    uint32_t maxBindlessTextures;
 };
 
 struct DeviceInfo

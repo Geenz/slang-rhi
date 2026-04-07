@@ -138,6 +138,17 @@ void RenderPassEncoder::drawMeshTasks(uint32_t x, uint32_t y, uint32_t z)
     }
 }
 
+void RenderPassEncoder::drawMeshTasksIndirect(BufferOffsetPair argBuffer)
+{
+    if (m_commandList)
+    {
+        writeRenderState();
+        commands::DrawMeshTasksIndirect cmd;
+        cmd.argBuffer = argBuffer;
+        m_commandList->write(std::move(cmd));
+    }
+}
+
 void RenderPassEncoder::pushDebugGroup(const char* name, const MarkerColor& color)
 {
     if (m_commandList)

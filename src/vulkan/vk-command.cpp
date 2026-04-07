@@ -94,6 +94,7 @@ public:
     void cmdDrawIndirect(const commands::DrawIndirect& cmd);
     void cmdDrawIndexedIndirect(const commands::DrawIndexedIndirect& cmd);
     void cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd);
+    void cmdDrawMeshTasksIndirect(const commands::DrawMeshTasksIndirect& cmd);
     void cmdBeginComputePass(const commands::BeginComputePass& cmd);
     void cmdEndComputePass(const commands::EndComputePass& cmd);
     void cmdSetComputeState(const commands::SetComputeState& cmd);
@@ -1026,6 +1027,12 @@ void CommandRecorder::cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd)
         return;
 
     m_api.vkCmdDrawMeshTasksEXT(m_cmdBuffer, cmd.x, cmd.y, cmd.z);
+}
+
+void CommandRecorder::cmdDrawMeshTasksIndirect(const commands::DrawMeshTasksIndirect& cmd)
+{
+    SLANG_UNUSED(cmd);
+    NOT_SUPPORTED(IRenderPassEncoder, drawMeshTasksIndirect);
 }
 
 void CommandRecorder::cmdBeginComputePass(const commands::BeginComputePass& cmd)

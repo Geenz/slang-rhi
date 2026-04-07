@@ -1,4 +1,5 @@
 #include "metal-shader-object.h"
+#include "metal-bindless-descriptor-set.h"
 #include "metal-device.h"
 #include "metal-acceleration-structure.h"
 #include "metal-buffer.h"
@@ -202,6 +203,10 @@ Result BindingDataBuilder::bindAsValue(
     // ranges and writing them to the descriptor sets that are being
     // passed down.
     //
+    // Get the bindless descriptor set for descriptor handle resolution
+    BindlessDescriptorSet* bindlessSet = m_device->m_bindlessDescriptorSet;
+
+    uint32_t bindingRangeIdx = 0;
     for (const auto& bindingRangeInfo : specializedLayout->m_bindingRanges)
     {
         uint32_t slotIndex = bindingRangeInfo.slotIndex;
@@ -224,6 +229,21 @@ Result BindingDataBuilder::bindAsValue(
                     uint32_t registerIndex = bindingRangeInfo.registerOffset + offset.texture + i;
                     SLANG_RETURN_ON_FAIL(setTexture(m_bindingData, registerIndex, textureView->m_textureView.get()));
                 }
+                else if (bindlessSet)
+                {
+                    // Check for descriptor handle
+                    uint64_t key = makeDescriptorHandleKey(bindingRangeIdx, i);
+                    auto it = shaderObject->m_descriptorHandles.find(key);
+                    if (it != shaderObject->m_descriptorHandles.end())
+                    {
+                        auto texIt = bindlessSet->m_handleToTexturePtr.find(it->second);
+                        if (texIt != bindlessSet->m_handleToTexturePtr.end())
+                        {
+                            uint32_t registerIndex = bindingRangeInfo.registerOffset + offset.texture + i;
+                            SLANG_RETURN_ON_FAIL(setTexture(m_bindingData, registerIndex, texIt->second));
+                        }
+                    }
+                }
             }
             break;
         case slang::BindingType::Sampler:
@@ -236,6 +256,21 @@ Result BindingDataBuilder::bindAsValue(
                     uint32_t registerIndex = bindingRangeInfo.registerOffset + offset.sampler + i;
                     SLANG_RHI_ASSERT(registerIndex < m_bindingData->samplerCount);
                     m_bindingData->samplers[registerIndex] = sampler->m_samplerState.get();
+                }
+                else if (bindlessSet)
+                {
+                    uint64_t key = makeDescriptorHandleKey(bindingRangeIdx, i);
+                    auto it = shaderObject->m_descriptorHandles.find(key);
+                    if (it != shaderObject->m_descriptorHandles.end())
+                    {
+                        auto sampIt = bindlessSet->m_handleToSamplerPtr.find(it->second);
+                        if (sampIt != bindlessSet->m_handleToSamplerPtr.end())
+                        {
+                            uint32_t registerIndex = bindingRangeInfo.registerOffset + offset.sampler + i;
+                            SLANG_RHI_ASSERT(registerIndex < m_bindingData->samplerCount);
+                            m_bindingData->samplers[registerIndex] = sampIt->second;
+                        }
+                    }
                 }
             }
             break;
@@ -254,6 +289,42 @@ Result BindingDataBuilder::bindAsValue(
                         setBuffer(m_bindingData, registerIndex, buffer->m_buffer.get(), slot.bufferRange.offset)
                     );
                 }
+                else if (bindlessSet)
+                {
+                    uint64_t key = makeDescriptorHandleKey(bindingRangeIdx, i);
+                    auto it = shaderObject->m_descriptorHandles.find(key);
+                    if (it != shaderObject->m_descriptorHandles.end())
+                    {
+                        // Try buffer pointer first (StructuredBuffer, ByteAddressBuffer)
+                        auto bufIt = bindlessSet->m_handleToBufferPtr.find(it->second);
+                        if (bufIt != bindlessSet->m_handleToBufferPtr.end())
+                        {
+                            uint32_t registerIndex = bindingRangeInfo.registerOffset + offset.buffer + i;
+                            SLANG_RETURN_ON_FAIL(
+                                setBuffer(m_bindingData, registerIndex, bufIt->second.buffer, bufIt->second.offset)
+                            );
+                            if (bindingRangeInfo.bindingType == slang::BindingType::MutableRawBuffer ||
+                                bindingRangeInfo.bindingType == slang::BindingType::MutableTypedBuffer)
+                            {
+                                SLANG_RETURN_ON_FAIL(addUsedRWResource(m_bindingData, bufIt->second.buffer));
+                            }
+                            else
+                            {
+                                SLANG_RETURN_ON_FAIL(addUsedResource(m_bindingData, bufIt->second.buffer));
+                            }
+                        }
+                        else
+                        {
+                            // Typed buffers (Buffer<T>) are backed by texture views on Metal
+                            auto texIt = bindlessSet->m_handleToTexturePtr.find(it->second);
+                            if (texIt != bindlessSet->m_handleToTexturePtr.end())
+                            {
+                                uint32_t registerIndex = bindingRangeInfo.registerOffset + offset.texture + i;
+                                SLANG_RETURN_ON_FAIL(setTexture(m_bindingData, registerIndex, texIt->second));
+                            }
+                        }
+                    }
+                }
             }
             break;
         case slang::BindingType::RayTracingAccelerationStructure:
@@ -267,6 +338,7 @@ Result BindingDataBuilder::bindAsValue(
             return SLANG_FAIL;
             break;
         }
+        bindingRangeIdx++;
     }
 
     // Once all the simple binding ranges are dealt with, we will bind
@@ -474,6 +546,16 @@ Result BindingDataBuilder::writeArgumentBuffer(
                         SLANG_RETURN_ON_FAIL(addUsedResource(m_bindingData, textureView->m_textureView.get()));
                     }
                 }
+                else
+                {
+                    // No explicit binding — check for descriptor handle set via setDescriptorHandle()
+                    uint64_t key = makeDescriptorHandleKey(bindingRangeIndex, i);
+                    auto it = shaderObject->m_descriptorHandles.find(key);
+                    if (it != shaderObject->m_descriptorHandles.end())
+                    {
+                        memcpy(argumentPtr + i * sizeof(uint64_t), &it->second, sizeof(uint64_t));
+                    }
+                }
             }
             break;
         case slang::BindingType::Sampler:
@@ -485,6 +567,16 @@ Result BindingDataBuilder::writeArgumentBuffer(
                 {
                     auto resourceId = sampler->m_samplerState->gpuResourceID();
                     memcpy(argumentPtr + i * sizeof(uint64_t), &resourceId, sizeof(resourceId));
+                }
+                else
+                {
+                    // Check for descriptor handle set via setDescriptorHandle()
+                    uint64_t key = makeDescriptorHandleKey(bindingRangeIndex, i);
+                    auto it = shaderObject->m_descriptorHandles.find(key);
+                    if (it != shaderObject->m_descriptorHandles.end())
+                    {
+                        memcpy(argumentPtr + i * sizeof(uint64_t), &it->second, sizeof(uint64_t));
+                    }
                 }
             }
             break;
@@ -509,6 +601,16 @@ Result BindingDataBuilder::writeArgumentBuffer(
                     else
                     {
                         SLANG_RETURN_ON_FAIL(addUsedResource(m_bindingData, buffer->m_buffer.get()));
+                    }
+                }
+                else
+                {
+                    // Check for descriptor handle set via setDescriptorHandle()
+                    uint64_t key = makeDescriptorHandleKey(bindingRangeIndex, i);
+                    auto it = shaderObject->m_descriptorHandles.find(key);
+                    if (it != shaderObject->m_descriptorHandles.end())
+                    {
+                        memcpy(argumentPtr + i * sizeof(uint64_t), &it->second, sizeof(uint64_t));
                     }
                 }
             }

@@ -233,6 +233,27 @@ void DebugRenderPassEncoder::drawMeshTasks(uint32_t x, uint32_t y, uint32_t z)
     baseObject->drawMeshTasks(x, y, z);
 }
 
+void DebugRenderPassEncoder::drawMeshTasksIndirect(BufferOffsetPair argBuffer)
+{
+    SLANG_RHI_DEBUG_API(IRenderPassEncoder, drawMeshTasksIndirect);
+
+    m_commandEncoder->requireOpen();
+    m_commandEncoder->requireRenderPass();
+
+    if (!m_pipelineBound)
+    {
+        RHI_VALIDATION_ERROR("No pipeline bound.");
+        return;
+    }
+    if (!argBuffer.buffer)
+    {
+        RHI_VALIDATION_ERROR("argBuffer is null.");
+        return;
+    }
+
+    baseObject->drawMeshTasksIndirect(argBuffer);
+}
+
 void DebugRenderPassEncoder::pushDebugGroup(const char* name, const MarkerColor& color)
 {
     SLANG_RHI_DEBUG_API(IRenderPassEncoder, pushDebugGroup);
