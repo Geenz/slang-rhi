@@ -83,7 +83,7 @@ Result DeviceImpl::createBuffer(const BufferDesc& desc_, const void* initData, I
         break;
     case MemoryType::Upload:
     case MemoryType::ReadBack:
-        resourceOptions = RHI_MTL_STAGING_STORAGE_MODE;
+        resourceOptions = stagingStorageMode(m_hasUnifiedMemory);
         break;
     }
 
@@ -100,7 +100,7 @@ Result DeviceImpl::createBuffer(const BufferDesc& desc_, const void* initData, I
     if (initData)
     {
         NS::SharedPtr<MTL::Buffer> stagingBuffer =
-            NS::TransferPtr(m_device->newBuffer(initData, bufferSize, RHI_MTL_STAGING_STORAGE_MODE));
+            NS::TransferPtr(m_device->newBuffer(initData, bufferSize, stagingStorageMode(m_hasUnifiedMemory)));
         MTL::CommandBuffer* commandBuffer = m_commandQueue->commandBuffer();
         MTL::BlitCommandEncoder* encoder = commandBuffer->blitCommandEncoder();
         if (!stagingBuffer || !commandBuffer || !encoder)
@@ -130,16 +130,14 @@ Result DeviceImpl::mapBuffer(IBuffer* buffer, CpuAccessMode mode, void** outData
 
     BufferImpl* bufferImpl = checked_cast<BufferImpl*>(buffer);
     bufferImpl->m_lastCpuAccessMode = mode;
-    if (mode == CpuAccessMode::Read)
+    if (mode == CpuAccessMode::Read && !m_hasUnifiedMemory)
     {
-#if TARGET_OS_OSX
         MTL::CommandBuffer* commandBuffer = m_commandQueue->commandBuffer();
         MTL::BlitCommandEncoder* encoder = commandBuffer->blitCommandEncoder();
         encoder->synchronizeResource(bufferImpl->m_buffer.get());
         encoder->endEncoding();
         commandBuffer->commit();
         commandBuffer->waitUntilCompleted();
-#endif
     }
     *outData = bufferImpl->m_buffer->contents();
     return SLANG_OK;
@@ -150,19 +148,15 @@ Result DeviceImpl::unmapBuffer(IBuffer* buffer)
     AUTORELEASEPOOL
 
     BufferImpl* bufferImpl = checked_cast<BufferImpl*>(buffer);
-    if (bufferImpl->m_lastCpuAccessMode == CpuAccessMode::Write)
+    if (bufferImpl->m_lastCpuAccessMode == CpuAccessMode::Write && !m_hasUnifiedMemory)
     {
-#if TARGET_OS_OSX
         bufferImpl->m_buffer->didModifyRange(NS::Range(0, bufferImpl->m_desc.size));
-#endif
-#if TARGET_OS_OSX
         MTL::CommandBuffer* commandBuffer = m_commandQueue->commandBuffer();
         MTL::BlitCommandEncoder* encoder = commandBuffer->blitCommandEncoder();
         encoder->synchronizeResource(bufferImpl->m_buffer.get());
         encoder->endEncoding();
         commandBuffer->commit();
         commandBuffer->waitUntilCompleted();
-#endif
     }
     return SLANG_OK;
 }

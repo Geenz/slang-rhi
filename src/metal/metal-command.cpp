@@ -123,15 +123,16 @@ Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
 {
     m_commandBuffer = commandBuffer->m_commandBuffer;
 
-#if TARGET_OS_OSX
-    // Synchronize constant and argument buffers (Managed memory coherency — macOS only).
-    // TODO(shaderobject): This only needs to be done once after writing,
-    // once we cache/reuse binding data this should be revisited.
-    for (const auto& buffer : commandBuffer->m_bindingCache.buffers)
+    if (!getDevice<DeviceImpl>()->m_hasUnifiedMemory)
     {
-        getBlitCommandEncoder()->synchronizeResource(buffer->m_buffer.get());
+        // Synchronize constant and argument buffers (Managed memory coherency).
+        // TODO(shaderobject): This only needs to be done once after writing,
+        // once we cache/reuse binding data this should be revisited.
+        for (const auto& buffer : commandBuffer->m_bindingCache.buffers)
+        {
+            getBlitCommandEncoder()->synchronizeResource(buffer->m_buffer.get());
+        }
     }
-#endif
 
     CommandList& commandList = commandBuffer->m_commandList;
     auto command = commandList.getCommands();

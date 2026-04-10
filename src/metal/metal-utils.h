@@ -6,15 +6,18 @@
 #include "metal-api.h"
 #include "core/common.h"
 
-// iOS uses StorageModeShared (UMA — no managed memory).
-// macOS uses StorageModeManaged for CPU/GPU coherent staging buffers.
-#if TARGET_OS_OSX
-    #define RHI_MTL_STAGING_STORAGE_MODE MTL::ResourceStorageModeManaged
-    #define RHI_MTL_STAGING_TEXTURE_MODE MTL::StorageModeManaged
-#else
-    #define RHI_MTL_STAGING_STORAGE_MODE MTL::ResourceStorageModeShared
-    #define RHI_MTL_STAGING_TEXTURE_MODE MTL::StorageModeShared
-#endif
+// UMA devices (Apple Silicon) use StorageModeShared — no CPU/GPU sync needed.
+// Non-UMA devices (Intel Macs with discrete GPUs) need StorageModeManaged
+// with explicit synchronization barriers.
+inline MTL::ResourceOptions stagingStorageMode(bool hasUnifiedMemory)
+{
+    return hasUnifiedMemory ? MTL::ResourceStorageModeShared : MTL::ResourceStorageModeManaged;
+}
+
+inline MTL::StorageMode stagingTextureMode(bool hasUnifiedMemory)
+{
+    return hasUnifiedMemory ? MTL::StorageModeShared : MTL::StorageModeManaged;
+}
 
 namespace rhi::metal {
 

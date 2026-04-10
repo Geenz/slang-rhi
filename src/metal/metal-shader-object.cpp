@@ -455,9 +455,8 @@ Result BindingDataBuilder::bindOrdinaryDataBufferIfNeeded(
     SLANG_RETURN_ON_FAIL(setBuffer(m_bindingData, ioOffset.buffer, bufferImpl->m_buffer.get()));
     ioOffset.buffer++;
 
-#if TARGET_OS_OSX
-    bufferImpl->m_buffer->didModifyRange(NS::Range(0, bufferImpl->m_desc.size));
-#endif
+    if (!m_device->m_hasUnifiedMemory)
+        bufferImpl->m_buffer->didModifyRange(NS::Range(0, bufferImpl->m_desc.size));
 
     // Pass ownership of the buffer to the binding cache.
     m_bindingCache->buffers.push_back(bufferImpl);
@@ -679,9 +678,8 @@ Result BindingDataBuilder::writeArgumentBuffer(
         }
     }
 
-#if TARGET_OS_OSX
-    argumentBufferImpl->m_buffer->didModifyRange(NS::Range(0, argumentBufferImpl->m_desc.size));
-#endif
+    if (!m_device->m_hasUnifiedMemory)
+        argumentBufferImpl->m_buffer->didModifyRange(NS::Range(0, argumentBufferImpl->m_desc.size));
 
     // Pass ownership of the buffer to the binding cache.
     m_bindingCache->buffers.push_back(argumentBufferImpl);

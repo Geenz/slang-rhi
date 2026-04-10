@@ -169,6 +169,7 @@ public:
 
     NS::Array* getAccelerationStructureArray();
 
+    bool m_hasUnifiedMemory = false;
     bool m_hasArgumentBufferTier2 = false;
 
     RefPtr<BindlessDescriptorSet> m_bindlessDescriptorSet;

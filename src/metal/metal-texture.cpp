@@ -179,7 +179,7 @@ Result DeviceImpl::createTexture(const TextureDesc& desc_, const SubresourceData
 
     if (initData)
     {
-        textureDesc->setStorageMode(RHI_MTL_STAGING_TEXTURE_MODE);
+        textureDesc->setStorageMode(stagingTextureMode(m_hasUnifiedMemory));
         textureDesc->setCpuCacheMode(MTL::CPUCacheModeDefaultCache);
         NS::SharedPtr<MTL::Texture> stagingTexture = NS::TransferPtr(m_device->newTexture(textureDesc.get()));
 
@@ -210,9 +210,8 @@ Result DeviceImpl::createTexture(const TextureDesc& desc_, const SubresourceData
                     subresourceData.rowPitch,
                     subresourceData.slicePitch
                 );
-#if TARGET_OS_OSX
-                encoder->synchronizeTexture(stagingTexture.get(), slice, level);
-#endif
+                if (!m_hasUnifiedMemory)
+                    encoder->synchronizeTexture(stagingTexture.get(), slice, level);
                 region.size.width = region.size.width > 0 ? max(1ul, region.size.width >> 1) : 0;
                 region.size.height = region.size.height > 0 ? max(1ul, region.size.height >> 1) : 0;
                 region.size.depth = region.size.depth > 0 ? max(1ul, region.size.depth >> 1) : 0;

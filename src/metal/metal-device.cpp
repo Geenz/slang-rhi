@@ -126,6 +126,7 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     {
         return SLANG_FAIL;
     }
+    m_hasUnifiedMemory = m_device->hasUnifiedMemory();
     m_commandQueue = NS::TransferPtr(m_device->newCommandQueue(64));
     if (!m_commandQueue)
     {
@@ -374,7 +375,7 @@ Result DeviceImpl::readBuffer(IBuffer* buffer, Offset offset, Size size, void* o
 
     // create staging buffer
     NS::SharedPtr<MTL::Buffer> stagingBuffer =
-        NS::TransferPtr(m_device->newBuffer(size, RHI_MTL_STAGING_STORAGE_MODE));
+        NS::TransferPtr(m_device->newBuffer(size, stagingStorageMode(m_hasUnifiedMemory)));
     if (!stagingBuffer)
     {
         return SLANG_FAIL;
@@ -383,9 +384,8 @@ Result DeviceImpl::readBuffer(IBuffer* buffer, Offset offset, Size size, void* o
     MTL::CommandBuffer* commandBuffer = m_commandQueue->commandBuffer();
     MTL::BlitCommandEncoder* blitEncoder = commandBuffer->blitCommandEncoder();
     blitEncoder->copyFromBuffer(bufferImpl->m_buffer.get(), offset, stagingBuffer.get(), 0, size);
-#if TARGET_OS_OSX
-    blitEncoder->synchronizeResource(stagingBuffer.get());
-#endif
+    if (!m_hasUnifiedMemory)
+        blitEncoder->synchronizeResource(stagingBuffer.get());
     blitEncoder->endEncoding();
     commandBuffer->commit();
     commandBuffer->waitUntilCompleted();
