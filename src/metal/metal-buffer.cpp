@@ -95,7 +95,7 @@ Result DeviceImpl::createBuffer(const BufferDesc& desc_, const void* initData, I
     }
 
     if (desc.label)
-        buffer->m_buffer->addDebugMarker(createString(desc.label).get(), NS::Range(0, desc.size));
+        buffer->m_buffer->setLabel(createString(desc.label).get());
 
     if (initData)
     {

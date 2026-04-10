@@ -437,6 +437,11 @@ Result BindingDataBuilder::bindOrdinaryDataBufferIfNeeded(
     bufferDesc.usage = BufferUsage::ConstantBuffer | BufferUsage::CopyDestination;
     bufferDesc.defaultState = ResourceState::ConstantBuffer;
     bufferDesc.memoryType = MemoryType::Upload;
+    // Build descriptive label from pipeline context
+    char ordinaryLabel[128] = "ShaderObject_OrdinaryData";
+    if (m_label)
+        snprintf(ordinaryLabel, sizeof(ordinaryLabel), "%s_OrdinaryData", m_label);
+    bufferDesc.label = ordinaryLabel;
     SLANG_RETURN_ON_FAIL(m_device->createBuffer(bufferDesc, nullptr, buffer.writeRef()));
     auto bufferImpl = checked_cast<BufferImpl*>(buffer.get());
 
@@ -486,6 +491,10 @@ Result BindingDataBuilder::writeArgumentBuffer(
     argumentBufferDesc.usage = BufferUsage::ConstantBuffer | BufferUsage::CopyDestination;
     argumentBufferDesc.defaultState = ResourceState::ConstantBuffer;
     argumentBufferDesc.memoryType = MemoryType::Upload;
+    char argLabel[128] = "ShaderObject_ArgumentBuffer";
+    if (m_label)
+        snprintf(argLabel, sizeof(argLabel), "%s_ArgumentBuffer", m_label);
+    argumentBufferDesc.label = argLabel;
     SLANG_RETURN_ON_FAIL(m_device->createBuffer(argumentBufferDesc, nullptr, argumentBuffer.writeRef()));
     auto argumentBufferImpl = checked_cast<BufferImpl*>(argumentBuffer.get());
 

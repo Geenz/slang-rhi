@@ -1703,6 +1703,11 @@ Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingD
     builder.m_bindingCache = &m_commandBuffer->m_bindingCache;
     ShaderObjectLayout* specializedLayout = nullptr;
     SLANG_RETURN_ON_FAIL(rootObject->getSpecializedLayout(specializedLayout));
+    // Extract program label for debug naming of internal buffers
+    auto* rootLayout = checked_cast<RootShaderObjectLayoutImpl*>(specializedLayout);
+    auto* programLayout = rootLayout->getSlangProgramLayout();
+    if (programLayout && programLayout->getEntryPointCount() > 0)
+        builder.m_label = programLayout->getEntryPointByIndex(0)->getName();
     return builder.bindAsRoot(
         rootObject,
         checked_cast<RootShaderObjectLayoutImpl*>(specializedLayout),

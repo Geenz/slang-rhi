@@ -13,6 +13,7 @@ struct BindingDataBuilder
     ArenaAllocator* m_allocator;
     BindingCache* m_bindingCache;
     BindingDataImpl* m_bindingData;
+    const char* m_label = nullptr;  ///< Pipeline/shader label for debug naming of internal buffers
 
     /// Bind this object as a root shader object
     Result bindAsRoot(
