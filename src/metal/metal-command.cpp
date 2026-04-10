@@ -123,7 +123,7 @@ Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
 {
     m_commandBuffer = commandBuffer->m_commandBuffer;
 
-    if (!getDevice<DeviceImpl>()->m_hasUnifiedMemory)
+    if (!m_device->m_hasUnifiedMemory)
     {
         // Synchronize constant and argument buffers (Managed memory coherency).
         // TODO(shaderobject): This only needs to be done once after writing,
