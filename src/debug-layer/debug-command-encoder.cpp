@@ -238,10 +238,8 @@ void DebugRenderPassEncoder::drawMeshTasks(uint32_t x, uint32_t y, uint32_t z)
 
 void DebugRenderPassEncoder::drawMeshTasksIndirect(BufferOffsetPair argBuffer)
 {
-    std::cout << "[TRACE] DebugRenderPassEncoder::drawMeshTasksIndirect ENTER" << std::endl;
     SLANG_RHI_DEBUG_API(IRenderPassEncoder, drawMeshTasksIndirect);
 
-    auto _dt0 = mach_absolute_time();
     m_commandEncoder->requireOpen();
     m_commandEncoder->requireRenderPass();
 
@@ -256,17 +254,7 @@ void DebugRenderPassEncoder::drawMeshTasksIndirect(BufferOffsetPair argBuffer)
         return;
     }
 
-    auto _dt1 = mach_absolute_time();
     baseObject->drawMeshTasksIndirect(argBuffer);
-    auto _dt2 = mach_absolute_time();
-    {
-        mach_timebase_info_data_t info;
-        mach_timebase_info(&info);
-        uint64_t valUs = (_dt1 - _dt0) * info.numer / info.denom / 1000;
-        uint64_t drawUs = (_dt2 - _dt1) * info.numer / info.denom / 1000;
-        fprintf(stderr, "[dbg] meshIndirect: validate=%lluus draw=%lluus\n",
-                (unsigned long long)valUs, (unsigned long long)drawUs);
-    }
 }
 
 void DebugRenderPassEncoder::pushDebugGroup(const char* name, const MarkerColor& color)

@@ -27,18 +27,12 @@ RenderPassEncoder::RenderPassEncoder(CommandEncoder* commandEncoder)
 
 void RenderPassEncoder::writeRenderState()
 {
-    auto ws0 = mach_absolute_time();
-
     commands::SetRenderState cmd;
     cmd.state = m_renderState;
     cmd.pipeline = m_pipeline;
     m_commandEncoder->getPipelineSpecializationArgs(m_pipeline, m_rootObject, cmd.specializationArgs);
 
-    auto ws1 = mach_absolute_time();
-
     uint64_t compositeVersion = m_rootObject->getCompositeVersion();
-
-    auto ws2 = mach_absolute_time();
 
     if (m_cachedBindingData && m_cachedPipeline == m_pipeline.get() && m_cachedRootObject == m_rootObject.get() &&
         m_cachedCompositeVersion == compositeVersion)
@@ -59,32 +53,7 @@ void RenderPassEncoder::writeRenderState()
         m_cachedBindingData = cmd.bindingData;
     }
 
-    auto ws3 = mach_absolute_time();
-
     m_commandList->write(std::move(cmd));
-
-    auto ws4 = mach_absolute_time();
-
-    {
-        static thread_local uint64_t s_setupNs = 0, s_versionNs = 0, s_bindNs = 0, s_writeNs = 0;
-        static thread_local uint32_t s_cnt = 0;
-        s_setupNs += (ws1 - ws0);
-        s_versionNs += (ws2 - ws1);
-        s_bindNs += (ws3 - ws2);
-        s_writeNs += (ws4 - ws3);
-        s_cnt++;
-        if (s_cnt % 500 == 0)
-        {
-            mach_timebase_info_data_t info;
-            mach_timebase_info(&info);
-            auto toUs = [&](uint64_t ticks) { return ticks * info.numer / info.denom / 1000; };
-            fprintf(stderr, "[slang-rhi] writeRenderState x%u: setup=%lluus version=%lluus bind=%lluus cmdWrite=%lluus\n",
-                    s_cnt, (unsigned long long)toUs(s_setupNs), (unsigned long long)toUs(s_versionNs),
-                    (unsigned long long)toUs(s_bindNs), (unsigned long long)toUs(s_writeNs));
-            s_setupNs = s_versionNs = s_bindNs = s_writeNs = 0;
-            s_cnt = 0;
-        }
-    }
 }
 
 IShaderObject* RenderPassEncoder::bindPipeline(IRenderPipeline* pipeline)
@@ -166,23 +135,12 @@ void RenderPassEncoder::drawIndexedIndirect(
 {
     if (m_commandList)
     {
-        auto di0 = mach_absolute_time();
         writeRenderState();
-        auto di1 = mach_absolute_time();
         commands::DrawIndexedIndirect cmd;
         cmd.maxDrawCount = maxDrawCount;
         cmd.argBuffer = argBuffer;
         cmd.countBuffer = countBuffer;
         m_commandList->write(std::move(cmd));
-        auto di2 = mach_absolute_time();
-        {
-            mach_timebase_info_data_t info;
-            mach_timebase_info(&info);
-            uint64_t wsUs = (di1 - di0) * info.numer / info.denom / 1000;
-            uint64_t cwUs = (di2 - di1) * info.numer / info.denom / 1000;
-            fprintf(stderr, "[rhi] idxIndirect: ws=%lluus cw=%lluus\n",
-                    (unsigned long long)wsUs, (unsigned long long)cwUs);
-        }
     }
 }
 
@@ -203,20 +161,10 @@ void RenderPassEncoder::drawMeshTasksIndirect(BufferOffsetPair argBuffer)
 {
     if (m_commandList)
     {
-        auto t0 = mach_absolute_time();
         writeRenderState();
-        auto t1 = mach_absolute_time();
         commands::DrawMeshTasksIndirect cmd;
         cmd.argBuffer = argBuffer;
         m_commandList->write(std::move(cmd));
-        auto t2 = mach_absolute_time();
-        {
-            mach_timebase_info_data_t info;
-            mach_timebase_info(&info);
-            uint64_t wsUs = (t1 - t0) * info.numer / info.denom / 1000;
-            uint64_t cwUs = (t2 - t1) * info.numer / info.denom / 1000;
-            std::cout << "[rhi] meshIndirect: ws=" << wsUs << "us cw=" << cwUs << "us" << std::endl;
-        }
     }
 }
 

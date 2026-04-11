@@ -37,6 +37,15 @@ struct FlatArgBufferBindingEntry
     bool isMutable;
 };
 
+/// Pre-computed memcpy command for uniform data in an argument buffer.
+/// Maps a contiguous block from CPU layout (m_data) to GPU argument buffer layout.
+struct FlatArgBufferDataCopy
+{
+    uint32_t srcOffset;   ///< Offset into ShaderObject::m_data
+    uint32_t dstOffset;   ///< Offset into the argument buffer
+    uint32_t size;        ///< Bytes to copy
+};
+
 /// Pre-computed argument buffer descriptor: one per ParameterBlock sub-object.
 struct FlatArgBufferDesc
 {
@@ -46,6 +55,8 @@ struct FlatArgBufferDesc
     uint32_t dataSize;          ///< Bytes of m_data to copy into the argument buffer
     uint32_t firstEntry;        ///< Start index into FlatBindingTable::argBufferEntries
     uint32_t entryCount;        ///< Number of entries for this argument buffer
+    uint32_t firstDataCopy;     ///< Start index into FlatBindingTable::argBufferDataCopies
+    uint32_t dataCopyCount;     ///< Number of data copy commands
 };
 
 /// Pre-computed object tree path: how to collect a ShaderObject* from root at draw time.
@@ -64,6 +75,7 @@ struct FlatBindingTable
     std::vector<FlatOrdinaryDataEntry> ordinaryData;
     std::vector<FlatArgBufferDesc> argBuffers;
     std::vector<FlatArgBufferBindingEntry> argBufferEntries;
+    std::vector<FlatArgBufferDataCopy> argBufferDataCopies; ///< Pre-computed uniform data copy commands
     std::vector<FlatObjectPath> objectPaths;    ///< How to collect each ShaderObject* at draw time
     uint16_t objectCount = 0;
     uint16_t maxBufferRegister = 0;     ///< Highest buffer register + 1 (right-size allocation)

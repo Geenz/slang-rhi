@@ -28,6 +28,18 @@ public:
     std::mutex m_deferredDeleteQueueMutex;
     RingQueue<DeferredDelete> m_deferredDeleteQueue;
 
+    // Persistent argument buffer cache — survives across CommandEncoder lifetimes.
+    // Keyed by ShaderObject pointer + version; holds ownership of the MTL::Buffer.
+    struct CachedArgBuffer
+    {
+        ShaderObject* object = nullptr;
+        uint32_t version = 0;
+        NS::SharedPtr<MTL::Buffer> buffer;  // Owns the buffer
+        std::vector<MTL::Resource*> usedResources;    // Cached for residency replay
+        std::vector<MTL::Resource*> usedRWResources;
+    };
+    std::vector<CachedArgBuffer> m_cachedArgBuffers;
+
     CommandQueueImpl(Device* device, QueueType type);
     ~CommandQueueImpl();
 
@@ -67,14 +79,7 @@ public:
     std::vector<SubObjectVersionEntry> m_versionSnapB;
     bool m_versionSnapFlip = false;
 
-    // Cached argument buffers (version-based reuse)
-    struct CachedArgBuffer
-    {
-        ShaderObject* object = nullptr;
-        uint32_t version = 0;
-        MTL::Buffer* buffer = nullptr;
-    };
-    std::vector<CachedArgBuffer> m_cachedArgBuffers;
+    // Argument buffer cache lives on CommandQueueImpl for cross-frame persistence.
 
     CommandEncoderImpl(Device* device, CommandQueueImpl* queue, const CommandEncoderDesc& desc);
     ~CommandEncoderImpl();

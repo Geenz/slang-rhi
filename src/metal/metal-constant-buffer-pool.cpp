@@ -2,8 +2,6 @@
 #include "metal-device.h"
 #include "metal-buffer.h"
 
-#include <cstdio>
-
 namespace rhi::metal {
 
 inline size_t alignUp(size_t value, size_t alignment)
@@ -23,11 +21,6 @@ void ConstantBufferPool::finish()
 
 void ConstantBufferPool::reset()
 {
-    if (m_allocationCount > 0)
-    {
-        fprintf(stderr, "[slang-rhi] ConstantBufferPool: %u allocations across %d pages\n",
-                m_allocationCount, m_currentPage + 1);
-    }
     m_allocationCount = 0;
     m_currentPage = -1;
     m_currentOffset = 0;

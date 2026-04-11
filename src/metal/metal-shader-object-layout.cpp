@@ -3,6 +3,40 @@
 
 namespace rhi::metal {
 
+/// Flatten the recursive writeOrdinaryDataIntoArgumentBuffer walk into pre-computed copy commands.
+static void flattenOrdinaryDataCopies(
+    slang::TypeLayoutReflection* argLayout,
+    slang::TypeLayoutReflection* srcLayout,
+    uint32_t argBase,
+    uint32_t srcBase,
+    std::vector<FlatArgBufferDataCopy>& outCopies
+)
+{
+    if (srcLayout->getCategoryCount() == 1)
+    {
+        if (srcLayout->getCategoryByIndex(0) == slang::ParameterCategory::Uniform)
+        {
+            uint32_t size = (uint32_t)srcLayout->getSize();
+            if (size > 0)
+                outCopies.push_back({srcBase, argBase, size});
+        }
+        return;
+    }
+
+    for (unsigned int i = 0; i < argLayout->getFieldCount(); i++)
+    {
+        auto argField = argLayout->getFieldByIndex(i);
+        auto srcField = srcLayout->getFieldByIndex(i);
+        flattenOrdinaryDataCopies(
+            argField->getTypeLayout(),
+            srcField->getTypeLayout(),
+            argBase + (uint32_t)argField->getOffset(),
+            srcBase + (uint32_t)srcField->getOffset(),
+            outCopies
+        );
+    }
+}
+
 static slang::TypeLayoutReflection* _getParameterBlockTypeLayout(
     slang::ISession* slangSession,
     slang::TypeLayoutReflection* elementTypeLayout
@@ -443,6 +477,12 @@ static void buildFlatEntries(
                 desc.firstEntry = (uint32_t)table.argBufferEntries.size();
                 desc.entryCount = 0;
 
+                // Pre-compute uniform data copy commands (flattened from recursive layout walk)
+                desc.firstDataCopy = (uint32_t)table.argBufferDataCopies.size();
+                flattenOrdinaryDataCopies(
+                    argTypeLayout, pbLayout->getElementTypeLayout(), 0, 0, table.argBufferDataCopies);
+                desc.dataCopyCount = (uint32_t)table.argBufferDataCopies.size() - desc.firstDataCopy;
+
                 // Pre-compute per-binding offsets within the argument buffer
                 for (uint32_t bri = 0; bri < pbLayout->getBindingRangeCount(); ++bri)
                 {
@@ -580,32 +620,14 @@ const FlatBindingTable& RootShaderObjectLayoutImpl::getFlatBindingTable()
     {
         m_flatBindingTable.maxBufferRegister = std::max(m_flatBindingTable.maxBufferRegister,
                                                         (uint16_t)(ab.bindingDataRegister + 1));
-        m_flatBindingTable.maxUsedResources += ab.entryCount; // conservative upper bound
+        // Don't add full entryCount — most entries in large bindless arrays are
+        // unbound (descriptor handles, not resource bindings). Those get residency
+        // via the bindless descriptor set's bulk useResources. Add a reasonable
+        // cap per arg buffer for the directly-bound resources.
+        m_flatBindingTable.maxUsedResources += std::min(ab.entryCount, (uint32_t)2048);
     }
 
     m_flatBindingTable.built = true;
-
-    fprintf(stderr, "[slang-rhi] FlatBindingTable: %zu entries, %zu ordinaryData, %u objects, buf=%u tex=%u\n",
-            m_flatBindingTable.entries.size(), m_flatBindingTable.ordinaryData.size(),
-            m_flatBindingTable.objectCount, m_flatBindingTable.maxBufferRegister,
-            m_flatBindingTable.maxTextureRegister);
-
-    fprintf(stderr, "[slang-rhi] FlatBindingTable: %zu entries, %zu ordinaryData, %u objects\n",
-            m_flatBindingTable.entries.size(), m_flatBindingTable.ordinaryData.size(),
-            m_flatBindingTable.objectCount);
-    for (size_t i = 0; i < m_flatBindingTable.ordinaryData.size(); ++i)
-    {
-        const auto& od = m_flatBindingTable.ordinaryData[i];
-        fprintf(stderr, "  ordinaryData[%zu]: obj=%u reg=%u size=%u\n", i, od.objectTreeIndex, od.bufferRegister, od.dataSize);
-    }
-    for (size_t i = 0; i < m_flatBindingTable.entries.size(); ++i)
-    {
-        const auto& e = m_flatBindingTable.entries[i];
-        const char* typeStr = e.type == FlatBindingEntry::Type::Buffer ? "buf" :
-                              e.type == FlatBindingEntry::Type::Texture ? "tex" : "smp";
-        fprintf(stderr, "  entry[%zu]: obj=%u slot=%u -> %s[%u]%s\n", i, e.objectTreeIndex, e.slotIndex,
-                typeStr, e.registerIndex, e.isMutable ? " (rw)" : "");
-    }
 
     return m_flatBindingTable;
 }

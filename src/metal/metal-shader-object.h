@@ -89,7 +89,8 @@ struct BindingDataBuilder
     Result writeArgumentBuffer(
         ShaderObject* shaderObject,
         ShaderObjectLayoutImpl* specializedLayout,
-        BufferImpl*& outArgumentBuffer
+        MTL::Buffer*& outBuffer,
+        NS::UInteger& outOffset
     );
 
     Result writeOrdinaryDataIntoArgumentBuffer(

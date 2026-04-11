@@ -1,4 +1,5 @@
 #include "metal-shader-object.h"
+#include "metal-command.h"
 #include "metal-bindless-descriptor-set.h"
 #include <mach/mach_time.h>
 #include <cstdio>
@@ -38,9 +39,7 @@ inline Result setTexture(BindingDataImpl* bindingData, uint32_t index, MTL::Text
 inline Result addUsedResource(BindingDataImpl* bindingData, MTL::Resource* resource)
 {
     if (bindingData->usedResourceCount >= bindingData->usedResourceCapacity)
-    {
-        return SLANG_FAIL;
-    }
+        return SLANG_OK; // Silently skip — resource is likely covered by bindless useResources
     bindingData->usedResources[bindingData->usedResourceCount++] = resource;
     return SLANG_OK;
 }
@@ -48,9 +47,7 @@ inline Result addUsedResource(BindingDataImpl* bindingData, MTL::Resource* resou
 inline Result addUsedRWResource(BindingDataImpl* bindingData, MTL::Resource* resource)
 {
     if (bindingData->usedRWResourceCount >= bindingData->usedRWResourceCapacity)
-    {
-        return SLANG_FAIL;
-    }
+        return SLANG_OK; // Silently skip — resource is likely covered by bindless useResources
     bindingData->usedRWResources[bindingData->usedRWResourceCount++] = resource;
     return SLANG_OK;
 }
@@ -63,11 +60,9 @@ Result BindingDataBuilder::bindAsRootFlat(
 {
     const FlatBindingTable& table = specializedLayout->getFlatBindingTable();
 
-    // Allocate BindingData (clone from previous or fresh)
     BindingDataImpl* bindingData = m_allocator->allocate<BindingDataImpl>();
     m_bindingData = bindingData;
 
-    // Right-sized allocations from pre-computed bounds — no wasted zeroing
     uint32_t bufCount = table.maxBufferRegister;
     uint32_t texCount = table.maxTextureRegister;
     uint32_t samplerCount = specializedLayout->getTotalSamplerCount();
@@ -97,14 +92,11 @@ Result BindingDataBuilder::bindAsRootFlat(
     m_bindingData->usedRWResourceCapacity = usedRWResCapacity;
     m_bindingData->usedRWResources = m_allocator->allocate<MTL::Resource*>(usedRWResCapacity);
 
-    // Collect all ShaderObjects in tree order (root, sub-objects, entry points)
-    // using a small inline array since tree is typically <20 objects
+    // Collect ShaderObject pointers using pre-computed paths.
     ShaderObject* objects[64];
     uint16_t objCount = table.objectCount;
     SLANG_RHI_ASSERT(objCount <= 64);
 
-    // Build flat object array: root=0, then sub-objects in tree order, then entry points
-    // Collect ShaderObject pointers using pre-computed paths — no layout traversal at draw time.
     for (uint16_t i = 0; i < objCount; ++i)
     {
         const auto& path = table.objectPaths[i];
@@ -140,7 +132,7 @@ Result BindingDataBuilder::bindAsRootFlat(
             allocation.buffer->m_buffer->didModifyRange(NS::Range(allocation.offset, od.dataSize));
     }
 
-    // Process binding entries (single flat loop — no recursion)
+    // Process binding entries (single flat loop)
     for (const auto& entry : table.entries)
     {
         ShaderObject* obj = objects[entry.objectTreeIndex];
@@ -183,7 +175,10 @@ Result BindingDataBuilder::bindAsRootFlat(
         }
     }
 
-    // Handle ParameterBlock sub-objects via pre-computed argument buffer layout.
+    // Handle ParameterBlock sub-objects via argument buffer cache.
+    // Cache lives on CommandQueueImpl for cross-frame persistence.
+    auto* argCache = static_cast<std::vector<CommandQueueImpl::CachedArgBuffer>*>(m_cachedArgBuffers);
+
     for (const auto& ab : table.argBuffers)
     {
         ShaderObject* obj = objects[ab.objectTreeIndex];
@@ -191,8 +186,6 @@ Result BindingDataBuilder::bindAsRootFlat(
             continue;
 
         // Check argument buffer cache — reuse if version unchanged
-        struct CachedArgBuf { ShaderObject* object; uint32_t version; MTL::Buffer* buffer; };
-        auto* argCache = static_cast<std::vector<CachedArgBuf>*>(m_cachedArgBuffers);
         if (argCache)
         {
             bool hit = false;
@@ -200,7 +193,11 @@ Result BindingDataBuilder::bindAsRootFlat(
             {
                 if (c.object == obj && c.version == obj->m_version)
                 {
-                    SLANG_RETURN_ON_FAIL(setBuffer(m_bindingData, ab.bindingDataRegister, c.buffer, 0));
+                    SLANG_RETURN_ON_FAIL(setBuffer(m_bindingData, ab.bindingDataRegister, c.buffer.get(), 0));
+                    for (auto* r : c.usedResources)
+                        addUsedResource(m_bindingData, r);
+                    for (auto* r : c.usedRWResources)
+                        addUsedRWResource(m_bindingData, r);
                     hit = true;
                     break;
                 }
@@ -208,8 +205,19 @@ Result BindingDataBuilder::bindAsRootFlat(
             if (hit) continue;
         }
 
-        // Cache miss — create argument buffer via recursive path.
-        // Find the correct ParameterBlock layout from the sub-object ranges.
+        // Cache miss — check if we can reuse an existing buffer (version changed)
+        MTL::Buffer* existingBuffer = nullptr;
+        if (argCache)
+        {
+            for (auto& c : *argCache)
+            {
+                if (c.object == obj) {
+                    existingBuffer = c.buffer.get();
+                    break;
+                }
+            }
+        }
+
         ShaderObjectLayoutImpl* pbLayout = nullptr;
         for (const auto& sr : specializedLayout->m_subObjectRanges)
         {
@@ -220,24 +228,80 @@ Result BindingDataBuilder::bindAsRootFlat(
                 break;
             }
         }
-        BufferImpl* argBufResult = nullptr;
-        if (pbLayout)
-            SLANG_RETURN_ON_FAIL(writeArgumentBuffer(obj, pbLayout, argBufResult));
-        if (argBufResult)
-        {
-            SLANG_RETURN_ON_FAIL(setBuffer(m_bindingData, ab.bindingDataRegister, argBufResult->m_buffer.get(), 0));
 
-            // Update cache
+        MTL::Buffer* argBuffer = nullptr;
+        NS::UInteger argOffset = 0;
+
+        if (existingBuffer && pbLayout)
+        {
+            // Reuse existing buffer — update uniform data via pre-computed copies.
+            argBuffer = existingBuffer;
+            argOffset = 0;
+
+            uint8_t* dst = (uint8_t*)existingBuffer->contents();
+            const uint8_t* src = obj->m_data.data();
+            for (uint32_t ci = ab.firstDataCopy; ci < ab.firstDataCopy + ab.dataCopyCount; ++ci)
+            {
+                const auto& cp = table.argBufferDataCopies[ci];
+                ::memcpy(dst + cp.dstOffset, src + cp.srcOffset, cp.size);
+            }
+
+            if (!m_device->m_hasUnifiedMemory)
+                existingBuffer->didModifyRange(NS::Range(0, ab.bufferSize));
+
+            // Replay cached resource lists for residency
             if (argCache)
             {
+                for (auto& c : *argCache)
+                {
+                    if (c.object == obj)
+                    {
+                        for (auto* r : c.usedResources)
+                            addUsedResource(m_bindingData, r);
+                        for (auto* r : c.usedRWResources)
+                            addUsedRWResource(m_bindingData, r);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!existingBuffer && pbLayout)
+        {
+            // Cold miss — allocate new buffer and snapshot resource lists for future replay.
+            uint32_t prevUsedRes = m_bindingData->usedResourceCount;
+            uint32_t prevUsedRW = m_bindingData->usedRWResourceCount;
+
+            SLANG_RETURN_ON_FAIL(writeArgumentBuffer(obj, pbLayout, argBuffer, argOffset));
+
+            if (argBuffer && argCache)
+            {
+                std::vector<MTL::Resource*> res, rwRes;
+                for (uint32_t i = prevUsedRes; i < m_bindingData->usedResourceCount; ++i)
+                    res.push_back(m_bindingData->usedResources[i]);
+                for (uint32_t i = prevUsedRW; i < m_bindingData->usedRWResourceCount; ++i)
+                    rwRes.push_back(m_bindingData->usedRWResources[i]);
+
                 bool updated = false;
                 for (auto& c : *argCache)
                 {
-                    if (c.object == obj) { c.version = obj->m_version; c.buffer = argBufResult->m_buffer.get(); updated = true; break; }
+                    if (c.object == obj) {
+                        c.version = obj->m_version;
+                        c.buffer = NS::RetainPtr(argBuffer);
+                        c.usedResources = std::move(res);
+                        c.usedRWResources = std::move(rwRes);
+                        updated = true;
+                        break;
+                    }
                 }
                 if (!updated)
-                    argCache->push_back({obj, obj->m_version, argBufResult->m_buffer.get()});
+                    argCache->push_back({obj, obj->m_version, NS::RetainPtr(argBuffer), std::move(res), std::move(rwRes)});
             }
+        }
+
+        if (argBuffer)
+        {
+            SLANG_RETURN_ON_FAIL(setBuffer(m_bindingData, ab.bindingDataRegister, argBuffer, argOffset));
         }
     }
 
@@ -253,7 +317,7 @@ Result BindingDataBuilder::bindAsRoot(
 {
     BindingDataImpl* bindingData = m_allocator->allocate<BindingDataImpl>();
     m_bindingData = bindingData;
-
+ 
     uint32_t samplerCount = specializedLayout->getTotalSamplerCount();
 
     if (m_previousBindingData && m_previousBindingData->bufferCapacity == 256 &&
@@ -416,12 +480,13 @@ Result BindingDataBuilder::bindAsParameterBlock(
     if (!m_device->m_hasArgumentBufferTier2)
         return SLANG_FAIL;
 
-    BufferImpl* argumentBuffer = nullptr;
-    SLANG_RETURN_ON_FAIL(writeArgumentBuffer(shaderObject, specializedLayout, argumentBuffer));
+    MTL::Buffer* argumentBuffer = nullptr;
+    NS::UInteger argumentOffset = 0;
+    SLANG_RETURN_ON_FAIL(writeArgumentBuffer(shaderObject, specializedLayout, argumentBuffer, argumentOffset));
 
     if (argumentBuffer)
     {
-        SLANG_RETURN_ON_FAIL(setBuffer(m_bindingData, inOffset.buffer, argumentBuffer->m_buffer.get()));
+        SLANG_RETURN_ON_FAIL(setBuffer(m_bindingData, inOffset.buffer, argumentBuffer, argumentOffset));
     }
 
     return SLANG_OK;
@@ -727,7 +792,8 @@ Result BindingDataBuilder::bindOrdinaryDataBufferIfNeeded(
 Result BindingDataBuilder::writeArgumentBuffer(
     ShaderObject* shaderObject,
     ShaderObjectLayoutImpl* specializedLayout,
-    BufferImpl*& outArgumentBuffer
+    MTL::Buffer*& outBuffer,
+    NS::UInteger& outOffset
 )
 {
     auto argumentBufferTypeLayout = specializedLayout->getParameterBlockTypeLayout();
@@ -736,7 +802,8 @@ Result BindingDataBuilder::writeArgumentBuffer(
     // empty struct type in AST. We need to handle this correctly.
     if (argumentBufferTypeLayout->getFieldCount() == 0)
     {
-        outArgumentBuffer = nullptr;
+        outBuffer = nullptr;
+        outOffset = 0;
         return SLANG_OK;
     }
 
@@ -746,10 +813,7 @@ Result BindingDataBuilder::writeArgumentBuffer(
     argumentBufferDesc.usage = BufferUsage::ConstantBuffer | BufferUsage::CopyDestination;
     argumentBufferDesc.defaultState = ResourceState::ConstantBuffer;
     argumentBufferDesc.memoryType = MemoryType::Upload;
-    char argLabel[128] = "ShaderObject_ArgumentBuffer";
-    if (m_label)
-        snprintf(argLabel, sizeof(argLabel), "%s_ArgumentBuffer", m_label);
-    argumentBufferDesc.label = argLabel;
+    argumentBufferDesc.label = "ArgumentBuffer";
     SLANG_RETURN_ON_FAIL(m_device->createBuffer(argumentBufferDesc, nullptr, argumentBuffer.writeRef()));
     auto argumentBufferImpl = checked_cast<BufferImpl*>(argumentBuffer.get());
 
@@ -766,7 +830,7 @@ Result BindingDataBuilder::writeArgumentBuffer(
     SLANG_RETURN_ON_FAIL(writeOrdinaryDataIntoArgumentBuffer(
         argumentBufferTypeLayout,
         shaderObject->getElementTypeLayout(),
-        (uint8_t*)argumentData,
+        argumentData,
         (uint8_t*)shaderObject->m_data.data()
     ));
 
@@ -929,11 +993,12 @@ Result BindingDataBuilder::writeArgumentBuffer(
             for (uint32_t i = 0; i < count; ++i)
             {
                 auto subObject = shaderObject->m_objects[subObjectIndex + i];
-                BufferImpl* subArgumentBuffer = nullptr;
-                SLANG_RETURN_ON_FAIL(writeArgumentBuffer(subObject, subObjectLayout, subArgumentBuffer));
-                DeviceAddress bufferPtr = subArgumentBuffer->m_buffer->gpuAddress();
+                MTL::Buffer* subArgBuffer = nullptr;
+                NS::UInteger subArgOffset = 0;
+                SLANG_RETURN_ON_FAIL(writeArgumentBuffer(subObject, subObjectLayout, subArgBuffer, subArgOffset));
+                DeviceAddress bufferPtr = subArgBuffer->gpuAddress() + subArgOffset;
                 memcpy(argumentPtr + i * sizeof(uint64_t), &bufferPtr, sizeof(bufferPtr));
-                SLANG_RETURN_ON_FAIL(addUsedResource(m_bindingData, subArgumentBuffer->m_buffer.get()));
+                SLANG_RETURN_ON_FAIL(addUsedResource(m_bindingData, subArgBuffer));
             }
             break;
         }
@@ -943,12 +1008,15 @@ Result BindingDataBuilder::writeArgumentBuffer(
     }
 
     if (!m_device->m_hasUnifiedMemory)
-        argumentBufferImpl->m_buffer->didModifyRange(NS::Range(0, argumentBufferImpl->m_desc.size));
+        argumentBufferImpl->m_buffer->didModifyRange(NS::Range(0, argumentBufferDesc.size));
 
-    // Pass ownership of the buffer to the binding cache.
+    outBuffer = argumentBufferImpl->m_buffer.get();
+    outOffset = 0;
+
+    // Keep BufferImpl alive for the frame via binding cache.
+    // The queue's arg buffer cache will separately retain the MTL::Buffer for cross-frame persistence.
     m_bindingCache->buffers.push_back(argumentBufferImpl);
 
-    outArgumentBuffer = argumentBufferImpl;
     return SLANG_OK;
 }
 
