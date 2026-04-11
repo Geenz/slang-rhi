@@ -2,21 +2,47 @@
 
 #include "metal-base.h"
 #include "metal-shader-object-layout.h"
+#include "metal-constant-buffer-pool.h"
 
 #include <vector>
 
 namespace rhi::metal {
+
+/// Per-object version snapshot for sub-tree skipping in bindAsValue.
+struct SubObjectVersionEntry
+{
+    ShaderObject* object;
+    uint32_t version;
+};
 
 struct BindingDataBuilder
 {
     DeviceImpl* m_device;
     ArenaAllocator* m_allocator;
     BindingCache* m_bindingCache;
+    ConstantBufferPool* m_constantBufferPool;
     BindingDataImpl* m_bindingData;
+    BindingDataImpl* m_previousBindingData = nullptr;
     const char* m_label = nullptr;  ///< Pipeline/shader label for debug naming of internal buffers
+
+    /// Previous sub-object versions for skip detection. Owned by CommandEncoderImpl.
+    std::vector<SubObjectVersionEntry>* m_previousVersions = nullptr;
+    /// Current sub-object versions being built this call.
+    std::vector<SubObjectVersionEntry>* m_currentVersions = nullptr;
+
+    /// Cached argument buffers. Owned by CommandEncoderImpl.
+    /// Using void* to avoid circular header dependency; cast to vector<CachedArgBuffer>* at use site.
+    void* m_cachedArgBuffers = nullptr;
 
     /// Bind this object as a root shader object
     Result bindAsRoot(
+        RootShaderObject* shaderObject,
+        RootShaderObjectLayoutImpl* specializedLayout,
+        BindingDataImpl*& outBindingData
+    );
+
+    /// Flat binding path: uses pre-computed FlatBindingTable instead of recursive tree walk
+    Result bindAsRootFlat(
         RootShaderObject* shaderObject,
         RootShaderObjectLayoutImpl* specializedLayout,
         BindingDataImpl*& outBindingData

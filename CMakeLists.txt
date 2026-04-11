@@ -745,6 +745,7 @@ if(SLANG_RHI_ENABLE_METAL)
         src/metal/metal-query.cpp
         src/metal/metal-sampler.cpp
         src/metal/metal-shader-object-layout.cpp
+        src/metal/metal-constant-buffer-pool.cpp
         src/metal/metal-shader-object.cpp
         src/metal/metal-shader-program.cpp
         src/metal/metal-shader-table.cpp

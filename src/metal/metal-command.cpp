@@ -1,5 +1,7 @@
 #include "metal-command.h"
 #include "metal-bindless-descriptor-set.h"
+#include <mach/mach_time.h>
+#include <cstdio>
 #include "metal-device.h"
 #include "metal-buffer.h"
 #include "metal-texture.h"
@@ -1696,11 +1698,32 @@ Result CommandEncoderImpl::init()
 
 Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingData*& outBindingData)
 {
-    rootObject->trackResources(m_commandBuffer->m_trackedObjects);
+    static thread_local uint64_t s_trackNs = 0, s_layoutNs = 0, s_bindNs = 0;
+    static thread_local uint32_t s_calls = 0;
+
+    auto t0 = mach_absolute_time();
+
+    // trackResources walks the shader object tree inserting RefPtrs into a std::set —
+    // expensive and unnecessary for the flat path which tracks used resources via
+    // addUsedResource/addUsedRWResource directly. Resources are kept alive by the
+    // GpuShader's persistent _defaultObject which holds RefPtrs to all bound resources.
+    // rootObject->trackResources(m_commandBuffer->m_trackedObjects);
+
+    auto t1 = mach_absolute_time();
+
     BindingDataBuilder builder;
     builder.m_device = getDevice<DeviceImpl>();
     builder.m_allocator = &m_commandBuffer->m_allocator;
     builder.m_bindingCache = &m_commandBuffer->m_bindingCache;
+    builder.m_constantBufferPool = &m_commandBuffer->m_constantBufferPool;
+    builder.m_previousBindingData = m_previousBindingData;
+    // Double-buffer version snapshots: previous has last frame's versions, current collects this frame's
+    auto* prevVersions = m_versionSnapFlip ? &m_versionSnapB : &m_versionSnapA;
+    auto* currVersions = m_versionSnapFlip ? &m_versionSnapA : &m_versionSnapB;
+    currVersions->clear();
+    builder.m_previousVersions = (m_previousBindingData) ? prevVersions : nullptr;
+    builder.m_currentVersions = currVersions;
+    builder.m_cachedArgBuffers = &m_cachedArgBuffers;
     ShaderObjectLayout* specializedLayout = nullptr;
     SLANG_RETURN_ON_FAIL(rootObject->getSpecializedLayout(specializedLayout));
     // Extract program label for debug naming of internal buffers
@@ -1708,11 +1731,34 @@ Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingD
     auto* programLayout = rootLayout->getSlangProgramLayout();
     if (programLayout && programLayout->getEntryPointCount() > 0)
         builder.m_label = programLayout->getEntryPointByIndex(0)->getName();
-    return builder.bindAsRoot(
-        rootObject,
-        checked_cast<RootShaderObjectLayoutImpl*>(specializedLayout),
-        (BindingDataImpl*&)outBindingData
-    );
+
+    auto t2 = mach_absolute_time();
+
+    SLANG_RETURN_ON_FAIL(builder.bindAsRootFlat(
+        rootObject, rootLayout, (BindingDataImpl*&)outBindingData));
+
+    auto t3 = mach_absolute_time();
+
+    m_previousBindingData = (BindingDataImpl*)outBindingData;
+    m_versionSnapFlip = !m_versionSnapFlip;
+
+    s_trackNs += (t1 - t0);
+    s_layoutNs += (t2 - t1);
+    s_bindNs += (t3 - t2);
+    s_calls++;
+    if (s_calls % 500 == 0)
+    {
+        mach_timebase_info_data_t info;
+        mach_timebase_info(&info);
+        auto toUs = [&](uint64_t ticks) { return ticks * info.numer / info.denom / 1000; };
+        fprintf(stderr, "[slang-rhi] getBindingData x%u: track=%lluus layout=%lluus bindAsRoot=%lluus\n",
+                s_calls, (unsigned long long)toUs(s_trackNs), (unsigned long long)toUs(s_layoutNs),
+                (unsigned long long)toUs(s_bindNs));
+        s_trackNs = s_layoutNs = s_bindNs = 0;
+        s_calls = 0;
+    }
+
+    return SLANG_OK;
 }
 
 Result CommandEncoderImpl::finish(const CommandBufferDesc& desc, ICommandBuffer** outCommandBuffer)
@@ -1755,6 +1801,8 @@ Result CommandBufferImpl::init()
 {
     AUTORELEASEPOOL
 
+    m_constantBufferPool.init(getDevice<DeviceImpl>());
+
     // Use descriptor to enable enhanced error reporting.
     // CommandBufferErrorOptionEncoderExecutionStatus tracks per-encoder fault state,
     // allowing us to identify which specific render/compute/blit encoder caused a GPU fault.
@@ -1772,6 +1820,7 @@ Result CommandBufferImpl::init()
 Result CommandBufferImpl::reset()
 {
     m_bindingCache.reset();
+    m_constantBufferPool.reset();
     return CommandBuffer::reset();
 }
 

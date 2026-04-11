@@ -2,6 +2,7 @@
 
 #include "metal-base.h"
 #include "metal-shader-object.h"
+#include "metal-constant-buffer-pool.h"
 
 #include "core/ring-queue.h"
 
@@ -59,6 +60,22 @@ public:
     CommandQueueImpl* m_queue;
     RefPtr<CommandBufferImpl> m_commandBuffer;
 
+    // Incremental binding state
+    RootShaderObject* m_lastTrackedRootObject = nullptr;
+    BindingDataImpl* m_previousBindingData = nullptr;
+    std::vector<SubObjectVersionEntry> m_versionSnapA;
+    std::vector<SubObjectVersionEntry> m_versionSnapB;
+    bool m_versionSnapFlip = false;
+
+    // Cached argument buffers (version-based reuse)
+    struct CachedArgBuffer
+    {
+        ShaderObject* object = nullptr;
+        uint32_t version = 0;
+        MTL::Buffer* buffer = nullptr;
+    };
+    std::vector<CachedArgBuffer> m_cachedArgBuffers;
+
     CommandEncoderImpl(Device* device, CommandQueueImpl* queue, const CommandEncoderDesc& desc);
     ~CommandEncoderImpl();
 
@@ -80,6 +97,7 @@ public:
     CommandQueueImpl* m_queue;
     NS::SharedPtr<MTL::CommandBuffer> m_commandBuffer;
     BindingCache m_bindingCache;
+    ConstantBufferPool m_constantBufferPool;
     uint64_t m_submissionID;
 
     CommandBufferImpl(Device* device, CommandQueueImpl* queue);

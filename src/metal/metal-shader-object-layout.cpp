@@ -1,4 +1,5 @@
 #include "metal-shader-object-layout.h"
+#include <cstdio>
 
 namespace rhi::metal {
 
@@ -325,6 +326,288 @@ Result RootShaderObjectLayoutImpl::_init(const Builder* builder)
     m_slangSession = m_program->getSession();
 
     return SLANG_OK;
+}
+
+// ============================================================================
+// Flat binding table builder
+// ============================================================================
+
+static void buildFlatEntries(
+    FlatBindingTable& table,
+    ShaderObjectLayoutImpl* layout,
+    BindingOffset offset,
+    uint16_t objectTreeIndex,
+    bool isRoot
+)
+{
+    // Record ordinary data for this object level (root handled externally).
+    // NOTE: Do NOT increment offset.buffer here. In the recursive path,
+    // bindAsConstantBuffer uses the ORIGINAL inOffset for bindAsValue,
+    // not the offset modified by bindOrdinaryDataBufferIfNeeded.
+    uint32_t ordinaryDataSize = layout->getTotalOrdinaryDataSize();
+    if (ordinaryDataSize > 0 && !isRoot)
+    {
+        FlatOrdinaryDataEntry entry;
+        entry.objectTreeIndex = objectTreeIndex;
+        entry.bufferRegister = (uint16_t)offset.buffer;
+        entry.dataSize = ordinaryDataSize;
+        table.ordinaryData.push_back(entry);
+    }
+
+    // Record binding range entries (textures, buffers, samplers)
+    for (const auto& bindingRangeInfo : layout->m_bindingRanges)
+    {
+        uint32_t count = bindingRangeInfo.count;
+        switch (bindingRangeInfo.bindingType)
+        {
+        case slang::BindingType::Texture:
+        case slang::BindingType::MutableTexture:
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                FlatBindingEntry entry;
+                entry.objectTreeIndex = objectTreeIndex;
+                entry.slotIndex = (uint16_t)(bindingRangeInfo.slotIndex + i);
+                entry.registerIndex = (uint16_t)(bindingRangeInfo.registerOffset + offset.texture + i);
+                entry.type = FlatBindingEntry::Type::Texture;
+                entry.isMutable = (bindingRangeInfo.bindingType == slang::BindingType::MutableTexture);
+                table.entries.push_back(entry);
+            }
+            break;
+
+        case slang::BindingType::Sampler:
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                FlatBindingEntry entry;
+                entry.objectTreeIndex = objectTreeIndex;
+                entry.slotIndex = (uint16_t)(bindingRangeInfo.slotIndex + i);
+                entry.registerIndex = (uint16_t)(bindingRangeInfo.registerOffset + offset.sampler + i);
+                entry.type = FlatBindingEntry::Type::Sampler;
+                entry.isMutable = false;
+                table.entries.push_back(entry);
+            }
+            break;
+
+        case slang::BindingType::RawBuffer:
+        case slang::BindingType::MutableRawBuffer:
+        case slang::BindingType::TypedBuffer:
+        case slang::BindingType::MutableTypedBuffer:
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                FlatBindingEntry entry;
+                entry.objectTreeIndex = objectTreeIndex;
+                entry.slotIndex = (uint16_t)(bindingRangeInfo.slotIndex + i);
+                entry.registerIndex = (uint16_t)(bindingRangeInfo.registerOffset + offset.buffer + i);
+                entry.type = FlatBindingEntry::Type::Buffer;
+                entry.isMutable = (bindingRangeInfo.bindingType == slang::BindingType::MutableRawBuffer ||
+                                   bindingRangeInfo.bindingType == slang::BindingType::MutableTypedBuffer);
+                table.entries.push_back(entry);
+            }
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    // Recurse into sub-object ranges
+    for (const auto& subObjectRange : layout->m_subObjectRanges)
+    {
+        auto subObjectLayout = subObjectRange.layout;
+        if (!subObjectLayout)
+            continue;
+
+        const auto& bindingRange = layout->m_bindingRanges[subObjectRange.bindingRangeIndex];
+        if (bindingRange.bindingType == slang::BindingType::ParameterBlock)
+        {
+            // Pre-compute argument buffer layout for ParameterBlock sub-objects.
+            auto pbLayout = subObjectRange.layout;
+            if (!pbLayout) continue;
+
+            auto argTypeLayout = pbLayout->getParameterBlockTypeLayout();
+            if (!argTypeLayout || argTypeLayout->getFieldCount() == 0) continue;
+
+            BindingOffset rangeOffset = offset;
+            rangeOffset += subObjectRange.offset;
+
+            for (uint32_t i = 0; i < bindingRange.count; ++i)
+            {
+                uint16_t subObjIndex = table.objectCount++;
+                table.objectPaths.push_back({FlatObjectPath::Source::SubObject, objectTreeIndex,
+                                             (uint16_t)(bindingRange.subObjectIndex + i)});
+
+                FlatArgBufferDesc desc;
+                desc.objectTreeIndex = subObjIndex;
+                desc.bindingDataRegister = (uint16_t)rangeOffset.buffer;
+                desc.bufferSize = (uint32_t)argTypeLayout->getSize();
+                desc.dataSize = (uint32_t)pbLayout->getElementTypeLayout()->getSize();
+                desc.firstEntry = (uint32_t)table.argBufferEntries.size();
+                desc.entryCount = 0;
+
+                // Pre-compute per-binding offsets within the argument buffer
+                for (uint32_t bri = 0; bri < pbLayout->getBindingRangeCount(); ++bri)
+                {
+                    const auto& brInfo = pbLayout->m_bindingRanges[bri];
+                    uint32_t count2 = brInfo.count;
+
+                    FlatArgBufferBindingEntry::Type entryType;
+                    bool isMutable = false;
+                    bool skip = false;
+
+                    switch (brInfo.bindingType)
+                    {
+                    case slang::BindingType::Texture:
+                        entryType = FlatArgBufferBindingEntry::Type::Texture; break;
+                    case slang::BindingType::MutableTexture:
+                        entryType = FlatArgBufferBindingEntry::Type::Texture; isMutable = true; break;
+                    case slang::BindingType::Sampler:
+                        entryType = FlatArgBufferBindingEntry::Type::Sampler; break;
+                    case slang::BindingType::RawBuffer:
+                    case slang::BindingType::TypedBuffer:
+                        entryType = FlatArgBufferBindingEntry::Type::Buffer; break;
+                    case slang::BindingType::MutableRawBuffer:
+                    case slang::BindingType::MutableTypedBuffer:
+                        entryType = FlatArgBufferBindingEntry::Type::Buffer; isMutable = true; break;
+                    case slang::BindingType::RayTracingAccelerationStructure:
+                        entryType = FlatArgBufferBindingEntry::Type::AccelerationStructure; break;
+                    default:
+                        skip = true; break;
+                    }
+
+                    if (skip) continue;
+
+                    SlangInt setIdx = argTypeLayout->getBindingRangeDescriptorSetIndex(bri);
+                    SlangInt rangeIdx = argTypeLayout->getBindingRangeFirstDescriptorRangeIndex(bri);
+                    SlangInt argOffset = argTypeLayout->getDescriptorSetDescriptorRangeIndexOffset(setIdx, rangeIdx);
+
+                    for (uint32_t j = 0; j < count2; ++j)
+                    {
+                        FlatArgBufferBindingEntry entry;
+                        entry.slotIndex = (uint16_t)(brInfo.slotIndex + j);
+                        entry.byteOffset = (uint32_t)(argOffset + j * sizeof(uint64_t));
+                        entry.type = entryType;
+                        entry.isMutable = isMutable;
+                        table.argBufferEntries.push_back(entry);
+                        desc.entryCount++;
+                    }
+                }
+
+                table.argBuffers.push_back(desc);
+                rangeOffset += subObjectRange.stride;
+            }
+            continue;
+        }
+
+        if (bindingRange.bindingType != slang::BindingType::ConstantBuffer)
+            continue;
+
+        uint32_t count = bindingRange.count;
+        BindingOffset rangeOffset = offset;
+        rangeOffset += subObjectRange.offset;
+        BindingOffset rangeStride = subObjectRange.stride;
+
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            uint16_t subObjIndex = table.objectCount++;
+            table.objectPaths.push_back({FlatObjectPath::Source::SubObject, objectTreeIndex,
+                                         (uint16_t)(bindingRange.subObjectIndex + i)});
+            buildFlatEntries(table, subObjectLayout, rangeOffset, subObjIndex, false);
+            rangeOffset += rangeStride;
+        }
+    }
+}
+
+const FlatBindingTable& RootShaderObjectLayoutImpl::getFlatBindingTable()
+{
+    if (m_flatBindingTable.built)
+        return m_flatBindingTable;
+
+    m_flatBindingTable.objectCount = 1; // root = index 0
+    m_flatBindingTable.objectPaths.push_back({FlatObjectPath::Source::Root, 0, 0});
+
+    // Root level: ordinary data offset is special (absolute, not relative)
+    uint32_t rootOrdinaryDataSize = getTotalOrdinaryDataSize();
+    if (rootOrdinaryDataSize > 0)
+    {
+        FlatOrdinaryDataEntry entry;
+        entry.objectTreeIndex = 0;
+        entry.bufferRegister = 0;
+        entry.dataSize = rootOrdinaryDataSize;
+        m_flatBindingTable.ordinaryData.push_back(entry);
+        // Root ordinary data buffer offset is handled separately in bindAsRoot
+    }
+
+    // Build entries for root's own binding ranges (with offset 0)
+    // Then recurse into sub-objects
+    buildFlatEntries(m_flatBindingTable, this, BindingOffset(), 0, true);
+
+    // Entry points
+    for (size_t i = 0; i < m_entryPoints.size(); ++i)
+    {
+        auto* epLayout = m_entryPoints[i].layout.get();
+        BindingOffset epOffset = m_entryPoints[i].offset;
+        uint16_t epIndex = m_flatBindingTable.objectCount++;
+        m_flatBindingTable.objectPaths.push_back({FlatObjectPath::Source::EntryPoint, 0, (uint16_t)i});
+        buildFlatEntries(m_flatBindingTable, epLayout, epOffset, epIndex, false);
+    }
+
+    // Compute right-sized array bounds from the flat table
+    for (const auto& e : m_flatBindingTable.entries)
+    {
+        if (e.type == FlatBindingEntry::Type::Buffer)
+        {
+            m_flatBindingTable.maxBufferRegister = std::max(m_flatBindingTable.maxBufferRegister,
+                                                            (uint16_t)(e.registerIndex + 1));
+            if (e.isMutable) m_flatBindingTable.maxUsedRWResources++;
+            else m_flatBindingTable.maxUsedResources++;
+        }
+        else if (e.type == FlatBindingEntry::Type::Texture)
+        {
+            m_flatBindingTable.maxTextureRegister = std::max(m_flatBindingTable.maxTextureRegister,
+                                                             (uint16_t)(e.registerIndex + 1));
+            if (e.isMutable) m_flatBindingTable.maxUsedRWResources++;
+            else m_flatBindingTable.maxUsedResources++;
+        }
+        else if (e.type == FlatBindingEntry::Type::Sampler)
+        {
+            // samplers don't need usedResource tracking
+        }
+    }
+    // Account for ordinary data buffers and argument buffers in buffer register count
+    for (const auto& od : m_flatBindingTable.ordinaryData)
+        m_flatBindingTable.maxBufferRegister = std::max(m_flatBindingTable.maxBufferRegister,
+                                                        (uint16_t)(od.bufferRegister + 1));
+    for (const auto& ab : m_flatBindingTable.argBuffers)
+    {
+        m_flatBindingTable.maxBufferRegister = std::max(m_flatBindingTable.maxBufferRegister,
+                                                        (uint16_t)(ab.bindingDataRegister + 1));
+        m_flatBindingTable.maxUsedResources += ab.entryCount; // conservative upper bound
+    }
+
+    m_flatBindingTable.built = true;
+
+    fprintf(stderr, "[slang-rhi] FlatBindingTable: %zu entries, %zu ordinaryData, %u objects, buf=%u tex=%u\n",
+            m_flatBindingTable.entries.size(), m_flatBindingTable.ordinaryData.size(),
+            m_flatBindingTable.objectCount, m_flatBindingTable.maxBufferRegister,
+            m_flatBindingTable.maxTextureRegister);
+
+    fprintf(stderr, "[slang-rhi] FlatBindingTable: %zu entries, %zu ordinaryData, %u objects\n",
+            m_flatBindingTable.entries.size(), m_flatBindingTable.ordinaryData.size(),
+            m_flatBindingTable.objectCount);
+    for (size_t i = 0; i < m_flatBindingTable.ordinaryData.size(); ++i)
+    {
+        const auto& od = m_flatBindingTable.ordinaryData[i];
+        fprintf(stderr, "  ordinaryData[%zu]: obj=%u reg=%u size=%u\n", i, od.objectTreeIndex, od.bufferRegister, od.dataSize);
+    }
+    for (size_t i = 0; i < m_flatBindingTable.entries.size(); ++i)
+    {
+        const auto& e = m_flatBindingTable.entries[i];
+        const char* typeStr = e.type == FlatBindingEntry::Type::Buffer ? "buf" :
+                              e.type == FlatBindingEntry::Type::Texture ? "tex" : "smp";
+        fprintf(stderr, "  entry[%zu]: obj=%u slot=%u -> %s[%u]%s\n", i, e.objectTreeIndex, e.slotIndex,
+                typeStr, e.registerIndex, e.isMutable ? " (rw)" : "");
+    }
+
+    return m_flatBindingTable;
 }
 
 } // namespace rhi::metal

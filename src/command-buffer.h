@@ -65,6 +65,12 @@ public:
     /// Command list, nullptr if pass encoder is not active.
     CommandList* m_commandList = nullptr;
 
+    // Binding data cache (single-entry MRU)
+    IPipeline* m_cachedPipeline = nullptr;
+    RootShaderObject* m_cachedRootObject = nullptr;
+    uint64_t m_cachedCompositeVersion = 0;
+    BindingData* m_cachedBindingData = nullptr;
+
     RenderPassEncoder(CommandEncoder* commandEncoder);
 
     void writeRenderState();
@@ -113,6 +119,12 @@ public:
     /// Command list, nullptr if pass encoder is not active.
     CommandList* m_commandList;
 
+    // Binding data cache (single-entry MRU)
+    IComputePipeline* m_cachedPipeline = nullptr;
+    RootShaderObject* m_cachedRootObject = nullptr;
+    uint64_t m_cachedCompositeVersion = 0;
+    BindingData* m_cachedBindingData = nullptr;
+
     ComputePassEncoder(CommandEncoder* commandEncoder);
 
     void writeComputeState();
@@ -151,6 +163,12 @@ public:
     RefPtr<RootShaderObject> m_rootObject;
     /// Command list, nullptr if pass encoder is not active.
     CommandList* m_commandList;
+
+    // Binding data cache (single-entry MRU)
+    IRayTracingPipeline* m_cachedPipeline = nullptr;
+    RootShaderObject* m_cachedRootObject = nullptr;
+    uint64_t m_cachedCompositeVersion = 0;
+    BindingData* m_cachedBindingData = nullptr;
 
     RayTracingPassEncoder(CommandEncoder* commandEncoder);
 

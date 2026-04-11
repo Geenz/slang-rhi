@@ -78,10 +78,16 @@ Result ShaderObject::setData(const ShaderOffset& offset, const void* data, Size 
     size_t availableSize = m_data.size();
 
     // This should be an error, but slang-test relies on this behavior.
+    if (dataOffset >= availableSize)
+        return SLANG_OK;
     if ((dataOffset + dataSize) > availableSize)
     {
         dataSize = availableSize - dataOffset;
     }
+
+    // Skip write and version bump if data is identical.
+    if (dataSize == 0 || ::memcmp(dest + dataOffset, data, dataSize) == 0)
+        return SLANG_OK;
 
     ::memcpy(dest + dataOffset, data, dataSize);
 
@@ -286,6 +292,9 @@ Result ShaderObject::setBinding(const ShaderOffset& offset, const Binding& bindi
 
     ResourceSlot& slot = m_slots[slotIndex];
 
+    // Build the new slot value, then compare against current to skip redundant version bumps.
+    ResourceSlot newSlot = {};
+
     switch (binding.type)
     {
     case BindingType::Buffer:
@@ -294,16 +303,12 @@ Result ShaderObject::setBinding(const ShaderOffset& offset, const Binding& bindi
         Buffer* buffer = checked_cast<Buffer*>(binding.resource.get());
         if (buffer)
         {
-            slot.type = BindingType::Buffer;
-            slot.resource = buffer;
+            newSlot.type = BindingType::Buffer;
+            newSlot.resource = buffer;
             if (binding.type == BindingType::BufferWithCounter)
-                slot.resource2 = checked_cast<Buffer*>(binding.resource2.get());
-            slot.format = buffer->m_desc.format;
-            slot.bufferRange = buffer->resolveBufferRange(binding.bufferRange);
-        }
-        else
-        {
-            slot = {};
+                newSlot.resource2 = checked_cast<Buffer*>(binding.resource2.get());
+            newSlot.format = buffer->m_desc.format;
+            newSlot.bufferRange = buffer->resolveBufferRange(binding.bufferRange);
         }
         break;
     }
@@ -312,12 +317,8 @@ Result ShaderObject::setBinding(const ShaderOffset& offset, const Binding& bindi
         TextureView* textureView = checked_cast<TextureView*>(binding.resource.get());
         if (textureView)
         {
-            slot.type = BindingType::Texture;
-            slot.resource = textureView;
-        }
-        else
-        {
-            slot = {};
+            newSlot.type = BindingType::Texture;
+            newSlot.resource = textureView;
         }
         break;
     }
@@ -326,12 +327,8 @@ Result ShaderObject::setBinding(const ShaderOffset& offset, const Binding& bindi
         Sampler* sampler = checked_cast<Sampler*>(binding.resource.get());
         if (sampler)
         {
-            slot.type = BindingType::Sampler;
-            slot.resource = sampler;
-        }
-        else
-        {
-            slot = {};
+            newSlot.type = BindingType::Sampler;
+            newSlot.resource = sampler;
         }
         break;
     }
@@ -340,12 +337,8 @@ Result ShaderObject::setBinding(const ShaderOffset& offset, const Binding& bindi
         AccelerationStructure* accelerationStructure = checked_cast<AccelerationStructure*>(binding.resource.get());
         if (accelerationStructure)
         {
-            slot.type = BindingType::AccelerationStructure;
-            slot.resource = accelerationStructure;
-        }
-        else
-        {
-            slot = {};
+            newSlot.type = BindingType::AccelerationStructure;
+            newSlot.resource = accelerationStructure;
         }
         break;
     }
@@ -355,19 +348,25 @@ Result ShaderObject::setBinding(const ShaderOffset& offset, const Binding& bindi
         Sampler* sampler = checked_cast<Sampler*>(binding.resource2.get());
         if (textureView && sampler)
         {
-            slot.type = BindingType::CombinedTextureSampler;
-            slot.resource = textureView;
-            slot.resource2 = sampler;
-        }
-        else
-        {
-            slot = {};
+            newSlot.type = BindingType::CombinedTextureSampler;
+            newSlot.resource = textureView;
+            newSlot.resource2 = sampler;
         }
         break;
     }
     default:
         return SLANG_E_INVALID_ARG;
     }
+
+    // Skip if the binding is identical to what's already stored.
+    if (slot.type == newSlot.type && slot.resource == newSlot.resource && slot.resource2 == newSlot.resource2 &&
+        slot.format == newSlot.format && slot.bufferRange.offset == newSlot.bufferRange.offset &&
+        slot.bufferRange.size == newSlot.bufferRange.size)
+    {
+        return SLANG_OK;
+    }
+
+    slot = std::move(newSlot);
 
     if (m_setBindingHook)
         m_setBindingHook(this, offset, slot, bindingRange.bindingType);
@@ -929,6 +928,28 @@ void RootShaderObject::trackResources(std::set<RefPtr<RefObject>>& resources)
         if (entryPoint)
             entryPoint->trackResources(resources);
     }
+}
+
+uint64_t ShaderObject::getCompositeVersion() const
+{
+    uint64_t composite = m_version;
+    for (size_t i = 0; i < m_objects.size(); ++i)
+    {
+        if (m_objects[i])
+            composite = composite * 31 + m_objects[i]->getCompositeVersion();
+    }
+    return composite;
+}
+
+uint64_t RootShaderObject::getCompositeVersion() const
+{
+    uint64_t composite = ShaderObject::getCompositeVersion();
+    for (size_t i = 0; i < m_entryPoints.size(); ++i)
+    {
+        if (m_entryPoints[i])
+            composite = composite * 31 + m_entryPoints[i]->getCompositeVersion();
+    }
+    return composite;
 }
 
 bool _doesValueFitInExistentialPayload(

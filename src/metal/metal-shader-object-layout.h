@@ -6,6 +6,73 @@
 
 namespace rhi::metal {
 
+/// Flat binding entry: pre-computed mapping from ShaderObject slot to BindingData array index.
+struct FlatBindingEntry
+{
+    enum class Type : uint8_t { Buffer, Texture, Sampler };
+
+    uint16_t objectTreeIndex;   ///< Index into flat ShaderObject array
+    uint16_t slotIndex;         ///< Index into ShaderObject::m_slots
+    uint16_t registerIndex;     ///< Final index in BindingData array
+    Type type;
+    bool isMutable;
+};
+
+/// Flat ordinary data entry: pre-computed for constant buffer data uploads.
+struct FlatOrdinaryDataEntry
+{
+    uint16_t objectTreeIndex;
+    uint16_t bufferRegister;
+    uint32_t dataSize;
+};
+
+/// Pre-computed argument buffer binding: one per resource in a ParameterBlock.
+struct FlatArgBufferBindingEntry
+{
+    enum class Type : uint8_t { Buffer, Texture, Sampler, AccelerationStructure };
+
+    uint16_t slotIndex;         ///< Index into the ParameterBlock ShaderObject's m_slots
+    uint32_t byteOffset;        ///< Byte offset in the argument buffer to write the 8-byte GPU address
+    Type type;
+    bool isMutable;
+};
+
+/// Pre-computed argument buffer descriptor: one per ParameterBlock sub-object.
+struct FlatArgBufferDesc
+{
+    uint16_t objectTreeIndex;   ///< Index into flat ShaderObject array
+    uint16_t bindingDataRegister; ///< Buffer register in BindingData where the arg buffer is bound
+    uint32_t bufferSize;        ///< Total argument buffer allocation size
+    uint32_t dataSize;          ///< Bytes of m_data to copy into the argument buffer
+    uint32_t firstEntry;        ///< Start index into FlatBindingTable::argBufferEntries
+    uint32_t entryCount;        ///< Number of entries for this argument buffer
+};
+
+/// Pre-computed object tree path: how to collect a ShaderObject* from root at draw time.
+struct FlatObjectPath
+{
+    enum class Source : uint8_t { Root, SubObject, EntryPoint };
+    Source source;
+    uint16_t parentIndex;       ///< Index of parent in objects[] array (for SubObject)
+    uint16_t subObjectSlot;     ///< Index into parent->m_objects (for SubObject) or m_entryPoints (for EntryPoint)
+};
+
+/// Pre-computed flat binding table. Replaces recursive tree walk with a single flat loop.
+struct FlatBindingTable
+{
+    std::vector<FlatBindingEntry> entries;
+    std::vector<FlatOrdinaryDataEntry> ordinaryData;
+    std::vector<FlatArgBufferDesc> argBuffers;
+    std::vector<FlatArgBufferBindingEntry> argBufferEntries;
+    std::vector<FlatObjectPath> objectPaths;    ///< How to collect each ShaderObject* at draw time
+    uint16_t objectCount = 0;
+    uint16_t maxBufferRegister = 0;     ///< Highest buffer register + 1 (right-size allocation)
+    uint16_t maxTextureRegister = 0;    ///< Highest texture register + 1
+    uint16_t maxUsedResources = 0;      ///< Max possible usedResource count (read-only)
+    uint16_t maxUsedRWResources = 0;    ///< Max possible usedRWResource count (read-write)
+    bool built = false;
+};
+
 /// A "simple" binding offset that records an offset in buffer/texture/sampler slots
 struct BindingOffset
 {
@@ -225,6 +292,11 @@ public:
 
     slang::IComponentType* getSlangProgram() const { return m_program; }
     slang::ProgramLayout* getSlangProgramLayout() const { return m_programLayout; }
+
+    /// Get or build the flat binding table for this layout.
+    const FlatBindingTable& getFlatBindingTable();
+
+    FlatBindingTable m_flatBindingTable;
 
     // ShaderObjectLayout interface
     virtual uint32_t getEntryPointCount() const override { return (uint32_t)m_entryPoints.size(); }

@@ -1,5 +1,7 @@
 #include "metal-shader-object.h"
 #include "metal-bindless-descriptor-set.h"
+#include <mach/mach_time.h>
+#include <cstdio>
 #include "metal-device.h"
 #include "metal-acceleration-structure.h"
 #include "metal-buffer.h"
@@ -53,68 +55,277 @@ inline Result addUsedRWResource(BindingDataImpl* bindingData, MTL::Resource* res
     return SLANG_OK;
 }
 
+Result BindingDataBuilder::bindAsRootFlat(
+    RootShaderObject* shaderObject,
+    RootShaderObjectLayoutImpl* specializedLayout,
+    BindingDataImpl*& outBindingData
+)
+{
+    const FlatBindingTable& table = specializedLayout->getFlatBindingTable();
+
+    // Allocate BindingData (clone from previous or fresh)
+    BindingDataImpl* bindingData = m_allocator->allocate<BindingDataImpl>();
+    m_bindingData = bindingData;
+
+    // Right-sized allocations from pre-computed bounds — no wasted zeroing
+    uint32_t bufCount = table.maxBufferRegister;
+    uint32_t texCount = table.maxTextureRegister;
+    uint32_t samplerCount = specializedLayout->getTotalSamplerCount();
+    uint32_t usedResCapacity = table.maxUsedResources + table.ordinaryData.size() + 1;
+    uint32_t usedRWResCapacity = table.maxUsedRWResources + 1;
+
+    m_bindingData->bufferCapacity = bufCount;
+    m_bindingData->bufferCount = bufCount;
+    m_bindingData->buffers = m_allocator->allocate<MTL::Buffer*>(bufCount);
+    ::memset(m_bindingData->buffers, 0, sizeof(MTL::Buffer*) * bufCount);
+    m_bindingData->bufferOffsets = m_allocator->allocate<NS::UInteger>(bufCount);
+    ::memset(m_bindingData->bufferOffsets, 0, sizeof(NS::UInteger) * bufCount);
+
+    m_bindingData->textureCapacity = texCount;
+    m_bindingData->textureCount = texCount;
+    m_bindingData->textures = m_allocator->allocate<MTL::Texture*>(texCount);
+    ::memset(m_bindingData->textures, 0, sizeof(MTL::Texture*) * texCount);
+
+    m_bindingData->samplerCount = samplerCount;
+    m_bindingData->samplers = m_allocator->allocate<MTL::SamplerState*>(samplerCount);
+    ::memset(m_bindingData->samplers, 0, sizeof(MTL::SamplerState*) * samplerCount);
+
+    m_bindingData->usedResourceCount = 0;
+    m_bindingData->usedResourceCapacity = usedResCapacity;
+    m_bindingData->usedResources = m_allocator->allocate<MTL::Resource*>(usedResCapacity);
+    m_bindingData->usedRWResourceCount = 0;
+    m_bindingData->usedRWResourceCapacity = usedRWResCapacity;
+    m_bindingData->usedRWResources = m_allocator->allocate<MTL::Resource*>(usedRWResCapacity);
+
+    // Collect all ShaderObjects in tree order (root, sub-objects, entry points)
+    // using a small inline array since tree is typically <20 objects
+    ShaderObject* objects[64];
+    uint16_t objCount = table.objectCount;
+    SLANG_RHI_ASSERT(objCount <= 64);
+
+    // Build flat object array: root=0, then sub-objects in tree order, then entry points
+    // Collect ShaderObject pointers using pre-computed paths — no layout traversal at draw time.
+    for (uint16_t i = 0; i < objCount; ++i)
+    {
+        const auto& path = table.objectPaths[i];
+        switch (path.source)
+        {
+        case FlatObjectPath::Source::Root:
+            objects[i] = shaderObject;
+            break;
+        case FlatObjectPath::Source::SubObject:
+            objects[i] = objects[path.parentIndex] ? objects[path.parentIndex]->m_objects[path.subObjectSlot] : nullptr;
+            break;
+        case FlatObjectPath::Source::EntryPoint:
+            objects[i] = shaderObject->m_entryPoints[path.subObjectSlot];
+            break;
+        }
+    }
+
+    // Process ordinary data entries (constant buffer uploads)
+    for (const auto& od : table.ordinaryData)
+    {
+        ShaderObject* obj = objects[od.objectTreeIndex];
+        if (!obj || od.dataSize == 0)
+            continue;
+
+        ConstantBufferPool::Allocation allocation;
+        SLANG_RETURN_ON_FAIL(m_constantBufferPool->allocate(od.dataSize, allocation));
+        ::memcpy(allocation.mappedData, obj->m_data.data(), std::min((size_t)od.dataSize, obj->m_data.size()));
+
+        SLANG_RETURN_ON_FAIL(setBuffer(m_bindingData, od.bufferRegister,
+                                        allocation.buffer->m_buffer.get(), allocation.offset));
+
+        if (!m_device->m_hasUnifiedMemory)
+            allocation.buffer->m_buffer->didModifyRange(NS::Range(allocation.offset, od.dataSize));
+    }
+
+    // Process binding entries (single flat loop — no recursion)
+    for (const auto& entry : table.entries)
+    {
+        ShaderObject* obj = objects[entry.objectTreeIndex];
+        if (!obj)
+            continue;
+
+        const ResourceSlot& slot = obj->m_slots[entry.slotIndex];
+        if (!slot.resource)
+            continue;
+
+        switch (entry.type)
+        {
+        case FlatBindingEntry::Type::Buffer:
+        {
+            BufferImpl* buffer = static_cast<BufferImpl*>(slot.resource.get());
+            setBuffer(m_bindingData, entry.registerIndex, buffer->m_buffer.get(), slot.bufferRange.offset);
+            if (entry.isMutable)
+                addUsedRWResource(m_bindingData, buffer->m_buffer.get());
+            else
+                addUsedResource(m_bindingData, buffer->m_buffer.get());
+            break;
+        }
+        case FlatBindingEntry::Type::Texture:
+        {
+            TextureViewImpl* textureView = static_cast<TextureViewImpl*>(slot.resource.get());
+            setTexture(m_bindingData, entry.registerIndex, textureView->m_textureView.get());
+            if (entry.isMutable)
+                addUsedRWResource(m_bindingData, textureView->m_textureView.get());
+            else
+                addUsedResource(m_bindingData, textureView->m_textureView.get());
+            break;
+        }
+        case FlatBindingEntry::Type::Sampler:
+        {
+            SamplerImpl* sampler = static_cast<SamplerImpl*>(slot.resource.get());
+            SLANG_RHI_ASSERT(entry.registerIndex < m_bindingData->samplerCount);
+            m_bindingData->samplers[entry.registerIndex] = sampler->m_samplerState.get();
+            break;
+        }
+        }
+    }
+
+    // Handle ParameterBlock sub-objects via pre-computed argument buffer layout.
+    for (const auto& ab : table.argBuffers)
+    {
+        ShaderObject* obj = objects[ab.objectTreeIndex];
+        if (!obj || ab.bufferSize == 0)
+            continue;
+
+        // Check argument buffer cache — reuse if version unchanged
+        struct CachedArgBuf { ShaderObject* object; uint32_t version; MTL::Buffer* buffer; };
+        auto* argCache = static_cast<std::vector<CachedArgBuf>*>(m_cachedArgBuffers);
+        if (argCache)
+        {
+            bool hit = false;
+            for (auto& c : *argCache)
+            {
+                if (c.object == obj && c.version == obj->m_version)
+                {
+                    SLANG_RETURN_ON_FAIL(setBuffer(m_bindingData, ab.bindingDataRegister, c.buffer, 0));
+                    hit = true;
+                    break;
+                }
+            }
+            if (hit) continue;
+        }
+
+        // Cache miss — create argument buffer via recursive path.
+        // Find the correct ParameterBlock layout from the sub-object ranges.
+        ShaderObjectLayoutImpl* pbLayout = nullptr;
+        for (const auto& sr : specializedLayout->m_subObjectRanges)
+        {
+            const auto& br = specializedLayout->m_bindingRanges[sr.bindingRangeIndex];
+            if (br.bindingType == slang::BindingType::ParameterBlock)
+            {
+                pbLayout = sr.layout;
+                break;
+            }
+        }
+        BufferImpl* argBufResult = nullptr;
+        if (pbLayout)
+            SLANG_RETURN_ON_FAIL(writeArgumentBuffer(obj, pbLayout, argBufResult));
+        if (argBufResult)
+        {
+            SLANG_RETURN_ON_FAIL(setBuffer(m_bindingData, ab.bindingDataRegister, argBufResult->m_buffer.get(), 0));
+
+            // Update cache
+            if (argCache)
+            {
+                bool updated = false;
+                for (auto& c : *argCache)
+                {
+                    if (c.object == obj) { c.version = obj->m_version; c.buffer = argBufResult->m_buffer.get(); updated = true; break; }
+                }
+                if (!updated)
+                    argCache->push_back({obj, obj->m_version, argBufResult->m_buffer.get()});
+            }
+        }
+    }
+
+    outBindingData = bindingData;
+    return SLANG_OK;
+}
+
 Result BindingDataBuilder::bindAsRoot(
     RootShaderObject* shaderObject,
     RootShaderObjectLayoutImpl* specializedLayout,
     BindingDataImpl*& outBindingData
 )
 {
-    // Create a new set of binding data to populate.
-    // TODO: In the future we should lookup the cache for existing
-    // binding data and reuse that if possible.
     BindingDataImpl* bindingData = m_allocator->allocate<BindingDataImpl>();
     m_bindingData = bindingData;
 
-    // TODO(shaderobject): we should count number of buffers/textures in the layout and allocate appropriately
-    // then we could switch to asserts instead of error checks when writing binding data
-    m_bindingData->bufferCapacity = 256;
-    m_bindingData->textureCapacity = 256;
-    m_bindingData->usedResourceCapacity = 256;
-    m_bindingData->usedRWResourceCapacity = 256;
-
-    m_bindingData->bufferCount = 0;
-    m_bindingData->buffers = m_allocator->allocate<MTL::Buffer*>(m_bindingData->bufferCapacity);
-    ::memset(m_bindingData->buffers, 0, sizeof(MTL::Buffer*) * m_bindingData->bufferCapacity);
-    m_bindingData->bufferOffsets = m_allocator->allocate<NS::UInteger>(m_bindingData->bufferCapacity);
-    ::memset(m_bindingData->bufferOffsets, 0, sizeof(NS::UInteger) * m_bindingData->bufferCapacity);
-
-    m_bindingData->textureCount = 0;
-    m_bindingData->textures = m_allocator->allocate<MTL::Texture*>(m_bindingData->textureCapacity);
-    ::memset(m_bindingData->textures, 0, sizeof(MTL::Texture*) * m_bindingData->textureCapacity);
-
     uint32_t samplerCount = specializedLayout->getTotalSamplerCount();
-    m_bindingData->samplerCount = samplerCount;
-    m_bindingData->samplers = m_allocator->allocate<MTL::SamplerState*>(samplerCount);
-    ::memset(m_bindingData->samplers, 0, sizeof(MTL::SamplerState*) * samplerCount);
 
-    m_bindingData->usedResourceCount = 0;
-    m_bindingData->usedResources = m_allocator->allocate<MTL::Resource*>(m_bindingData->usedResourceCapacity);
-    m_bindingData->usedRWResourceCount = 0;
-    m_bindingData->usedRWResources = m_allocator->allocate<MTL::Resource*>(m_bindingData->usedRWResourceCapacity);
+    if (m_previousBindingData && m_previousBindingData->bufferCapacity == 256 &&
+        m_previousBindingData->samplerCount == samplerCount)
+    {
+        // Clone arrays from previous binding data (memcpy instead of alloc+memset).
+        // The tree walk below will overwrite changed slots.
+        m_bindingData->bufferCapacity = 256;
+        m_bindingData->textureCapacity = 256;
+        m_bindingData->usedResourceCapacity = 256;
+        m_bindingData->usedRWResourceCapacity = 256;
+
+        m_bindingData->buffers = m_allocator->allocate<MTL::Buffer*>(256);
+        ::memcpy(m_bindingData->buffers, m_previousBindingData->buffers, sizeof(MTL::Buffer*) * 256);
+        m_bindingData->bufferOffsets = m_allocator->allocate<NS::UInteger>(256);
+        ::memcpy(m_bindingData->bufferOffsets, m_previousBindingData->bufferOffsets, sizeof(NS::UInteger) * 256);
+        m_bindingData->bufferCount = m_previousBindingData->bufferCount;
+
+        m_bindingData->textures = m_allocator->allocate<MTL::Texture*>(256);
+        ::memcpy(m_bindingData->textures, m_previousBindingData->textures, sizeof(MTL::Texture*) * 256);
+        m_bindingData->textureCount = m_previousBindingData->textureCount;
+
+        m_bindingData->samplerCount = samplerCount;
+        m_bindingData->samplers = m_allocator->allocate<MTL::SamplerState*>(samplerCount);
+        ::memcpy(m_bindingData->samplers, m_previousBindingData->samplers, sizeof(MTL::SamplerState*) * samplerCount);
+
+        // usedResource arrays must be rebuilt each time (addUsedResource appends)
+        m_bindingData->usedResourceCount = 0;
+        m_bindingData->usedResources = m_allocator->allocate<MTL::Resource*>(256);
+        m_bindingData->usedRWResourceCount = 0;
+        m_bindingData->usedRWResources = m_allocator->allocate<MTL::Resource*>(256);
+    }
+    else
+    {
+        // Fresh allocation path (first call or layout mismatch)
+        m_bindingData->bufferCapacity = 256;
+        m_bindingData->textureCapacity = 256;
+        m_bindingData->usedResourceCapacity = 256;
+        m_bindingData->usedRWResourceCapacity = 256;
+
+        m_bindingData->bufferCount = 0;
+        m_bindingData->buffers = m_allocator->allocate<MTL::Buffer*>(256);
+        ::memset(m_bindingData->buffers, 0, sizeof(MTL::Buffer*) * 256);
+        m_bindingData->bufferOffsets = m_allocator->allocate<NS::UInteger>(256);
+        ::memset(m_bindingData->bufferOffsets, 0, sizeof(NS::UInteger) * 256);
+
+        m_bindingData->textureCount = 0;
+        m_bindingData->textures = m_allocator->allocate<MTL::Texture*>(256);
+        ::memset(m_bindingData->textures, 0, sizeof(MTL::Texture*) * 256);
+
+        m_bindingData->samplerCount = samplerCount;
+        m_bindingData->samplers = m_allocator->allocate<MTL::SamplerState*>(samplerCount);
+        ::memset(m_bindingData->samplers, 0, sizeof(MTL::SamplerState*) * samplerCount);
+
+        m_bindingData->usedResourceCount = 0;
+        m_bindingData->usedResources = m_allocator->allocate<MTL::Resource*>(256);
+        m_bindingData->usedRWResourceCount = 0;
+        m_bindingData->usedRWResources = m_allocator->allocate<MTL::Resource*>(256);
+    }
 
     // Initialize binding offset for shader parameters.
     //
     BindingOffset offset;
 
-    // Note: We could *almost* call `bindAsConstantBuffer()` here to bind
-    // the state of the root object itself, but there is an important
-    // detail that means we can't:
-    //
-    // The `_bindOrdinaryDataBufferIfNeeded` operation automatically
-    // increments the offset parameter if it binds a buffer, so that
-    // subsequently bindings will be adjusted. However, the reflection
-    // information computed for root shader parameters is absolute rather
-    // than relative to the default constant buffer (if any).
-    //
-    // TODO: Quite technically, the ordinary data buffer for the global
-    // scope is *not* guaranteed to be at offset zero, so this logic should
-    // really be querying an appropriate absolute offset from `layout`.
-    //
 #if 1
+    auto ta = mach_absolute_time();
     BindingOffset ordinaryDataBufferOffset = offset;
     SLANG_RETURN_ON_FAIL(bindOrdinaryDataBufferIfNeeded(shaderObject, ordinaryDataBufferOffset, specializedLayout));
+    auto tb = mach_absolute_time();
 #endif
     SLANG_RETURN_ON_FAIL(bindAsValue(shaderObject, offset, specializedLayout));
+    auto tc = mach_absolute_time();
 
     // Once the state stored in the root shader object itself has been bound,
     // we turn our attention to the entry points and their parameters.
@@ -137,6 +348,29 @@ Result BindingDataBuilder::bindAsRoot(
         // (because entry points don't need to deal with explicit bindings).
         //
         SLANG_RETURN_ON_FAIL(bindAsConstantBuffer(entryPoint, entryPointOffset, entryPointLayout));
+    }
+
+    auto td = mach_absolute_time();
+
+    {
+        static thread_local uint64_t s_ordNs = 0, s_valNs = 0, s_epNs = 0;
+        static thread_local uint32_t s_cnt = 0;
+        // ta..tb is alloc+clone (before ordinaryData), but we timed alloc outside — approximate
+        s_ordNs += (tb - ta);
+        s_valNs += (tc - tb);
+        s_epNs += (td - tc);
+        s_cnt++;
+        if (s_cnt % 500 == 0)
+        {
+            mach_timebase_info_data_t info;
+            mach_timebase_info(&info);
+            auto toUs = [&](uint64_t ticks) { return ticks * info.numer / info.denom / 1000; };
+            fprintf(stderr, "[slang-rhi] bindAsRoot x%u: ordinaryData=%lluus bindAsValue=%lluus entryPoints=%lluus\n",
+                    s_cnt, (unsigned long long)toUs(s_ordNs), (unsigned long long)toUs(s_valNs),
+                    (unsigned long long)toUs(s_epNs));
+            s_ordNs = s_valNs = s_epNs = 0;
+            s_cnt = 0;
+        }
     }
 
     outBindingData = bindingData;
@@ -199,6 +433,8 @@ Result BindingDataBuilder::bindAsValue(
     ShaderObjectLayoutImpl* specializedLayout
 )
 {
+    auto tBindValueStart = mach_absolute_time();
+
     // We start by iterating over the "simple" (non-sub-object) binding
     // ranges and writing them to the descriptor sets that are being
     // passed down.
@@ -341,6 +577,8 @@ Result BindingDataBuilder::bindAsValue(
         bindingRangeIdx++;
     }
 
+    auto tBindRangesEnd = mach_absolute_time();
+
     // Once all the simple binding ranges are dealt with, we will bind
     // all of the sub-objects in sub-object ranges.
     //
@@ -371,9 +609,29 @@ Result BindingDataBuilder::bindAsValue(
             {
                 auto subObject = shaderObject->m_objects[subObjectIndex + i];
 
-                // Unsurprisingly, we bind each object in the range as
-                // a constant buffer.
-                //
+                // Record current version for next call's skip detection
+                if (m_currentVersions && subObject)
+                    m_currentVersions->push_back({subObject, subObject->m_version});
+
+                // Skip if sub-object version unchanged and we have cloned previous binding data
+                if (m_previousBindingData && m_previousVersions && subObject)
+                {
+                    bool canSkip = false;
+                    for (const auto& prev : *m_previousVersions)
+                    {
+                        if (prev.object == subObject && prev.version == subObject->m_version)
+                        {
+                            canSkip = true;
+                            break;
+                        }
+                    }
+                    if (canSkip)
+                    {
+                        objOffset += rangeStride;
+                        continue;
+                    }
+                }
+
                 SLANG_RETURN_ON_FAIL(bindAsConstantBuffer(subObject, objOffset, subObjectLayout));
 
                 objOffset += rangeStride;
@@ -418,6 +676,25 @@ Result BindingDataBuilder::bindAsValue(
         }
     }
 
+    auto tBindValueEnd = mach_absolute_time();
+    {
+        static thread_local uint64_t s_rangesNs = 0, s_subObjNs = 0;
+        static thread_local uint32_t s_cnt = 0;
+        s_rangesNs += (tBindRangesEnd - tBindValueStart);
+        s_subObjNs += (tBindValueEnd - tBindRangesEnd);
+        s_cnt++;
+        if (s_cnt % 500 == 0)
+        {
+            mach_timebase_info_data_t info;
+            mach_timebase_info(&info);
+            auto toUs = [&](uint64_t ticks) { return ticks * info.numer / info.denom / 1000; };
+            fprintf(stderr, "[slang-rhi] bindAsValue x%u: bindingRanges=%lluus subObjects=%lluus\n",
+                    s_cnt, (unsigned long long)toUs(s_rangesNs), (unsigned long long)toUs(s_subObjNs));
+            s_rangesNs = s_subObjNs = 0;
+            s_cnt = 0;
+        }
+    }
+
     return SLANG_OK;
 }
 
@@ -431,40 +708,18 @@ Result BindingDataBuilder::bindOrdinaryDataBufferIfNeeded(
     if (size == 0)
         return SLANG_OK;
 
-    ComPtr<IBuffer> buffer;
-    BufferDesc bufferDesc = {};
-    bufferDesc.size = size;
-    bufferDesc.usage = BufferUsage::ConstantBuffer | BufferUsage::CopyDestination;
-    bufferDesc.defaultState = ResourceState::ConstantBuffer;
-    bufferDesc.memoryType = MemoryType::Upload;
-    // Build descriptive label from pipeline context
-    char ordinaryLabel[128] = "ShaderObject_OrdinaryData";
-    if (m_label)
-        snprintf(ordinaryLabel, sizeof(ordinaryLabel), "%s_OrdinaryData", m_label);
-    bufferDesc.label = ordinaryLabel;
-    SLANG_RETURN_ON_FAIL(m_device->createBuffer(bufferDesc, nullptr, buffer.writeRef()));
-    auto bufferImpl = checked_cast<BufferImpl*>(buffer.get());
+    ConstantBufferPool::Allocation allocation;
+    SLANG_RETURN_ON_FAIL(m_constantBufferPool->allocate(size, allocation));
 
-    // Once the buffer is allocated, we can use `_writeOrdinaryData` to fill it in.
-    //
-    // Note that `_writeOrdinaryData` is potentially recursive in the case
-    // where this object contains interface/existential-type fields, so we
-    // don't need or want to inline it into this call site.
-    //
-    void* ordinaryData = bufferImpl->m_buffer->contents();
-    SLANG_RETURN_ON_FAIL(shaderObject->writeOrdinaryData(ordinaryData, size, specializedLayout));
+    SLANG_RETURN_ON_FAIL(shaderObject->writeOrdinaryData(allocation.mappedData, size, specializedLayout));
 
-    // If we did indeed need/create a buffer, then we must bind it
-    // into root binding state.
-    //
-    SLANG_RETURN_ON_FAIL(setBuffer(m_bindingData, ioOffset.buffer, bufferImpl->m_buffer.get()));
+    SLANG_RETURN_ON_FAIL(
+        setBuffer(m_bindingData, ioOffset.buffer, allocation.buffer->m_buffer.get(), allocation.offset)
+    );
     ioOffset.buffer++;
 
     if (!m_device->m_hasUnifiedMemory)
-        bufferImpl->m_buffer->didModifyRange(NS::Range(0, bufferImpl->m_desc.size));
-
-    // Pass ownership of the buffer to the binding cache.
-    m_bindingCache->buffers.push_back(bufferImpl);
+        allocation.buffer->m_buffer->didModifyRange(NS::Range(allocation.offset, size));
 
     return SLANG_OK;
 }

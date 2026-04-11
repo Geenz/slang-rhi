@@ -312,6 +312,10 @@ public:
 
     void trackResources(std::set<RefPtr<RefObject>>& resources);
 
+    /// Compute a composite version reflecting the state of this object
+    /// and all sub-objects. Used for binding data caching.
+    virtual uint64_t getCompositeVersion() const;
+
 protected:
     inline void incrementVersion() { m_version++; }
 
@@ -366,6 +370,8 @@ public:
     virtual Result collectSpecializationArgs(ExtendedShaderObjectTypeList& args) override;
 
     void trackResources(std::set<RefPtr<RefObject>>& resources);
+
+    uint64_t getCompositeVersion() const override;
 };
 
 bool _doesValueFitInExistentialPayload(
