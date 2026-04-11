@@ -2,9 +2,6 @@
 #include "debug-command-buffer.h"
 #include "debug-helper-functions.h"
 #include "debug-query.h"
-#include <mach/mach_time.h>
-#include <cstdio>
-#include <iostream>
 
 #include <vector>
 

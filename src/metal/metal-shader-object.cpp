@@ -1,8 +1,6 @@
 #include "metal-shader-object.h"
 #include "metal-command.h"
 #include "metal-bindless-descriptor-set.h"
-#include <mach/mach_time.h>
-#include <cstdio>
 #include "metal-device.h"
 #include "metal-acceleration-structure.h"
 #include "metal-buffer.h"
@@ -382,14 +380,9 @@ Result BindingDataBuilder::bindAsRoot(
     //
     BindingOffset offset;
 
-#if 1
-    auto ta = mach_absolute_time();
     BindingOffset ordinaryDataBufferOffset = offset;
     SLANG_RETURN_ON_FAIL(bindOrdinaryDataBufferIfNeeded(shaderObject, ordinaryDataBufferOffset, specializedLayout));
-    auto tb = mach_absolute_time();
-#endif
     SLANG_RETURN_ON_FAIL(bindAsValue(shaderObject, offset, specializedLayout));
-    auto tc = mach_absolute_time();
 
     // Once the state stored in the root shader object itself has been bound,
     // we turn our attention to the entry points and their parameters.
@@ -401,40 +394,10 @@ Result BindingDataBuilder::bindAsRoot(
         const auto& entryPointInfo = specializedLayout->m_entryPoints[i];
         ShaderObjectLayoutImpl* entryPointLayout = entryPointInfo.layout;
 
-        // Each entry point will be bound at some offset relative to where
-        // the root shader parameters start.
-        //
         BindingOffset entryPointOffset = offset;
         entryPointOffset += entryPointInfo.offset;
 
-        // An entry point can simply be bound as a constant buffer, because
-        // the absolute offsets as are used for the global scope do not apply
-        // (because entry points don't need to deal with explicit bindings).
-        //
         SLANG_RETURN_ON_FAIL(bindAsConstantBuffer(entryPoint, entryPointOffset, entryPointLayout));
-    }
-
-    auto td = mach_absolute_time();
-
-    {
-        static thread_local uint64_t s_ordNs = 0, s_valNs = 0, s_epNs = 0;
-        static thread_local uint32_t s_cnt = 0;
-        // ta..tb is alloc+clone (before ordinaryData), but we timed alloc outside — approximate
-        s_ordNs += (tb - ta);
-        s_valNs += (tc - tb);
-        s_epNs += (td - tc);
-        s_cnt++;
-        if (s_cnt % 500 == 0)
-        {
-            mach_timebase_info_data_t info;
-            mach_timebase_info(&info);
-            auto toUs = [&](uint64_t ticks) { return ticks * info.numer / info.denom / 1000; };
-            fprintf(stderr, "[slang-rhi] bindAsRoot x%u: ordinaryData=%lluus bindAsValue=%lluus entryPoints=%lluus\n",
-                    s_cnt, (unsigned long long)toUs(s_ordNs), (unsigned long long)toUs(s_valNs),
-                    (unsigned long long)toUs(s_epNs));
-            s_ordNs = s_valNs = s_epNs = 0;
-            s_cnt = 0;
-        }
     }
 
     outBindingData = bindingData;
@@ -498,8 +461,6 @@ Result BindingDataBuilder::bindAsValue(
     ShaderObjectLayoutImpl* specializedLayout
 )
 {
-    auto tBindValueStart = mach_absolute_time();
-
     // We start by iterating over the "simple" (non-sub-object) binding
     // ranges and writing them to the descriptor sets that are being
     // passed down.
@@ -642,8 +603,6 @@ Result BindingDataBuilder::bindAsValue(
         bindingRangeIdx++;
     }
 
-    auto tBindRangesEnd = mach_absolute_time();
-
     // Once all the simple binding ranges are dealt with, we will bind
     // all of the sub-objects in sub-object ranges.
     //
@@ -738,25 +697,6 @@ Result BindingDataBuilder::bindAsValue(
 
         default:
             break;
-        }
-    }
-
-    auto tBindValueEnd = mach_absolute_time();
-    {
-        static thread_local uint64_t s_rangesNs = 0, s_subObjNs = 0;
-        static thread_local uint32_t s_cnt = 0;
-        s_rangesNs += (tBindRangesEnd - tBindValueStart);
-        s_subObjNs += (tBindValueEnd - tBindRangesEnd);
-        s_cnt++;
-        if (s_cnt % 500 == 0)
-        {
-            mach_timebase_info_data_t info;
-            mach_timebase_info(&info);
-            auto toUs = [&](uint64_t ticks) { return ticks * info.numer / info.denom / 1000; };
-            fprintf(stderr, "[slang-rhi] bindAsValue x%u: bindingRanges=%lluus subObjects=%lluus\n",
-                    s_cnt, (unsigned long long)toUs(s_rangesNs), (unsigned long long)toUs(s_subObjNs));
-            s_rangesNs = s_subObjNs = 0;
-            s_cnt = 0;
         }
     }
 
@@ -996,6 +936,8 @@ Result BindingDataBuilder::writeArgumentBuffer(
                 MTL::Buffer* subArgBuffer = nullptr;
                 NS::UInteger subArgOffset = 0;
                 SLANG_RETURN_ON_FAIL(writeArgumentBuffer(subObject, subObjectLayout, subArgBuffer, subArgOffset));
+                if (!subArgBuffer)
+                    continue;
                 DeviceAddress bufferPtr = subArgBuffer->gpuAddress() + subArgOffset;
                 memcpy(argumentPtr + i * sizeof(uint64_t), &bufferPtr, sizeof(bufferPtr));
                 SLANG_RETURN_ON_FAIL(addUsedResource(m_bindingData, subArgBuffer));

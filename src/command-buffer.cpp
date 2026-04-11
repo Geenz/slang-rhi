@@ -1,9 +1,6 @@
 #include "command-buffer.h"
 
 #include "rhi-shared.h"
-#include <mach/mach_time.h>
-#include <cstdio>
-#include <iostream>
 #include "device.h"
 #include "format-conversion.h"
 

@@ -38,8 +38,9 @@ Result ConstantBufferPool::allocate(size_t size, Allocation& outAllocation)
         m_currentPage += 1;
         if (m_currentPage >= int(m_pages.size()))
         {
-            m_pages.push_back(Page());
-            SLANG_RETURN_ON_FAIL(createPage(kPageSize, m_pages.back()));
+            Page newPage;
+            SLANG_RETURN_ON_FAIL(createPage(kPageSize, newPage));
+            m_pages.push_back(std::move(newPage));
         }
         m_currentOffset = 0;
     }
