@@ -58,6 +58,20 @@ public:
     NS::SharedPtr<MTL::RenderPassDescriptor> m_renderPassDesc;
     uint32_t m_colorAttachmentCount = 0;
 
+    // Stage-boundary timestamp sampling state. On Apple Silicon,
+    // `sampleCountersInBuffer` (per-command) is unsupported — only
+    // descriptor-time stage-boundary sampling writes into a
+    // `MTLCounterSampleBuffer`. `cmdWriteTimestamp` stashes the
+    // target query pool + begin index here; the next call to
+    // `getRenderCommandEncoder` / `getComputeCommandEncoder`
+    // attaches `sampleBufferAttachments[0]` on its descriptor with
+    // start index = begin, end index = begin + 1. The caller
+    // (EntropyRender) writes exactly one `writeTimestamp` per pass;
+    // the "end" slot is produced automatically by the encoder's
+    // end-stage sampling.
+    IQueryPool* m_pendingSamplePool = nullptr;
+    uint32_t m_pendingSampleBegin = 0;
+
     CommandRecorder(DeviceImpl* device)
         : m_device(device)
     {
@@ -1227,13 +1241,13 @@ void CommandRecorder::cmdInsertDebugMarker(const commands::InsertDebugMarker& cm
 
 void CommandRecorder::cmdWriteTimestamp(const commands::WriteTimestamp& cmd)
 {
-    SLANG_UNUSED(cmd);
-    // auto encoder = getBlitCommandEncoder();
-    // encoder->sampleCountersInBuffer(
-    //     checked_cast<QueryPoolImpl*>(cmd.queryPool)->m_counterSampleBuffer.get(),
-    //     cmd.queryIndex,
-    //     true
-    // );
+    // Stash as the stage-boundary sample target for the next encoder
+    // creation. The last `writeTimestamp` before a `beginRenderPass`
+    // / `beginComputePass` wins; any subsequent writeTimestamp that
+    // doesn't precede an encoder creation is harmless (will be
+    // overwritten by the next one).
+    m_pendingSamplePool = cmd.queryPool;
+    m_pendingSampleBegin = cmd.queryIndex;
 }
 
 void CommandRecorder::cmdExecuteCallback(const commands::ExecuteCallback& cmd)
@@ -1246,6 +1260,28 @@ MTL::RenderCommandEncoder* CommandRecorder::getRenderCommandEncoder(MTL::RenderP
     if (!m_renderCommandEncoder)
     {
         endCommandEncoder();
+
+        // If a prior `writeTimestamp` stashed a target query pool,
+        // attach stage-boundary sampling to the render pass descriptor
+        // before encoder creation. Begin = start-of-vertex; end =
+        // end-of-fragment. On Apple Silicon this is the only supported
+        // way to write into the MTLCounterSampleBuffer.
+        if (m_pendingSamplePool &&
+            m_device->m_device->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary))
+        {
+            auto* sb = checked_cast<QueryPoolImpl*>(m_pendingSamplePool)->m_counterSampleBuffer.get();
+            if (sb)
+            {
+                auto* attach = renderPassDesc->sampleBufferAttachments()->object(0);
+                attach->setSampleBuffer(sb);
+                attach->setStartOfVertexSampleIndex(m_pendingSampleBegin);
+                attach->setEndOfVertexSampleIndex(NS::UIntegerMax);
+                attach->setStartOfFragmentSampleIndex(NS::UIntegerMax);
+                attach->setEndOfFragmentSampleIndex(m_pendingSampleBegin + 1);
+            }
+        }
+        m_pendingSamplePool = nullptr;
+
         m_renderCommandEncoder = NS::RetainPtr(m_commandBuffer->renderCommandEncoder(renderPassDesc));
     }
     return m_renderCommandEncoder.get();
@@ -1256,6 +1292,30 @@ MTL::ComputeCommandEncoder* CommandRecorder::getComputeCommandEncoder()
     if (!m_computeCommandEncoder)
     {
         endCommandEncoder();
+
+        // Stage-boundary timestamp sampling: if a pending sample target
+        // was stashed by `cmdWriteTimestamp`, create the compute encoder
+        // via the descriptor variant with `sampleBufferAttachments[0]`
+        // wired up; otherwise use the lightweight no-descriptor path.
+        if (m_pendingSamplePool &&
+            m_device->m_device->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary))
+        {
+            auto* sb = checked_cast<QueryPoolImpl*>(m_pendingSamplePool)->m_counterSampleBuffer.get();
+            if (sb)
+            {
+                NS::SharedPtr<MTL::ComputePassDescriptor> desc =
+                    NS::TransferPtr(MTL::ComputePassDescriptor::alloc()->init());
+                auto* attach = desc->sampleBufferAttachments()->object(0);
+                attach->setSampleBuffer(sb);
+                attach->setStartOfEncoderSampleIndex(m_pendingSampleBegin);
+                attach->setEndOfEncoderSampleIndex(m_pendingSampleBegin + 1);
+                m_computeCommandEncoder = NS::RetainPtr(m_commandBuffer->computeCommandEncoder(desc.get()));
+                m_pendingSamplePool = nullptr;
+                return m_computeCommandEncoder.get();
+            }
+        }
+        m_pendingSamplePool = nullptr;
+
         m_computeCommandEncoder = NS::RetainPtr(m_commandBuffer->computeCommandEncoder());
     }
     return m_computeCommandEncoder.get();

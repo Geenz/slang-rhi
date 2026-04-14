@@ -175,6 +175,10 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
         m_info.apiName = "Metal";
         m_info.adapterName = "default";
         m_info.adapterLUID = {};
+        // Apple Silicon uses a unified CPU/GPU timebase measured in
+        // nanoseconds; `MTLCounterSampleBuffer` resolved timestamps
+        // are therefore already in ns. Frequency = 1e9 ticks/second.
+        m_info.timestampFrequency = 1'000'000'000ull;
 
         // TODO: Most limits cannot be queried through the Metal API but are described in
         // https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf
