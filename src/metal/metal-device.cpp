@@ -127,6 +127,7 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
         return SLANG_FAIL;
     }
     m_hasUnifiedMemory = m_device->hasUnifiedMemory();
+
     m_commandQueue = NS::TransferPtr(m_device->newCommandQueue(64));
     if (!m_commandQueue)
     {

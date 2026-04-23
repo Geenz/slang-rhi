@@ -1,7 +1,7 @@
 #include "metal-command.h"
 #include "metal-bindless-descriptor-set.h"
-#include <mach/mach_time.h>
 #include <cstdio>
+#include <string>
 #include "metal-device.h"
 #include "metal-buffer.h"
 #include "metal-texture.h"
@@ -73,6 +73,13 @@ public:
     // end-stage sampling.
     IQueryPool* m_pendingSamplePool = nullptr;
     uint32_t m_pendingSampleBegin = 0;
+
+    // Debug-group stack mirror. Metal's own debug-group stack is opaque,
+    // but we want the label of the most recent pushDebugGroup available so
+    // that newly created encoders can be labelled with the caller's pass
+    // name. Without labels, GPU fault reports (MTLCommandBufferEncoderInfo)
+    // only identify faulted encoders by ordinal — useless for diagnosis.
+    std::vector<std::string> m_debugGroupStack;
 
     CommandRecorder(DeviceImpl* device)
         : m_device(device)
@@ -1227,11 +1234,23 @@ void CommandRecorder::cmdPushDebugGroup(const commands::PushDebugGroup& cmd)
 {
     NS::SharedPtr<NS::String> string = createString(cmd.name);
     m_commandBuffer->pushDebugGroup(string.get());
+    m_debugGroupStack.emplace_back(cmd.name ? cmd.name : "");
+
+    // In EntropyRender, pushDebugGroup is typically issued *inside* a
+    // render/compute pass (the outer wrapper routes it to the active pass),
+    // so the encoder exists by the time this fires. Re-label the current
+    // encoder so GPU fault reports can identify the faulting pass.
+    if (m_renderCommandEncoder) m_renderCommandEncoder->setLabel(string.get());
+    else if (m_computeCommandEncoder) m_computeCommandEncoder->setLabel(string.get());
+    else if (m_blitCommandEncoder) m_blitCommandEncoder->setLabel(string.get());
+    else if (m_accelerationStructureCommandEncoder) m_accelerationStructureCommandEncoder->setLabel(string.get());
 }
 
 void CommandRecorder::cmdPopDebugGroup(const commands::PopDebugGroup& cmd)
 {
     m_commandBuffer->popDebugGroup();
+    if (!m_debugGroupStack.empty())
+        m_debugGroupStack.pop_back();
 }
 
 void CommandRecorder::cmdInsertDebugMarker(const commands::InsertDebugMarker& cmd)
@@ -1285,6 +1304,11 @@ MTL::RenderCommandEncoder* CommandRecorder::getRenderCommandEncoder(MTL::RenderP
         m_pendingSamplePool = nullptr;
 
         m_renderCommandEncoder = NS::RetainPtr(m_commandBuffer->renderCommandEncoder(renderPassDesc));
+        if (m_renderCommandEncoder && !m_debugGroupStack.empty())
+        {
+            NS::SharedPtr<NS::String> label = createString(m_debugGroupStack.back().c_str());
+            m_renderCommandEncoder->setLabel(label.get());
+        }
     }
     return m_renderCommandEncoder.get();
 }
@@ -1312,6 +1336,11 @@ MTL::ComputeCommandEncoder* CommandRecorder::getComputeCommandEncoder()
                 attach->setStartOfEncoderSampleIndex(m_pendingSampleBegin);
                 attach->setEndOfEncoderSampleIndex(m_pendingSampleBegin + 1);
                 m_computeCommandEncoder = NS::RetainPtr(m_commandBuffer->computeCommandEncoder(desc.get()));
+                if (m_computeCommandEncoder && !m_debugGroupStack.empty())
+                {
+                    NS::SharedPtr<NS::String> label = createString(m_debugGroupStack.back().c_str());
+                    m_computeCommandEncoder->setLabel(label.get());
+                }
                 m_pendingSamplePool = nullptr;
                 return m_computeCommandEncoder.get();
             }
@@ -1319,6 +1348,11 @@ MTL::ComputeCommandEncoder* CommandRecorder::getComputeCommandEncoder()
         m_pendingSamplePool = nullptr;
 
         m_computeCommandEncoder = NS::RetainPtr(m_commandBuffer->computeCommandEncoder());
+        if (m_computeCommandEncoder && !m_debugGroupStack.empty())
+        {
+            NS::SharedPtr<NS::String> label = createString(m_debugGroupStack.back().c_str());
+            m_computeCommandEncoder->setLabel(label.get());
+        }
     }
     return m_computeCommandEncoder.get();
 }
@@ -1329,6 +1363,11 @@ MTL::AccelerationStructureCommandEncoder* CommandRecorder::getAccelerationStruct
     {
         endCommandEncoder();
         m_accelerationStructureCommandEncoder = NS::RetainPtr(m_commandBuffer->accelerationStructureCommandEncoder());
+        if (m_accelerationStructureCommandEncoder && !m_debugGroupStack.empty())
+        {
+            NS::SharedPtr<NS::String> label = createString(m_debugGroupStack.back().c_str());
+            m_accelerationStructureCommandEncoder->setLabel(label.get());
+        }
     }
     return m_accelerationStructureCommandEncoder.get();
 }
@@ -1339,6 +1378,11 @@ MTL::BlitCommandEncoder* CommandRecorder::getBlitCommandEncoder()
     {
         endCommandEncoder();
         m_blitCommandEncoder = NS::RetainPtr(m_commandBuffer->blitCommandEncoder());
+        if (m_blitCommandEncoder && !m_debugGroupStack.empty())
+        {
+            NS::SharedPtr<NS::String> label = createString(m_debugGroupStack.back().c_str());
+            m_blitCommandEncoder->setLabel(label.get());
+        }
     }
     return m_blitCommandEncoder.get();
 }
@@ -1571,6 +1615,11 @@ void CommandQueueImpl::retireCommandBuffers()
     for (const auto& commandBuffer : commandBuffers)
     {
         auto status = commandBuffer->m_commandBuffer->status();
+        // Error diagnostic is surfaced by the `addCompletedHandler`
+        // installed in `submit()` — that fires per-CB at completion
+        // time with the real `NS::Error`, before Metal overwrites
+        // subsequent-CB errors with the "Ignored (for causing prior
+        // /excessive GPU errors)" cascade reason.
         if (status == MTL::CommandBufferStatusCompleted || status == MTL::CommandBufferStatusError)
         {
             commandBuffer->reset();
@@ -1691,6 +1740,16 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
     // Increment submission id
     m_lastSubmittedID++;
 
+    // Prune the argument buffer cache. Each frame's thread-local
+    // ShaderObject pointers are unique per camera, so cross-frame entries
+    // are never hit. Without pruning, the cache grows unboundedly —
+    // thousands of retained MTL::Buffers eventually pressure Metal's
+    // residency system, causing transient GPU page faults.
+    {
+        std::lock_guard<std::mutex> lock(m_argCacheMutex);
+        m_cachedArgBuffers.clear();
+    }
+
     // Commit the command buffers.
     for (uint32_t i = 0; i < desc.commandBufferCount; ++i)
     {
@@ -1711,6 +1770,81 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
             // Signal the submission event for tracking finished command buffers.
             commandBuffer->m_commandBuffer->encodeSignalEvent(m_trackingEvent.get(), m_lastSubmittedID);
         }
+
+        // Capture the error at completion time. Code 4
+        // (MTLCommandBufferErrorBlacklisted, "Ignored for causing
+        // prior/excessive GPU errors") is Metal's CASCADE reason —
+        // once one CB fails, every subsequent submission reports
+        // code 4 regardless of its own validity. We want the ROOT
+        // cause (code 1/2/3/5/6/7/8/…) that happened first. Gate
+        // logging with a process-wide atomic so only the first
+        // non-cascade error is surfaced; the cascade is flooded
+        // silently.
+        Device* devicePtr = getDevice();
+        uint64_t submissionID = m_lastSubmittedID;
+        uint32_t cbIndex = i;
+        commandBuffer->m_commandBuffer->addCompletedHandler(^(MTL::CommandBuffer* cb) {
+            if (cb->status() != MTL::CommandBufferStatusError) return;
+            NS::Error* err = cb->error();
+            if (!err) return;
+            long code = err->code();
+            // Skip cascade errors — their text is generic and drowns
+            // the first real error in thousands of identical lines.
+            if (code == 4) return;
+            // One-shot: after the first real error is logged, stop
+            // logging further (Metal often reports multiple
+            // root-cause failures close together — the first is
+            // enough to act on).
+            static std::atomic<bool> sReported{false};
+            bool expected = false;
+            if (!sReported.compare_exchange_strong(expected, true))
+                return;
+
+            const char* reason = "<no description>";
+            if (NS::String* ns = err->localizedDescription()) reason = ns->utf8String();
+            std::string msg = std::string("FIRST Metal CB failure [sub=") + std::to_string(submissionID) +
+                              " idx=" + std::to_string(cbIndex) + "] code=" + std::to_string(code) + ": " + reason;
+            if (NS::Dictionary* ui = err->userInfo())
+            {
+                NS::String* debugKey = NS::String::string("MTLCommandBufferEncoderInfoErrorKey", NS::UTF8StringEncoding);
+                if (auto* infos = reinterpret_cast<NS::Array*>(ui->object(debugKey)))
+                {
+                    NS::UInteger n = infos->count();
+                    for (NS::UInteger k = 0; k < n; ++k)
+                    {
+                        auto* info = reinterpret_cast<MTL::CommandBufferEncoderInfo*>(infos->object(k));
+                        if (!info) continue;
+                        MTL::CommandEncoderErrorState state = info->errorState();
+                        msg += "\n    [" + std::to_string((int)k) + "] state=" + std::to_string((int)state);
+                        if (NS::String* label = info->label())
+                        {
+                            msg += " label=";
+                            msg += label->utf8String();
+                        }
+                        // debugSignposts is the pushDebugGroup stack at fault time — usually
+                        // the most actionable clue, especially when encoder labels aren't set.
+                        if (NS::Array* signposts = info->debugSignposts())
+                        {
+                            NS::UInteger sn = signposts->count();
+                            if (sn > 0)
+                            {
+                                msg += " groups=[";
+                                for (NS::UInteger si = 0; si < sn; ++si)
+                                {
+                                    if (auto* s = reinterpret_cast<NS::String*>(signposts->object(si)))
+                                    {
+                                        if (si > 0) msg += ",";
+                                        msg += s->utf8String();
+                                    }
+                                }
+                                msg += "]";
+                            }
+                        }
+                    }
+                }
+            }
+            devicePtr->handleMessage(DebugMessageType::Error, DebugMessageSource::Driver, msg.c_str());
+        });
 
         commandBuffer->m_commandBuffer->commit();
     }
@@ -1770,6 +1904,7 @@ Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingD
     builder.m_previousVersions = (m_previousBindingData) ? prevVersions : nullptr;
     builder.m_currentVersions = currVersions;
     builder.m_cachedArgBuffers = &m_queue->m_cachedArgBuffers;
+    builder.m_argCacheMutex = &m_queue->m_argCacheMutex;
     ShaderObjectLayout* specializedLayout = nullptr;
     SLANG_RETURN_ON_FAIL(rootObject->getSpecializedLayout(specializedLayout));
     auto* rootLayout = checked_cast<RootShaderObjectLayoutImpl*>(specializedLayout);

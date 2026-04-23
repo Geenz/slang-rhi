@@ -30,6 +30,9 @@ public:
 
     // Persistent argument buffer cache — survives across CommandEncoder lifetimes.
     // Keyed by ShaderObject pointer + version; holds ownership of the MTL::Buffer.
+    // Guarded by m_argCacheMutex: multiple camera worker threads create
+    // CommandEncoders on the same queue and call getBindingData() concurrently
+    // during recording, which reads/writes this vector.
     struct CachedArgBuffer
     {
         ShaderObject* object = nullptr;
@@ -38,6 +41,7 @@ public:
         std::vector<MTL::Resource*> usedResources;    // Cached for residency replay
         std::vector<MTL::Resource*> usedRWResources;
     };
+    std::mutex m_argCacheMutex;
     std::vector<CachedArgBuffer> m_cachedArgBuffers;
 
     CommandQueueImpl(Device* device, QueueType type);

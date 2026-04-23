@@ -175,6 +175,9 @@ Result BindingDataBuilder::bindAsRootFlat(
 
     // Handle ParameterBlock sub-objects via argument buffer cache.
     // Cache lives on CommandQueueImpl for cross-frame persistence.
+    // Multiple camera worker threads may call getBindingData() concurrently
+    // on encoders sharing the same queue, so all cache access is guarded
+    // by m_argCacheMutex.
     auto* argCache = static_cast<std::vector<CommandQueueImpl::CachedArgBuffer>*>(m_cachedArgBuffers);
 
     for (const auto& ab : table.argBuffers)
@@ -184,8 +187,9 @@ Result BindingDataBuilder::bindAsRootFlat(
             continue;
 
         // Check argument buffer cache — reuse if version unchanged
-        if (argCache)
+        if (argCache && m_argCacheMutex)
         {
+            std::lock_guard<std::mutex> lock(*m_argCacheMutex);
             bool hit = false;
             for (auto& c : *argCache)
             {
@@ -203,76 +207,39 @@ Result BindingDataBuilder::bindAsRootFlat(
             if (hit) continue;
         }
 
-        // Cache miss — check if we can reuse an existing buffer (version changed)
-        MTL::Buffer* existingBuffer = nullptr;
-        if (argCache)
-        {
-            for (auto& c : *argCache)
-            {
-                if (c.object == obj) {
-                    existingBuffer = c.buffer.get();
-                    break;
-                }
-            }
-        }
-
-        ShaderObjectLayoutImpl* pbLayout = nullptr;
-        for (const auto& sr : specializedLayout->m_subObjectRanges)
-        {
-            const auto& br = specializedLayout->m_bindingRanges[sr.bindingRangeIndex];
-            if (br.bindingType == slang::BindingType::ParameterBlock)
-            {
-                pbLayout = sr.layout;
-                break;
-            }
-        }
+        // Use the layout captured per-ab at table-build time. The
+        // previous code here scanned `specializedLayout->m_subObjectRanges`
+        // and broke on the first `ParameterBlock` found, then used the
+        // resulting `pbLayout` for ALL `argBuffers`. That misbinds when
+        // a shader has multiple ParameterBlocks of different types
+        // (e.g. `_bindlessTextureHeap` and `_bindlessSamplerHeap`):
+        // iterating the sampler-heap argBuffer with the texture-heap's
+        // layout reads the sampler sub-object's `m_slots` against
+        // texture-typed binding ranges, producing
+        // `checked_cast<TextureViewImpl*>(samplerImpl)` failures inside
+        // `writeArgumentBuffer`.
+        ShaderObjectLayoutImpl* pbLayout = ab.pbLayout;
 
         MTL::Buffer* argBuffer = nullptr;
         NS::UInteger argOffset = 0;
 
-        if (existingBuffer && pbLayout)
+        if (pbLayout)
         {
-            // Reuse existing buffer — update uniform data via pre-computed copies.
-            argBuffer = existingBuffer;
-            argOffset = 0;
-
-            uint8_t* dst = (uint8_t*)existingBuffer->contents();
-            const uint8_t* src = obj->m_data.data();
-            for (uint32_t ci = ab.firstDataCopy; ci < ab.firstDataCopy + ab.dataCopyCount; ++ci)
-            {
-                const auto& cp = table.argBufferDataCopies[ci];
-                ::memcpy(dst + cp.dstOffset, src + cp.srcOffset, cp.size);
-            }
-
-            if (!m_device->m_hasUnifiedMemory)
-                existingBuffer->didModifyRange(NS::Range(0, ab.bufferSize));
-
-            // Replay cached resource lists for residency
-            if (argCache)
-            {
-                for (auto& c : *argCache)
-                {
-                    if (c.object == obj)
-                    {
-                        for (auto* r : c.usedResources)
-                            addUsedResource(m_bindingData, r);
-                        for (auto* r : c.usedRWResources)
-                            addUsedRWResource(m_bindingData, r);
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (!existingBuffer && pbLayout)
-        {
-            // Cold miss — allocate new buffer and snapshot resource lists for future replay.
+            // Full writeArgumentBuffer — re-encodes ALL bindings
+            // (uniform data, textures, buffers, samplers) from the
+            // current shader object state. A prior version of this code
+            // had a "fast path" that only patched uniform data via
+            // pre-computed dataCopies when the version changed. That
+            // left stale resource handles (GPU addresses of textures /
+            // buffers from the cold miss) in the argument buffer,
+            // causing wrong-texture rendering and eventual GPU page
+            // faults when the original resources were freed.
             uint32_t prevUsedRes = m_bindingData->usedResourceCount;
             uint32_t prevUsedRW = m_bindingData->usedRWResourceCount;
 
             SLANG_RETURN_ON_FAIL(writeArgumentBuffer(obj, pbLayout, argBuffer, argOffset));
 
-            if (argBuffer && argCache)
+            if (argBuffer && argCache && m_argCacheMutex)
             {
                 std::vector<MTL::Resource*> res, rwRes;
                 for (uint32_t i = prevUsedRes; i < m_bindingData->usedResourceCount; ++i)
@@ -280,6 +247,7 @@ Result BindingDataBuilder::bindAsRootFlat(
                 for (uint32_t i = prevUsedRW; i < m_bindingData->usedRWResourceCount; ++i)
                     rwRes.push_back(m_bindingData->usedRWResources[i]);
 
+                std::lock_guard<std::mutex> lock(*m_argCacheMutex);
                 bool updated = false;
                 for (auto& c : *argCache)
                 {

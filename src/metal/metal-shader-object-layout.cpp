@@ -476,6 +476,7 @@ static void buildFlatEntries(
                 desc.dataSize = (uint32_t)pbLayout->getElementTypeLayout()->getSize();
                 desc.firstEntry = (uint32_t)table.argBufferEntries.size();
                 desc.entryCount = 0;
+                desc.pbLayout = pbLayout;  // Per-PB layout; consumed by bindAsRootFlat.
 
                 // Pre-compute uniform data copy commands (flattened from recursive layout walk)
                 desc.firstDataCopy = (uint32_t)table.argBufferDataCopies.size();
@@ -558,9 +559,11 @@ static void buildFlatEntries(
 
 const FlatBindingTable& RootShaderObjectLayoutImpl::getFlatBindingTable()
 {
-    if (m_flatBindingTable.built)
-        return m_flatBindingTable;
-
+    // Thread-safe one-time build. Worker threads binding the same
+    // pipeline's shader object for the first time all land here; the
+    // per-layout `m_flatBindingTableOnce` makes exactly one thread run
+    // the build while the rest wait, then all return the same table.
+    std::call_once(m_flatBindingTableOnce, [this]() {
     m_flatBindingTable.objectCount = 1; // root = index 0
     m_flatBindingTable.objectPaths.push_back({FlatObjectPath::Source::Root, 0, 0});
 
@@ -628,6 +631,7 @@ const FlatBindingTable& RootShaderObjectLayoutImpl::getFlatBindingTable()
     }
 
     m_flatBindingTable.built = true;
+    });
 
     return m_flatBindingTable;
 }

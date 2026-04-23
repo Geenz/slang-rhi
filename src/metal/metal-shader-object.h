@@ -4,6 +4,7 @@
 #include "metal-shader-object-layout.h"
 #include "metal-constant-buffer-pool.h"
 
+#include <mutex>
 #include <vector>
 
 namespace rhi::metal {
@@ -30,9 +31,12 @@ struct BindingDataBuilder
     /// Current sub-object versions being built this call.
     std::vector<SubObjectVersionEntry>* m_currentVersions = nullptr;
 
-    /// Cached argument buffers. Owned by CommandEncoderImpl.
+    /// Cached argument buffers. Owned by CommandQueueImpl.
     /// Using void* to avoid circular header dependency; cast to vector<CachedArgBuffer>* at use site.
     void* m_cachedArgBuffers = nullptr;
+    /// Mutex guarding m_cachedArgBuffers. Multiple camera worker threads
+    /// may call getBindingData() concurrently on encoders sharing a queue.
+    std::mutex* m_argCacheMutex = nullptr;
 
     /// Bind this object as a root shader object
     Result bindAsRoot(

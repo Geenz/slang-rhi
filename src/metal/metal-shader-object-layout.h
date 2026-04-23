@@ -2,6 +2,7 @@
 
 #include "metal-base.h"
 
+#include <mutex>
 #include <vector>
 
 namespace rhi::metal {
@@ -46,6 +47,9 @@ struct FlatArgBufferDataCopy
     uint32_t size;        ///< Bytes to copy
 };
 
+// Forward decl: pbLayout pointer stored in FlatArgBufferDesc.
+class ShaderObjectLayoutImpl;
+
 /// Pre-computed argument buffer descriptor: one per ParameterBlock sub-object.
 struct FlatArgBufferDesc
 {
@@ -57,6 +61,16 @@ struct FlatArgBufferDesc
     uint32_t entryCount;        ///< Number of entries for this argument buffer
     uint32_t firstDataCopy;     ///< Start index into FlatBindingTable::argBufferDataCopies
     uint32_t dataCopyCount;     ///< Number of data copy commands
+    /// Layout for THIS argument buffer's ParameterBlock sub-object.
+    /// Captured at table-build time so the bind-time draw loop can pass
+    /// the correct layout to writeArgumentBuffer without re-scanning the
+    /// parent's sub-object ranges. (The previous "find first
+    /// ParameterBlock and use it for everything" code in
+    /// metal-shader-object.cpp::bindAsRootFlat misbinds when a shader
+    /// has multiple ParameterBlocks of different types — e.g.
+    /// `_bindlessTextureHeap` and `_bindlessSamplerHeap` — causing
+    /// `checked_cast<TextureViewImpl*>(samplerImpl)` failures.)
+    ShaderObjectLayoutImpl* pbLayout = nullptr;
 };
 
 /// Pre-computed object tree path: how to collect a ShaderObject* from root at draw time.
@@ -309,6 +323,15 @@ public:
     const FlatBindingTable& getFlatBindingTable();
 
     FlatBindingTable m_flatBindingTable;
+    /// Serializes first-time build of `m_flatBindingTable`. Multiple
+    /// worker threads hitting `bindAsRootFlat` for the first time on a
+    /// shared layout all call `getFlatBindingTable()`; without this
+    /// guard, `buildFlatEntries` concurrently `emplace_back`s into the
+    /// same vectors, corrupting the allocation and crashing with
+    /// "pointer being freed was not allocated". `once_flag` gives the
+    /// right semantics — one-time build, zero overhead on subsequent
+    /// calls after the table is built.
+    mutable std::once_flag m_flatBindingTableOnce;
 
     // ShaderObjectLayout interface
     virtual uint32_t getEntryPointCount() const override { return (uint32_t)m_entryPoints.size(); }
