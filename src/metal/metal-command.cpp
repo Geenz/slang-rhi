@@ -508,7 +508,21 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
                                      : nullptr
         );
         colorAttachment->setLevel(level);
-        colorAttachment->setSlice(slice);
+        // A 3D texture has a single array slice; its Z plane is selected via
+        // depthPlane, not slice. Callers pass the target plane in
+        // subresourceRange.layer (there is no depthPlane field in the public
+        // attachment API), so route it to depthPlane and pin slice to 0.
+        // Without this, rendering into a 3D texture's Z-slice trips Metal's
+        // render-pass descriptor validation (slice must be 0 for 3D).
+        if (view->m_texture->m_desc.type == TextureType::Texture3D)
+        {
+            colorAttachment->setSlice(0);
+            colorAttachment->setDepthPlane(slice);
+        }
+        else
+        {
+            colorAttachment->setSlice(slice);
+        }
     }
 
     // Setup depth stencil attachment.

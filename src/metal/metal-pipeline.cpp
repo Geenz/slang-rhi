@@ -211,6 +211,14 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
         NS::Error* icbError = nullptr;
         icbPipelineState = NS::TransferPtr(m_device->newRenderPipelineState(pd.get(), &icbError));
         pd->setSupportIndirectCommandBuffers(false);
+        if (!icbPipelineState && icbError)
+        {
+            handleMessage(
+                DebugMessageType::Warning,
+                DebugMessageSource::Driver,
+                icbError->localizedDescription()->utf8String()
+            );
+        }
     }
 
     // Create depth stencil state

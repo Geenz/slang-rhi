@@ -8,8 +8,34 @@
 #include "metal-sampler.h"
 #include "metal-utils.h"
 #include <slang.h>
+#include <atomic>
+#include <cstdio>
 
 namespace rhi::metal {
+
+// [ARGCACHE PROBE — TEMPORARY, team-flow M2 confirmation; REVERT after measuring]
+// Counts argument-buffer cache hits vs the two miss causes:
+//   miss_newobj  = a RootShaderObject pointer never seen before (object churn)
+//   miss_verbump = a reused pointer whose m_version changed (params re-set this frame)
+// Throttled dump to stderr so the app log can be grepped for [ARGCACHE].
+namespace {
+std::atomic<uint64_t> sArgHits{0};
+std::atomic<uint64_t> sArgMissNewObj{0};
+std::atomic<uint64_t> sArgMissVerBump{0};
+inline void argCacheDump()
+{
+    uint64_t h = sArgHits.load(std::memory_order_relaxed);
+    uint64_t mn = sArgMissNewObj.load(std::memory_order_relaxed);
+    uint64_t mv = sArgMissVerBump.load(std::memory_order_relaxed);
+    uint64_t tot = h + mn + mv;
+    if (tot && (tot % 4000ull) == 0)
+        fprintf(stderr,
+            "[ARGCACHE] total=%llu hits=%llu (%.1f%%) miss_newobj=%llu miss_verbump=%llu\n",
+            (unsigned long long)tot, (unsigned long long)h,
+            100.0 * double(h) / double(tot),
+            (unsigned long long)mn, (unsigned long long)mv);
+}
+} // namespace
 
 inline Result setBuffer(BindingDataImpl* bindingData, uint32_t index, MTL::Buffer* buffer, NS::UInteger offset = 0)
 {
@@ -201,6 +227,7 @@ Result BindingDataBuilder::bindAsRootFlat(
                     for (auto* r : c.usedRWResources)
                         addUsedRWResource(m_bindingData, r);
                     hit = true;
+                    sArgHits.fetch_add(1, std::memory_order_relaxed); // [ARGCACHE PROBE]
                     break;
                 }
             }
@@ -257,11 +284,14 @@ Result BindingDataBuilder::bindAsRootFlat(
                         c.usedResources = std::move(res);
                         c.usedRWResources = std::move(rwRes);
                         updated = true;
+                        sArgMissVerBump.fetch_add(1, std::memory_order_relaxed); // [ARGCACHE PROBE]
                         break;
                     }
                 }
-                if (!updated)
+                if (!updated) {
                     argCache->push_back({obj, obj->m_version, NS::RetainPtr(argBuffer), std::move(res), std::move(rwRes)});
+                    sArgMissNewObj.fetch_add(1, std::memory_order_relaxed); // [ARGCACHE PROBE]
+                }
             }
         }
 
@@ -271,6 +301,7 @@ Result BindingDataBuilder::bindAsRootFlat(
         }
     }
 
+    argCacheDump(); // [ARGCACHE PROBE]
     outBindingData = bindingData;
     return SLANG_OK;
 }

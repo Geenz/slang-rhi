@@ -4,6 +4,9 @@
 #include "metal-utils.h"
 #include "../cocoa-util.h"
 
+#include <objc/message.h>
+#include <objc/runtime.h>
+
 namespace rhi::metal {
 
 // Supported pixel formats
@@ -44,7 +47,25 @@ Result SurfaceImpl::configure(const SurfaceConfig& config)
     m_metalLayer->setPixelFormat(translatePixelFormat(m_config.format));
     m_metalLayer->setDrawableSize(CGSize{(float)m_config.width, (float)m_config.height});
     m_metalLayer->setFramebufferOnly(m_config.usage == TextureUsage::RenderTarget);
-    // m_metalLayer->setDisplaySyncEnabled(config.vsync);
+    // Honor the vsync config. metal-cpp's CA::MetalLayer binding lacks
+    // `setDisplaySyncEnabled:`, so call the ObjC selector directly. Previously
+    // omitted, which left the layer display-synced (120Hz ProMotion cap)
+    // regardless of config.vsync — so vsync=false was a no-op and frame time
+    // could never be measured below the refresh cap. vsync=false ⇒ present
+    // without display sync (uncapped, tearing) so true per-frame cost shows.
+    reinterpret_cast<void (*)(void*, SEL, bool)>(objc_msgSend)(
+        (void*)m_metalLayer.get(), sel_registerName("setDisplaySyncEnabled:"), m_config.vsync);
+    // [TEMP DIAG] read it back to confirm the setter actually took (the layer may
+    // ignore it / re-enable). Remove after the present-pacing investigation.
+    {
+        const bool readback = reinterpret_cast<bool (*)(void*, SEL)>(objc_msgSend)(
+            (void*)m_metalLayer.get(), sel_registerName("displaySyncEnabled"));
+        const bool responds = reinterpret_cast<bool (*)(void*, SEL, SEL)>(objc_msgSend)(
+            (void*)m_metalLayer.get(), sel_registerName("respondsToSelector:"),
+            sel_registerName("setDisplaySyncEnabled:"));
+        fprintf(stderr, "[DIAG displaySync] requested=%d readback=%d respondsToSetter=%d\n",
+                (int)m_config.vsync, (int)readback, (int)responds);
+    }
     m_configured = true;
 
     return SLANG_OK;
