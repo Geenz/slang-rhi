@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <map>
+#include <mutex>
 #include <unordered_map>
 
 namespace rhi {
@@ -125,6 +126,11 @@ protected:
 
     std::unordered_map<ComponentKey, ShaderComponentID, ComponentKeyHasher> componentIds;
     std::unordered_map<PipelineKey, RefPtr<Pipeline>, PipelineKeyHasher> specializedPipelines;
+
+    // Guards componentIds/specializedPipelines. Component-id lookup happens on
+    // every shader-object creation and may be reached from concurrent threads;
+    // id allocation (size() as next id) must be atomic with the insert.
+    std::mutex m_mutex;
 };
 
 class NullDebugCallback : public IDebugCallback
@@ -234,6 +240,7 @@ public:
     ) override;
 
     virtual SLANG_NO_THROW Result SLANG_MCALL createShaderObjectFromTypeLayout(
+        slang::ISession* session,
         slang::TypeLayoutReflection* typeLayout,
         IShaderObject** outObject
     ) override;
@@ -469,6 +476,9 @@ public:
     ComPtr<IPersistentCache> m_persistentPipelineCache;
 
     std::map<slang::TypeLayoutReflection*, RefPtr<ShaderObjectLayout>> m_shaderObjectLayoutCache;
+    // Guards m_shaderObjectLayoutCache; layout creation runs outside the lock
+    // (first inserted layout wins on a race).
+    std::mutex m_shaderObjectLayoutCacheMutex;
 
     // List of heaps managed by this device. DeviceImpl is expected
     // to hold references to them.

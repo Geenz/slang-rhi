@@ -9,6 +9,7 @@
 #include "rhi-shared-fwd.h"
 #include "device-child.h"
 
+#include <mutex>
 #include <unordered_map>
 
 namespace rhi {
@@ -58,9 +59,14 @@ public:
 
     bool m_isSpecializable = false;
 
+    // Guarded by m_compileShadersMutex (compileShaders may be reached
+    // concurrently from pipeline creation on multiple threads).
     bool m_compiledShaders = false;
+    std::mutex m_compileShadersMutex;
 
+    // Guarded by m_specializedProgramsMutex (see Device::getSpecializedProgram).
     std::unordered_map<SpecializationKey, RefPtr<ShaderProgram>, SpecializationKey::Hasher> m_specializedPrograms;
+    std::mutex m_specializedProgramsMutex;
 
     ShaderProgram(Device* device, const ShaderProgramDesc& desc);
     virtual ~ShaderProgram() override;

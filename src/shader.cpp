@@ -103,6 +103,11 @@ Result ShaderProgram::init()
 
 Result ShaderProgram::compileShaders(Device* device)
 {
+    // Serialize whole-program compilation: concurrent pipeline creation from
+    // the same program must not double-run codegen/createShaderModule or race
+    // the m_compiledShaders flag.
+    std::lock_guard<std::mutex> lock(m_compileShadersMutex);
+
     if (m_compiledShaders)
         return SLANG_OK;
 

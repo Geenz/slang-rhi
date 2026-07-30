@@ -78,7 +78,7 @@ DeviceImpl::DeviceImpl() {}
 
 DeviceImpl::~DeviceImpl()
 {
-    if (captureEnabled())
+    if (captureEnabled() && autoCaptureOnLaunch())
     {
         MTL::CaptureManager* captureManager = MTL::CaptureManager::sharedCaptureManager();
         captureManager->stopCapture();
@@ -139,7 +139,7 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
 
 #if TARGET_OS_OSX
     // Setup capture manager (GPUTraceDocument destination is macOS-only).
-    if (captureEnabled())
+    if (captureEnabled() && autoCaptureOnLaunch())
     {
         MTL::CaptureManager* captureManager = MTL::CaptureManager::sharedCaptureManager();
         MTL::CaptureDescriptor* d = MTL::CaptureDescriptor::alloc()->init();
@@ -231,6 +231,10 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
         limits.maxBindlessTextures = m_hasArgumentBufferTier2 ? 500000 : 31;
     }
 
+    // Raster order groups (ordered per-pixel RMW for RasterizerOrderedStructuredBuffer
+    // / [[raster_order_group]]). Supported on Apple Silicon + recent Intel/AMD Macs.
+    m_hasRasterOrderGroups = m_device->rasterOrderGroupsSupported();
+
     // Initialize features & capabilities.
 
     addFeature(Feature::HardwareDevice);
@@ -251,6 +255,11 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     if (m_device->supportsFamily(MTL::GPUFamilyMetal3))
     {
         addFeature(Feature::MeshShader);
+    }
+
+    if (m_hasRasterOrderGroups)
+    {
+        addFeature(Feature::RasterizerOrderedViews);
     }
 
     addCapability(Capability::metal);

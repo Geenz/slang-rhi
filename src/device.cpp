@@ -69,6 +69,7 @@ ShaderComponentID ShaderCache::getComponentId(std::string_view name)
 
 ShaderComponentID ShaderCache::getComponentId(ComponentKey key)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     auto it = componentIds.find(key);
     if (it != componentIds.end())
         return it->second;
@@ -79,6 +80,7 @@ ShaderComponentID ShaderCache::getComponentId(ComponentKey key)
 
 RefPtr<Pipeline> ShaderCache::getSpecializedPipeline(PipelineKey programKey)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     auto it = specializedPipelines.find(programKey);
     if (it != specializedPipelines.end())
         return it->second;
@@ -87,11 +89,13 @@ RefPtr<Pipeline> ShaderCache::getSpecializedPipeline(PipelineKey programKey)
 
 void ShaderCache::addSpecializedPipeline(PipelineKey key, RefPtr<Pipeline> specializedPipeline)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     specializedPipelines[key] = specializedPipeline;
 }
 
 void ShaderCache::free()
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     componentIds = decltype(componentIds)();
     specializedPipelines = decltype(specializedPipelines)();
 }
@@ -156,24 +160,36 @@ Result Device::getSpecializedProgram(
     ShaderProgram** outSpecializedProgram
 )
 {
-    // TODO make thread-safe
     SpecializationKey key(specializationArgs);
-    auto it = program->m_specializedPrograms.find(key);
-    if (it != program->m_specializedPrograms.end())
     {
-        returnRefPtr(outSpecializedProgram, it->second);
-        return SLANG_OK;
+        std::lock_guard<std::mutex> lock(program->m_specializedProgramsMutex);
+        auto it = program->m_specializedPrograms.find(key);
+        if (it != program->m_specializedPrograms.end())
+        {
+            returnRefPtr(outSpecializedProgram, it->second);
+            return SLANG_OK;
+        }
     }
-    else
+
+    // Specialize outside the lock (re-enters Slang + createShaderProgram).
+    RefPtr<ShaderProgram> specializedProgram;
+    SLANG_RETURN_ON_FAIL(specializeProgram(program, specializationArgs, specializedProgram.writeRef()));
+
     {
-        RefPtr<ShaderProgram> specializedProgram;
-        SLANG_RETURN_ON_FAIL(specializeProgram(program, specializationArgs, specializedProgram.writeRef()));
+        std::lock_guard<std::mutex> lock(program->m_specializedProgramsMutex);
+        auto it = program->m_specializedPrograms.find(key);
+        if (it != program->m_specializedPrograms.end())
+        {
+            // Lost the race; adopt the winner and drop ours.
+            returnRefPtr(outSpecializedProgram, it->second);
+            return SLANG_OK;
+        }
         program->m_specializedPrograms[key] = specializedProgram;
-        // Program is owned by the cache (which is owned by the device).
-        specializedProgram->breakStrongReferenceToDevice();
-        returnRefPtr(outSpecializedProgram, specializedProgram);
-        return SLANG_OK;
     }
+    // Program is owned by the cache (which is owned by the device).
+    specializedProgram->breakStrongReferenceToDevice();
+    returnRefPtr(outSpecializedProgram, specializedProgram);
+    return SLANG_OK;
 }
 
 
@@ -761,10 +777,19 @@ Result Device::createShaderObject(
     return SLANG_OK;
 }
 
-Result Device::createShaderObjectFromTypeLayout(slang::TypeLayoutReflection* typeLayout, IShaderObject** outObject)
+Result Device::createShaderObjectFromTypeLayout(
+    slang::ISession* session,
+    slang::TypeLayoutReflection* typeLayout,
+    IShaderObject** outObject
+)
 {
+    // The session must be the one that owns `typeLayout`. Passing null falls
+    // back to the device's own session (correct only for layouts produced
+    // from it, the historical behavior).
+    if (session == nullptr)
+        session = m_slangContext.session.get();
     RefPtr<ShaderObjectLayout> shaderObjectLayout;
-    SLANG_RETURN_ON_FAIL(getShaderObjectLayout(m_slangContext.session, typeLayout, shaderObjectLayout.writeRef()));
+    SLANG_RETURN_ON_FAIL(getShaderObjectLayout(session, typeLayout, shaderObjectLayout.writeRef()));
     RefPtr<ShaderObject> shaderObject;
     SLANG_RETURN_ON_FAIL(createShaderObject(shaderObjectLayout, shaderObject.writeRef()));
     returnComPtr(outObject, shaderObject);
@@ -1082,15 +1107,25 @@ Result Device::getShaderObjectLayout(
 )
 {
     RefPtr<ShaderObjectLayout> shaderObjectLayout;
-    auto it = m_shaderObjectLayoutCache.find(typeLayout);
-    if (it != m_shaderObjectLayoutCache.end())
     {
-        shaderObjectLayout = it->second;
+        std::lock_guard<std::mutex> lock(m_shaderObjectLayoutCacheMutex);
+        auto it = m_shaderObjectLayoutCache.find(typeLayout);
+        if (it != m_shaderObjectLayoutCache.end())
+        {
+            *outLayout = RefPtr<ShaderObjectLayout>(it->second).detach();
+            return SLANG_OK;
+        }
     }
-    else
+
+    // Build outside the lock; first inserted layout wins on a race so every
+    // caller sees one canonical layout per typeLayout.
+    SLANG_RETURN_ON_FAIL(createShaderObjectLayout(session, typeLayout, shaderObjectLayout.writeRef()));
+
     {
-        SLANG_RETURN_ON_FAIL(createShaderObjectLayout(session, typeLayout, shaderObjectLayout.writeRef()));
-        m_shaderObjectLayoutCache.emplace(typeLayout, shaderObjectLayout);
+        std::lock_guard<std::mutex> lock(m_shaderObjectLayoutCacheMutex);
+        auto [it, inserted] = m_shaderObjectLayoutCache.emplace(typeLayout, shaderObjectLayout);
+        if (!inserted)
+            shaderObjectLayout = it->second;
     }
     *outLayout = shaderObjectLayout.detach();
     return SLANG_OK;

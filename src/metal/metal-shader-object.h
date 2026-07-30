@@ -5,6 +5,7 @@
 #include "metal-constant-buffer-pool.h"
 
 #include <mutex>
+#include <set>
 #include <vector>
 
 namespace rhi::metal {
@@ -37,6 +38,40 @@ struct BindingDataBuilder
     /// Mutex guarding m_cachedArgBuffers. Multiple camera worker threads
     /// may call getBindingData() concurrently on encoders sharing a queue.
     std::mutex* m_argCacheMutex = nullptr;
+
+    /// The command buffer's tracked-objects set (CommandBuffer::m_trackedObjects).
+    /// BindingDataImpl stores RAW MTL::Buffer*/MTL::Texture* pointers that are only
+    /// dereferenced at CommandEncoderImpl::finish() (deferred encode). The shader
+    /// object's ResourceSlot RefPtr is the only thing keeping those alive at record
+    /// time — and slots are freely rebound between dispatches (this engine reuses one
+    /// mutable shader object per pass), so a rebind or a last-reference release on
+    /// another thread between record and finish leaves a dangling pointer that
+    /// crashes objc_retain inside the encoder (AGX setBuffers_impl). Every resource
+    /// resolved into binding data must therefore be retained here for the command
+    /// buffer's lifetime; the set dedups, so repeated binds of the same resource
+    /// across dispatches cost one node.
+    std::set<RefPtr<RefObject>>* m_trackedObjects = nullptr;
+
+    /// The command buffer's tracked argument buffers (CommandBufferImpl::m_trackedArgBuffers).
+    /// m_trackedObjects pins slot CONTENTS but not the cached argument buffer OBJECT
+    /// that binding data holds a raw MTL::Buffer* to. The queue-level arg-buffer cache
+    /// drops its ref before GPU completion (submit-time clear / version-bump overwrite),
+    /// so each arg buffer resolved into binding data must be strong-ref'd here for the
+    /// CB's lifetime, or its raw pointer dangles at the deferred finish() encode.
+    std::vector<NS::SharedPtr<MTL::Buffer>>* m_trackedArgBuffers = nullptr;
+
+    void retainResource(RefObject* resource)
+    {
+        if (m_trackedObjects && resource)
+            m_trackedObjects->insert(resource);
+    }
+
+    /// Retain every resource currently bound in `object`'s slots (recursing into
+    /// sub-objects). Used where binding data is produced or replayed WITHOUT walking
+    /// the slots per-entry: the argument-buffer build (writeArgumentBuffer) and the
+    /// argument-buffer cache HIT (whose version match guarantees the cached GPU
+    /// addresses refer to exactly the resources currently in the slots).
+    void retainObjectResources(ShaderObject* object);
 
     /// Bind this object as a root shader object
     Result bindAsRoot(

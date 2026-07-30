@@ -13,30 +13,6 @@
 
 namespace rhi::metal {
 
-// [ARGCACHE PROBE — TEMPORARY, team-flow M2 confirmation; REVERT after measuring]
-// Counts argument-buffer cache hits vs the two miss causes:
-//   miss_newobj  = a RootShaderObject pointer never seen before (object churn)
-//   miss_verbump = a reused pointer whose m_version changed (params re-set this frame)
-// Throttled dump to stderr so the app log can be grepped for [ARGCACHE].
-namespace {
-std::atomic<uint64_t> sArgHits{0};
-std::atomic<uint64_t> sArgMissNewObj{0};
-std::atomic<uint64_t> sArgMissVerBump{0};
-inline void argCacheDump()
-{
-    uint64_t h = sArgHits.load(std::memory_order_relaxed);
-    uint64_t mn = sArgMissNewObj.load(std::memory_order_relaxed);
-    uint64_t mv = sArgMissVerBump.load(std::memory_order_relaxed);
-    uint64_t tot = h + mn + mv;
-    if (tot && (tot % 4000ull) == 0)
-        fprintf(stderr,
-            "[ARGCACHE] total=%llu hits=%llu (%.1f%%) miss_newobj=%llu miss_verbump=%llu\n",
-            (unsigned long long)tot, (unsigned long long)h,
-            100.0 * double(h) / double(tot),
-            (unsigned long long)mn, (unsigned long long)mv);
-}
-} // namespace
-
 inline Result setBuffer(BindingDataImpl* bindingData, uint32_t index, MTL::Buffer* buffer, NS::UInteger offset = 0)
 {
     if (index >= bindingData->bufferCapacity)
@@ -74,6 +50,21 @@ inline Result addUsedRWResource(BindingDataImpl* bindingData, MTL::Resource* res
         return SLANG_OK; // Silently skip — resource is likely covered by bindless useResources
     bindingData->usedRWResources[bindingData->usedRWResourceCount++] = resource;
     return SLANG_OK;
+}
+
+void BindingDataBuilder::retainObjectResources(ShaderObject* object)
+{
+    if (!m_trackedObjects || !object)
+        return;
+    for (const auto& slot : object->m_slots)
+    {
+        if (slot.resource)
+            m_trackedObjects->insert(slot.resource.get());
+    }
+    for (const auto& subObject : object->m_objects)
+    {
+        retainObjectResources(subObject.get());
+    }
 }
 
 Result BindingDataBuilder::bindAsRootFlat(
@@ -167,6 +158,10 @@ Result BindingDataBuilder::bindAsRootFlat(
         if (!slot.resource)
             continue;
 
+        // Pin the resolved resource for the CB's lifetime — the raw MTL pointer
+        // written below is not dereferenced until finish() (see m_trackedObjects).
+        retainResource(slot.resource.get());
+
         switch (entry.type)
         {
         case FlatBindingEntry::Type::Buffer:
@@ -222,12 +217,23 @@ Result BindingDataBuilder::bindAsRootFlat(
                 if (c.object == obj && c.version == obj->m_version)
                 {
                     SLANG_RETURN_ON_FAIL(setBuffer(m_bindingData, ab.bindingDataRegister, c.buffer.get(), 0));
+                    // Pin the cached arg buffer OBJECT for the CB's lifetime. Its
+                    // raw pointer was just written into binding data (deferred
+                    // encode); the queue cache drops its ref before GPU completion.
+                    // Copying the SharedPtr retains.
+                    if (m_trackedArgBuffers)
+                        m_trackedArgBuffers->push_back(c.buffer);
                     for (auto* r : c.usedResources)
                         addUsedResource(m_bindingData, r);
                     for (auto* r : c.usedRWResources)
                         addUsedRWResource(m_bindingData, r);
+                    // The version match guarantees the cached GPU addresses and the
+                    // raw used-resource pointers replayed above refer to exactly the
+                    // resources currently in this object's slots — pin those for the
+                    // CB's lifetime, or a slot rebind after this dispatch (but before
+                    // finish) would dangle them at encode.
+                    retainObjectResources(obj);
                     hit = true;
-                    sArgHits.fetch_add(1, std::memory_order_relaxed); // [ARGCACHE PROBE]
                     break;
                 }
             }
@@ -284,13 +290,11 @@ Result BindingDataBuilder::bindAsRootFlat(
                         c.usedResources = std::move(res);
                         c.usedRWResources = std::move(rwRes);
                         updated = true;
-                        sArgMissVerBump.fetch_add(1, std::memory_order_relaxed); // [ARGCACHE PROBE]
                         break;
                     }
                 }
                 if (!updated) {
                     argCache->push_back({obj, obj->m_version, NS::RetainPtr(argBuffer), std::move(res), std::move(rwRes)});
-                    sArgMissNewObj.fetch_add(1, std::memory_order_relaxed); // [ARGCACHE PROBE]
                 }
             }
         }
@@ -298,10 +302,16 @@ Result BindingDataBuilder::bindAsRootFlat(
         if (argBuffer)
         {
             SLANG_RETURN_ON_FAIL(setBuffer(m_bindingData, ab.bindingDataRegister, argBuffer, argOffset));
+            // writeArgumentBuffer already pins this arg buffer for the CB via the
+            // BindingCache (BufferImpl RefPtr), but the raw pointer just written
+            // into binding data is the queue-cached object once stored above; pin
+            // it here too so the CB lifetime is self-covering regardless of cache
+            // eviction. RetainPtr retains (mirrors the cache store at :283/:291).
+            if (m_trackedArgBuffers)
+                m_trackedArgBuffers->push_back(NS::RetainPtr(argBuffer));
         }
     }
 
-    argCacheDump(); // [ARGCACHE PROBE]
     outBindingData = bindingData;
     return SLANG_OK;
 }
@@ -487,6 +497,7 @@ Result BindingDataBuilder::bindAsValue(
                 TextureViewImpl* textureView = checked_cast<TextureViewImpl*>(slot.resource.get());
                 if (textureView)
                 {
+                    retainResource(textureView);
                     uint32_t registerIndex = bindingRangeInfo.registerOffset + offset.texture + i;
                     SLANG_RETURN_ON_FAIL(setTexture(m_bindingData, registerIndex, textureView->m_textureView.get()));
                 }
@@ -514,6 +525,7 @@ Result BindingDataBuilder::bindAsValue(
                 SamplerImpl* sampler = checked_cast<SamplerImpl*>(slot.resource.get());
                 if (sampler)
                 {
+                    retainResource(sampler);
                     uint32_t registerIndex = bindingRangeInfo.registerOffset + offset.sampler + i;
                     SLANG_RHI_ASSERT(registerIndex < m_bindingData->samplerCount);
                     m_bindingData->samplers[registerIndex] = sampler->m_samplerState.get();
@@ -545,6 +557,7 @@ Result BindingDataBuilder::bindAsValue(
                 BufferImpl* buffer = checked_cast<BufferImpl*>(slot.resource.get());
                 if (buffer)
                 {
+                    retainResource(buffer);
                     uint32_t registerIndex = bindingRangeInfo.registerOffset + offset.buffer + i;
                     SLANG_RETURN_ON_FAIL(
                         setBuffer(m_bindingData, registerIndex, buffer->m_buffer.get(), slot.bufferRange.offset)
@@ -736,6 +749,11 @@ Result BindingDataBuilder::writeArgumentBuffer(
 )
 {
     auto argumentBufferTypeLayout = specializedLayout->getParameterBlockTypeLayout();
+
+    // The argument buffer embeds raw GPU addresses of this object's resources, and
+    // the useResources arrays hold raw MTL pointers — pin every slot resource (and
+    // sub-objects') for the CB's lifetime. Self-covering for the recursion below.
+    retainObjectResources(shaderObject);
 
     // If the argument buffer has no fields, we don't need to create one, note this is legal because there could be an
     // empty struct type in AST. We need to handle this correctly.

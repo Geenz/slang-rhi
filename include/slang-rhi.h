@@ -2195,6 +2195,10 @@ struct RenderPassColorAttachment
 struct RenderPassDepthStencilAttachment
 {
     ITextureView* view = nullptr;
+    // Single-sample resolve destination for a multisampled depth attachment.
+    // When set, the pass resolves depth (sample 0) into this at end-of-pass
+    // (Metal MultisampleResolve store action + Sample0 depth-resolve filter).
+    ITextureView* resolveTarget = nullptr;
     LoadOp depthLoadOp = LoadOp::Clear;
     StoreOp depthStoreOp = StoreOp::Store;
     float depthClearValue = 1.f;
@@ -3427,10 +3431,19 @@ public:
         return object;
     }
 
+    /// Create a shader object from an existing type layout. `session` must be
+    /// the slang session that owns `typeLayout`; passing null falls back to the
+    /// device's own session (only correct for layouts produced from it).
     virtual SLANG_NO_THROW Result SLANG_MCALL createShaderObjectFromTypeLayout(
+        slang::ISession* session,
         slang::TypeLayoutReflection* typeLayout,
         IShaderObject** outObject
     ) = 0;
+
+    inline Result createShaderObjectFromTypeLayout(slang::TypeLayoutReflection* typeLayout, IShaderObject** outObject)
+    {
+        return createShaderObjectFromTypeLayout(nullptr, typeLayout, outObject);
+    }
 
     virtual SLANG_NO_THROW Result SLANG_MCALL createRootShaderObject(
         IShaderProgram* program,

@@ -19,6 +19,37 @@ Result RenderPipelineImpl::getNativeHandle(NativeHandle* outHandle)
     return SLANG_OK;
 }
 
+MTL::RenderPipelineState* RenderPipelineImpl::getOrCreateIcbPipelineState(DeviceImpl* device)
+{
+    // Mesh pipelines never have an ICB variant (descriptor left null).
+    if (!m_icbPipelineDesc)
+        return nullptr;
+
+    // Build the ICB-enabled twin exactly once, on the first indirect draw that
+    // needs it. std::call_once serializes concurrent recorders; a null result
+    // (ICB-incompatible shader) is cached like the old eager path — callers then
+    // fall back to a CPU draw loop, and we don't retry the failed compile.
+    std::call_once(
+        m_icbPipelineOnce,
+        [&]()
+        {
+            NS::Error* icbError = nullptr;
+            m_icbPipelineState =
+                NS::TransferPtr(device->m_device->newRenderPipelineState(m_icbPipelineDesc.get(), &icbError));
+            if (!m_icbPipelineState && icbError)
+            {
+                device->handleMessage(
+                    DebugMessageType::Warning,
+                    DebugMessageSource::Driver,
+                    icbError->localizedDescription()->utf8String()
+                );
+            }
+        }
+    );
+
+    return m_icbPipelineState.get();
+}
+
 Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRenderPipeline** outPipeline)
 {
     AUTORELEASEPOOL
@@ -33,7 +64,8 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
 
     bool isMeshPipeline = program->isMeshShaderProgram();
     NS::SharedPtr<MTL::RenderPipelineState> pipelineState;
-    NS::SharedPtr<MTL::RenderPipelineState> icbPipelineState;
+    // Descriptor for the ICB-enabled variant, kept for a lazy first-use build.
+    NS::SharedPtr<MTL::RenderPipelineDescriptor> icbPipelineDesc;
     NS::UInteger vertexBufferOffset = 0;
     MTL::Size objectThreadgroupSize = MTL::Size::Make(1, 1, 1);
     MTL::Size meshThreadgroupSize = MTL::Size::Make(1, 1, 1);
@@ -206,19 +238,15 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
             return SLANG_FAIL;
         }
 
-        // Eagerly attempt ICB-enabled variant for indirect draws.
+        // Defer the ICB-enabled variant: retain the descriptor (with ICB support
+        // flagged on) and build the second PSO lazily on the first indirect draw
+        // that actually needs it (see RenderPipelineImpl::getOrCreateIcbPipelineState).
+        // Traditional pipelines that never issue an indirect draw — the common case,
+        // e.g. fullscreen/post passes — otherwise pay a wasted second PSO link here.
+        // The descriptor is not mutated again after this, so the lazy build reads it
+        // without further locking.
         pd->setSupportIndirectCommandBuffers(true);
-        NS::Error* icbError = nullptr;
-        icbPipelineState = NS::TransferPtr(m_device->newRenderPipelineState(pd.get(), &icbError));
-        pd->setSupportIndirectCommandBuffers(false);
-        if (!icbPipelineState && icbError)
-        {
-            handleMessage(
-                DebugMessageType::Warning,
-                DebugMessageSource::Driver,
-                icbError->localizedDescription()->utf8String()
-            );
-        }
+        icbPipelineDesc = pd;
     }
 
     // Create depth stencil state
@@ -277,7 +305,7 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
     pipeline->m_program = program;
     pipeline->m_rootObjectLayout = program->m_rootObjectLayout;
     pipeline->m_pipelineState = pipelineState;
-    pipeline->m_icbPipelineState = icbPipelineState;
+    pipeline->m_icbPipelineDesc = icbPipelineDesc; // null for mesh pipelines; ICB PSO built lazily
     pipeline->m_depthStencilState = depthStencilState;
     pipeline->m_primitiveType = translatePrimitiveType(desc.primitiveTopology);
     pipeline->m_rasterizerDesc = desc.rasterizer;

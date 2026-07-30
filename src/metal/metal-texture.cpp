@@ -143,6 +143,7 @@ Result DeviceImpl::createTexture(const TextureDesc& desc_, const SubresourceData
     {
         textureUsage |= MTL::TextureUsageShaderRead;
     }
+    bool wantsAtomic = false;
     if (is_set(desc.usage, TextureUsage::UnorderedAccess))
     {
         textureUsage |= MTL::TextureUsageShaderRead;
@@ -155,6 +156,7 @@ Result DeviceImpl::createTexture(const TextureDesc& desc_, const SubresourceData
         case Format::R32Uint:
         case Format::R32Sint:
             textureUsage |= MTL::TextureUsageShaderAtomic;
+            wantsAtomic = true;
             break;
         default:
             break;
@@ -162,7 +164,11 @@ Result DeviceImpl::createTexture(const TextureDesc& desc_, const SubresourceData
     }
 
     textureDesc->setUsage(textureUsage);
-    textureDesc->setAllowGPUOptimizedContents(desc.memoryType == MemoryType::DeviceLocal);
+    // Atomic-access textures must use the plain (uncompressed) layout; Metal
+    // silently drops atomic writes on a GPU-optimized/lossless-compressed
+    // texture, so disable optimized contents whenever atomics are requested.
+    textureDesc->setAllowGPUOptimizedContents(desc.memoryType == MemoryType::DeviceLocal &&
+                                              !wantsAtomic);
 
     textureImpl->m_texture = NS::TransferPtr(m_device->newTexture(textureDesc.get()));
     if (!textureImpl->m_texture)

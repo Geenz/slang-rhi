@@ -55,6 +55,31 @@ Result SurfaceImpl::configure(const SurfaceConfig& config)
     // without display sync (uncapped, tearing) so true per-frame cost shows.
     reinterpret_cast<void (*)(void*, SEL, bool)>(objc_msgSend)(
         (void*)m_metalLayer.get(), sel_registerName("setDisplaySyncEnabled:"), m_config.vsync);
+
+    // Wire the requested image count into the CAMetalLayer drawable pool. This is
+    // the pool `nextDrawable()` (acquireNextImage) blocks on: if the pool is left
+    // at its default while the compositor holds drawables, acquire stalls and pins
+    // frame time to the refresh cadence even with displaySync disabled. metal-cpp's
+    // CA::MetalLayer binding lacks `setMaximumDrawableCount:`, so call the ObjC
+    // selector directly (respondsToSelector-guarded, mirroring the vsync setter).
+    // Apple's contract: maximumDrawableCount must be 2 or 3 (default 3); a value
+    // outside [2,3] raises NSInvalidArgumentException — clamp defensively.
+    {
+        NS::UInteger drawableCount = (NS::UInteger)m_config.desiredImageCount;
+        if (drawableCount < 2)
+            drawableCount = 2;
+        else if (drawableCount > 3)
+            drawableCount = 3;
+        const bool respondsDrawables = reinterpret_cast<bool (*)(void*, SEL, SEL)>(objc_msgSend)(
+            (void*)m_metalLayer.get(), sel_registerName("respondsToSelector:"),
+            sel_registerName("setMaximumDrawableCount:"));
+        if (respondsDrawables)
+        {
+            reinterpret_cast<void (*)(void*, SEL, NS::UInteger)>(objc_msgSend)(
+                (void*)m_metalLayer.get(), sel_registerName("setMaximumDrawableCount:"), drawableCount);
+        }
+    }
+
     // [TEMP DIAG] read it back to confirm the setter actually took (the layer may
     // ignore it / re-enable). Remove after the present-pacing investigation.
     {
@@ -63,8 +88,22 @@ Result SurfaceImpl::configure(const SurfaceConfig& config)
         const bool responds = reinterpret_cast<bool (*)(void*, SEL, SEL)>(objc_msgSend)(
             (void*)m_metalLayer.get(), sel_registerName("respondsToSelector:"),
             sel_registerName("setDisplaySyncEnabled:"));
-        fprintf(stderr, "[DIAG displaySync] requested=%d readback=%d respondsToSetter=%d\n",
-                (int)m_config.vsync, (int)readback, (int)responds);
+        // Read back the applied drawable-pool size (respondsToSelector-guarded, same
+        // pattern) so `framesInFlight` reaching the layer is observable alongside vsync.
+        NS::UInteger drawablesReadback = 0;
+        const bool respondsDrawablesGetter = reinterpret_cast<bool (*)(void*, SEL, SEL)>(objc_msgSend)(
+            (void*)m_metalLayer.get(), sel_registerName("respondsToSelector:"),
+            sel_registerName("maximumDrawableCount"));
+        if (respondsDrawablesGetter)
+        {
+            drawablesReadback = reinterpret_cast<NS::UInteger (*)(void*, SEL)>(objc_msgSend)(
+                (void*)m_metalLayer.get(), sel_registerName("maximumDrawableCount"));
+        }
+        fprintf(stderr,
+                "[DIAG displaySync] requested=%d readback=%d respondsToSetter=%d "
+                "drawablesRequested=%u drawables=%lu\n",
+                (int)m_config.vsync, (int)readback, (int)responds,
+                (unsigned)m_config.desiredImageCount, (unsigned long)drawablesReadback);
     }
     m_configured = true;
 

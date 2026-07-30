@@ -150,6 +150,14 @@ public:
 
     bool captureEnabled() const { return std::getenv("MTL_CAPTURE_ENABLED") != nullptr; }
 
+    // Auto-capture the WHOLE run to frame.gputrace at device init. Opt-in via a
+    // SEPARATE env var so that merely enabling the Metal capture *capability*
+    // (MTL_CAPTURE_ENABLED, required for app-driven MTLCaptureManager captures)
+    // does NOT firehose every frame of every run to disk (multi-GB traces + huge
+    // slowdown) and does NOT hold the single MTLCaptureManager, which would block
+    // an app's own targeted captures.
+    bool autoCaptureOnLaunch() const { return std::getenv("SLANG_RHI_CAPTURE_ON_LAUNCH") != nullptr; }
+
     NS::SharedPtr<MTL::Device> m_device;
     RefPtr<CommandQueueImpl> m_queue;
     NS::SharedPtr<MTL::CommandQueue> m_commandQueue;
@@ -171,6 +179,7 @@ public:
 
     bool m_hasUnifiedMemory = false;
     bool m_hasArgumentBufferTier2 = false;
+    bool m_hasRasterOrderGroups = false;
 
     RefPtr<BindlessDescriptorSet> m_bindlessDescriptorSet;
 };

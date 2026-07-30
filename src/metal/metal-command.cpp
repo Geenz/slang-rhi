@@ -461,8 +461,26 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
     NS::SharedPtr<MTL::RenderPassDescriptor> renderPassDesc =
         NS::TransferPtr(MTL::RenderPassDescriptor::alloc()->init());
 
+    // Render-target array length for LAYERED rendering = the LAYER COUNT of the
+    // attachments (max across color + depth), NOT the number of color attachments.
+    // For a layered pass each attachment binds {baseLayer, layerCount=N}; Metal then
+    // routes each primitive to layer 0..N-1 via [[render_target_array_index]]. A
+    // value of 0 means non-layered (the attachment's slice/depthPlane selects a
+    // single layer). The previous code set this to `colorAttachmentCount`, which
+    // (a) DISABLED layered routing for depth-only passes (count 0 → all primitives
+    // collapse to layer 0 regardless of their render_target_array_index) and
+    // (b) was meaningless for color passes. Compute it from the attachment layer
+    // counts; only enable layered mode when an attachment spans >1 layer.
+    {
+        uint32_t arrayLen = 0;
+        for (uint32_t i = 0; i < desc.colorAttachmentCount; ++i)
+            arrayLen = max(arrayLen, desc.colorAttachments[i].subresourceRange.layerCount);
+        if (desc.depthStencilAttachment)
+            arrayLen = max(arrayLen, desc.depthStencilAttachment->subresourceRange.layerCount);
+        renderPassDesc->setRenderTargetArrayLength(arrayLen > 1 ? arrayLen : 0);
+    }
+
     // Setup color attachments.
-    renderPassDesc->setRenderTargetArrayLength(desc.colorAttachmentCount);
     for (uint32_t i = 0; i < desc.colorAttachmentCount; ++i)
     {
         const auto& attachment = desc.colorAttachments[i];
@@ -553,12 +571,20 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
         {
             MTL::RenderPassDepthAttachmentDescriptor* depthAttachment = renderPassDesc->depthAttachment();
             depthAttachment->setLoadAction(translateLoadOp(attachment.depthLoadOp));
-            depthAttachment->setStoreAction(translateStoreOp(attachment.depthStoreOp, false));
+            depthAttachment->setStoreAction(
+                translateStoreOp(attachment.depthStoreOp, attachment.resolveTarget != nullptr));
             if (attachment.depthLoadOp == LoadOp::Clear)
             {
                 depthAttachment->setClearDepth(attachment.depthClearValue);
             }
             depthAttachment->setTexture(view->m_textureView.get());
+            // Multisampled depth resolve (sample 0) into the single-sample target.
+            if (attachment.resolveTarget)
+            {
+                depthAttachment->setResolveTexture(
+                    checked_cast<TextureViewImpl*>(attachment.resolveTarget)->m_textureView.get());
+                depthAttachment->setDepthResolveFilter(MTL::MultisampleDepthResolveFilterSample0);
+            }
             depthAttachment->setLevel(level);
             depthAttachment->setSlice(slice);
         }
@@ -851,8 +877,9 @@ void CommandRecorder::cmdDrawIndirect(const commands::DrawIndirect& cmd)
         return;
     }
 
-    // ICB path for countBuffer — requires ICB-enabled pipeline variant
-    auto* icbPipelineState = m_renderPipeline->m_icbPipelineState.get();
+    // ICB path for countBuffer — requires ICB-enabled pipeline variant, built
+    // lazily on first use here.
+    auto* icbPipelineState = m_renderPipeline->getOrCreateIcbPipelineState(m_device);
     if (!icbPipelineState)
     {
         // Shader is ICB-incompatible — fall back to CPU loop.
@@ -934,8 +961,9 @@ void CommandRecorder::cmdDrawIndexedIndirect(const commands::DrawIndexedIndirect
         return;
     }
 
-    // ICB path for countBuffer — requires ICB-enabled pipeline variant
-    auto* icbPipelineState = m_renderPipeline->m_icbPipelineState.get();
+    // ICB path for countBuffer — requires ICB-enabled pipeline variant, built
+    // lazily on first use here.
+    auto* icbPipelineState = m_renderPipeline->getOrCreateIcbPipelineState(m_device);
     if (!icbPipelineState)
     {
         // Shader is ICB-incompatible — fall back to CPU loop.
@@ -1919,6 +1947,12 @@ Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingD
     builder.m_currentVersions = currVersions;
     builder.m_cachedArgBuffers = &m_queue->m_cachedArgBuffers;
     builder.m_argCacheMutex = &m_queue->m_argCacheMutex;
+    // Binding data holds RAW MTL pointers dereferenced only at finish() — every
+    // resolved resource must live until then. See BindingDataBuilder::m_trackedObjects.
+    builder.m_trackedObjects = &m_commandBuffer->m_trackedObjects;
+    // Cached argument buffers are owned only by the queue cache, which drops its
+    // ref before GPU completion — pin them on the CB too. See m_trackedArgBuffers.
+    builder.m_trackedArgBuffers = &m_commandBuffer->m_trackedArgBuffers;
     ShaderObjectLayout* specializedLayout = nullptr;
     SLANG_RETURN_ON_FAIL(rootObject->getSpecializedLayout(specializedLayout));
     auto* rootLayout = checked_cast<RootShaderObjectLayoutImpl*>(specializedLayout);
@@ -1995,6 +2029,12 @@ Result CommandBufferImpl::reset()
 {
     m_bindingCache.reset();
     m_constantBufferPool.reset();
+    // Release the argument-buffer strong refs pinned for this CB's lifetime.
+    // reset() only runs after the CB has completed on the GPU (see
+    // retireCommandBuffers), so the raw MTL::Buffer* in binding data is done
+    // being referenced by the time these drop. Mirrors CommandBuffer::reset()
+    // clearing m_trackedObjects.
+    m_trackedArgBuffers.clear();
     return CommandBuffer::reset();
 }
 

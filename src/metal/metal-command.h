@@ -109,6 +109,16 @@ public:
     ConstantBufferPool m_constantBufferPool;
     uint64_t m_submissionID;
 
+    /// Strong refs to argument buffers resolved into this CB's binding data.
+    /// Parallels the base CommandBuffer::m_trackedObjects, but pins the argument
+    /// buffer OBJECT itself (m_trackedObjects only pins its slot contents). The
+    /// cached arg buffer's only other owner is CommandQueueImpl's cross-frame
+    /// cache, which drops its ref at submit() (m_cachedArgBuffers.clear()) and on
+    /// version bumps — both BEFORE GPU completion, while this in-flight CB still
+    /// references the raw MTL::Buffer* in its (deferred-encoded) binding data.
+    /// Held until reset() releases them, which only runs after the CB completes.
+    std::vector<NS::SharedPtr<MTL::Buffer>> m_trackedArgBuffers;
+
     CommandBufferImpl(Device* device, CommandQueueImpl* queue);
     ~CommandBufferImpl();
 
