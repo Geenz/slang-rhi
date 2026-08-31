@@ -4,6 +4,7 @@
 #include "metal-utils.h"
 #include "../cocoa-util.h"
 
+#include <cstdio>
 #include <objc/message.h>
 #include <objc/runtime.h>
 
@@ -28,42 +29,31 @@ SurfaceImpl::~SurfaceImpl() {}
 
 Result SurfaceImpl::configure(const SurfaceConfig& config)
 {
+    SLANG_RETURN_ON_FAIL(validateConfig(config));
     setConfig(config);
-
-    if (m_config.width == 0 || m_config.height == 0)
-    {
-        return SLANG_FAIL;
-    }
     if (m_config.format == Format::Undefined)
     {
         m_config.format = m_info.preferredFormat;
     }
     if (m_config.usage == TextureUsage::None)
     {
-        // TODO: Once we have propert support for format support, we can add additional usages depending on the format.
-        m_config.usage = TextureUsage::Present | TextureUsage::RenderTarget | TextureUsage::CopyDestination;
+        m_config.usage = (TextureUsage::Present | TextureUsage::RenderTarget | TextureUsage::CopyDestination) &
+                         m_info.supportedUsage;
     }
 
     m_metalLayer->setPixelFormat(translatePixelFormat(m_config.format));
     m_metalLayer->setDrawableSize(CGSize{(float)m_config.width, (float)m_config.height});
-    m_metalLayer->setFramebufferOnly(m_config.usage == TextureUsage::RenderTarget);
+    const TextureUsage framebufferOnlyUsage = TextureUsage::Present | TextureUsage::RenderTarget;
+    m_metalLayer->setFramebufferOnly((m_config.usage & ~framebufferOnlyUsage) == TextureUsage::None);
+
     // Honor the vsync config. metal-cpp's CA::MetalLayer binding lacks
     // `setDisplaySyncEnabled:`, so call the ObjC selector directly. Previously
-    // omitted, which left the layer display-synced (120Hz ProMotion cap)
-    // regardless of config.vsync — so vsync=false was a no-op and frame time
-    // could never be measured below the refresh cap. vsync=false ⇒ present
-    // without display sync (uncapped, tearing) so true per-frame cost shows.
+    // omitted, which left the layer display-synced regardless of config.vsync.
     reinterpret_cast<void (*)(void*, SEL, bool)>(objc_msgSend)(
         (void*)m_metalLayer.get(), sel_registerName("setDisplaySyncEnabled:"), m_config.vsync);
 
-    // Wire the requested image count into the CAMetalLayer drawable pool. This is
-    // the pool `nextDrawable()` (acquireNextImage) blocks on: if the pool is left
-    // at its default while the compositor holds drawables, acquire stalls and pins
-    // frame time to the refresh cadence even with displaySync disabled. metal-cpp's
-    // CA::MetalLayer binding lacks `setMaximumDrawableCount:`, so call the ObjC
-    // selector directly (respondsToSelector-guarded, mirroring the vsync setter).
-    // Apple's contract: maximumDrawableCount must be 2 or 3 (default 3); a value
-    // outside [2,3] raises NSInvalidArgumentException — clamp defensively.
+    // Wire the requested image count into the CAMetalLayer drawable pool.
+    // Apple's contract: maximumDrawableCount must be 2 or 3 (default 3).
     {
         NS::UInteger drawableCount = (NS::UInteger)m_config.desiredImageCount;
         if (drawableCount < 2)
@@ -80,16 +70,14 @@ Result SurfaceImpl::configure(const SurfaceConfig& config)
         }
     }
 
-    // [TEMP DIAG] read it back to confirm the setter actually took (the layer may
-    // ignore it / re-enable). Remove after the present-pacing investigation.
+    // [TEMP DIAG] read back to confirm the setters took. Remove after the
+    // present-pacing investigation.
     {
         const bool readback = reinterpret_cast<bool (*)(void*, SEL)>(objc_msgSend)(
             (void*)m_metalLayer.get(), sel_registerName("displaySyncEnabled"));
         const bool responds = reinterpret_cast<bool (*)(void*, SEL, SEL)>(objc_msgSend)(
             (void*)m_metalLayer.get(), sel_registerName("respondsToSelector:"),
             sel_registerName("setDisplaySyncEnabled:"));
-        // Read back the applied drawable-pool size (respondsToSelector-guarded, same
-        // pattern) so `framesInFlight` reaching the layer is observable alongside vsync.
         NS::UInteger drawablesReadback = 0;
         const bool respondsDrawablesGetter = reinterpret_cast<bool (*)(void*, SEL, SEL)>(objc_msgSend)(
             (void*)m_metalLayer.get(), sel_registerName("respondsToSelector:"),

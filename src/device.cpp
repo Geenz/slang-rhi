@@ -3,6 +3,7 @@
 #include "rhi-shared.h"
 #include "shader.h"
 #include "heap.h"
+#include "debug-layer/debug-device.h"
 
 #include <algorithm>
 #include <cstdarg>
@@ -12,6 +13,18 @@ namespace rhi {
 namespace testing {
 bool gDebugDisableStateTracking = false;
 std::atomic<uint64_t> gResourceCount{0};
+
+Device* getUnderlyingDevice(IDevice* device)
+{
+    if (auto debugDevice = dynamic_cast<debug::DebugDevice*>(device))
+        device = debugDevice->baseObject.get();
+    return checked_cast<Device*>(device);
+}
+
+size_t getShaderObjectLayoutCacheSize(IDevice* device)
+{
+    return getUnderlyingDevice(device)->m_shaderObjectLayoutCache.size();
+}
 } // namespace testing
 
 // ----------------------------------------------------------------------------
@@ -160,38 +173,25 @@ Result Device::getSpecializedProgram(
     ShaderProgram** outSpecializedProgram
 )
 {
+    std::lock_guard<std::mutex> lock(program->m_specializedProgramsMutex);
     SpecializationKey key(specializationArgs);
+    auto it = program->m_specializedPrograms.find(key);
+    if (it != program->m_specializedPrograms.end())
     {
-        std::lock_guard<std::mutex> lock(program->m_specializedProgramsMutex);
-        auto it = program->m_specializedPrograms.find(key);
-        if (it != program->m_specializedPrograms.end())
-        {
-            returnRefPtr(outSpecializedProgram, it->second);
-            return SLANG_OK;
-        }
+        returnRefPtr(outSpecializedProgram, it->second);
+        return SLANG_OK;
     }
-
-    // Specialize outside the lock (re-enters Slang + createShaderProgram).
-    RefPtr<ShaderProgram> specializedProgram;
-    SLANG_RETURN_ON_FAIL(specializeProgram(program, specializationArgs, specializedProgram.writeRef()));
-
+    else
     {
-        std::lock_guard<std::mutex> lock(program->m_specializedProgramsMutex);
-        auto it = program->m_specializedPrograms.find(key);
-        if (it != program->m_specializedPrograms.end())
-        {
-            // Lost the race; adopt the winner and drop ours.
-            returnRefPtr(outSpecializedProgram, it->second);
-            return SLANG_OK;
-        }
+        RefPtr<ShaderProgram> specializedProgram;
+        SLANG_RETURN_ON_FAIL(specializeProgram(program, specializationArgs, specializedProgram.writeRef()));
         program->m_specializedPrograms[key] = specializedProgram;
+        // Program is owned by the cache (which is owned by the device).
+        specializedProgram->breakStrongReferenceToDevice();
+        returnRefPtr(outSpecializedProgram, specializedProgram);
+        return SLANG_OK;
     }
-    // Program is owned by the cache (which is owned by the device).
-    specializedProgram->breakStrongReferenceToDevice();
-    returnRefPtr(outSpecializedProgram, specializedProgram);
-    return SLANG_OK;
 }
-
 
 Result Device::specializeProgram(
     ShaderProgram* program,
@@ -300,7 +300,7 @@ Result Device::getConcretePipeline(
     if (isSpecializable)
     {
         RefPtr<ShaderProgram> specializedProgram;
-        SLANG_RETURN_ON_FAIL(specializeProgram(program, *specializationArgs, specializedProgram.writeRef()));
+        SLANG_RETURN_ON_FAIL(getSpecializedProgram(program, *specializationArgs, specializedProgram.writeRef()));
         program = specializedProgram;
     }
 
@@ -308,6 +308,30 @@ Result Device::getConcretePipeline(
     SLANG_RETURN_ON_FAIL(program->compileShaders(this));
 
     // Create a new concrete pipeline.
+    RefPtr<Pipeline> concretePipeline;
+    SLANG_RETURN_ON_FAIL(createConcretePipeline(pipeline, program, concretePipeline));
+
+    if (isSpecializable)
+    {
+        // Cache the specialized pipeline for later use.
+        m_shaderCache.addSpecializedPipeline(pipelineKey, concretePipeline);
+        // Pipeline is owned by the cache.
+        concretePipeline->breakStrongReferenceToDevice();
+        // Program is owned by the specialized pipeline (which is owned by the cache).
+        concretePipeline->m_program->breakStrongReferenceToDevice();
+    }
+    else
+    {
+        // Store the concrete pipeline in the virtual one.
+        pipeline->setConcretePipeline(concretePipeline);
+    }
+
+    outPipeline = concretePipeline;
+    return SLANG_OK;
+}
+
+Result Device::createConcretePipeline(Pipeline* pipeline, ShaderProgram* program, RefPtr<Pipeline>& outPipeline)
+{
     RefPtr<Pipeline> concretePipeline;
     switch (pipeline->getType())
     {
@@ -338,21 +362,6 @@ Result Device::getConcretePipeline(
         concretePipeline = checked_cast<RayTracingPipeline*>(rayTracingPipeline.get());
         break;
     }
-    }
-
-    if (isSpecializable)
-    {
-        // Cache the specialized pipeline for later use.
-        m_shaderCache.addSpecializedPipeline(pipelineKey, concretePipeline);
-        // Pipeline is owned by the cache.
-        concretePipeline->breakStrongReferenceToDevice();
-        // Program is owned by the specialized pipeline (which is owned by the cache).
-        concretePipeline->m_program->breakStrongReferenceToDevice();
-    }
-    else
-    {
-        // Store the concrete pipeline in the virtual one.
-        pipeline->setConcretePipeline(concretePipeline);
     }
 
     outPipeline = concretePipeline;
@@ -386,35 +395,41 @@ Result Device::getEntryPointCodeFromShaderCache(
     const char* entryPointName,
     uint32_t entryPointIndex,
     uint32_t targetIndex,
+    slang::IBlob* cacheKey,
+    bool measureCompilerTime,
+    EntryPointCompilationStats* outStats,
     slang::IBlob** outCode,
     slang::IBlob** outDiagnostics
 )
 {
     TimePoint startTime = Timer::now();
     ComPtr<ISlangBlob> codeBlob;
-    ComPtr<ISlangBlob> hashBlob;
+    ComPtr<ISlangBlob> hashBlob(cacheKey);
+    SLANG_UNUSED(program);
+    SLANG_UNUSED(entryPointName);
+
+    if (outStats)
+    {
+        *outStats = {};
+        outStats->startTime = startTime;
+    }
 
     if (m_persistentShaderCache)
     {
         // Hash all relevant state for generating the entry point shader code to use as a key
         // for the shader cache.
-        componentType->getEntryPointHash(entryPointIndex, targetIndex, hashBlob.writeRef());
+        if (!hashBlob)
+            componentType->getEntryPointHash(entryPointIndex, targetIndex, hashBlob.writeRef());
 
         // Query the shader cache.
-        if (m_persistentShaderCache->queryCache(hashBlob, codeBlob.writeRef()) == SLANG_OK)
+        Result cacheResult = m_persistentShaderCache->queryCache(hashBlob, codeBlob.writeRef());
+        if (cacheResult == SLANG_OK)
         {
-            if (m_shaderCompilationReporter)
+            if (outStats)
             {
-                m_shaderCompilationReporter->reportCompileEntryPoint(
-                    program,
-                    entryPointName,
-                    startTime,
-                    Timer::now(),
-                    0.0,
-                    0.0,
-                    true,
-                    codeBlob->getBufferSize()
-                );
+                outStats->endTime = Timer::now();
+                outStats->isCached = true;
+                outStats->cacheSize = codeBlob->getBufferSize();
             }
 
             returnComPtr(outCode, codeBlob);
@@ -423,13 +438,15 @@ Result Device::getEntryPointCodeFromShaderCache(
     }
 
     // Cached entry not found, generate the code and measure compilation time.
-    double startTotalTime, endTotalTime;
-    double startDownstreamTime, endDownstreamTime;
-    componentType->getSession()->getGlobalSession()->getCompilerElapsedTime(&startTotalTime, &startDownstreamTime);
+    double startTotalTime = 0.0, endTotalTime = 0.0;
+    double startDownstreamTime = 0.0, endDownstreamTime = 0.0;
+    if (measureCompilerTime)
+        componentType->getSession()->getGlobalSession()->getCompilerElapsedTime(&startTotalTime, &startDownstreamTime);
     SLANG_RETURN_ON_FAIL(
         componentType->getEntryPointCode(entryPointIndex, targetIndex, codeBlob.writeRef(), outDiagnostics)
     );
-    componentType->getSession()->getGlobalSession()->getCompilerElapsedTime(&endTotalTime, &endDownstreamTime);
+    if (measureCompilerTime)
+        componentType->getSession()->getGlobalSession()->getCompilerElapsedTime(&endTotalTime, &endDownstreamTime);
 
     // Write the generated code to the shader cache if available.
     if (m_persistentShaderCache)
@@ -437,19 +454,13 @@ Result Device::getEntryPointCodeFromShaderCache(
         m_persistentShaderCache->writeCache(hashBlob, codeBlob);
     }
 
-    // Report compilation time.
-    if (m_shaderCompilationReporter)
+    if (outStats)
     {
-        m_shaderCompilationReporter->reportCompileEntryPoint(
-            program,
-            entryPointName,
-            startTime,
-            Timer::now(),
-            endTotalTime - startTotalTime,
-            endDownstreamTime - startDownstreamTime,
-            false,
-            codeBlob->getBufferSize()
-        );
+        outStats->endTime = Timer::now();
+        outStats->totalTime = measureCompilerTime ? endTotalTime - startTotalTime : 0.0;
+        outStats->downstreamTime = measureCompilerTime ? endDownstreamTime - startDownstreamTime : 0.0;
+        outStats->isCached = false;
+        outStats->cacheSize = codeBlob->getBufferSize();
     }
 
     returnComPtr(outCode, codeBlob);
@@ -484,6 +495,8 @@ Result Device::initialize(const DeviceDesc& desc)
     {
         m_shaderCompilationReporter = new ShaderCompilationReporter(this);
     }
+
+    m_pipelineCompilationMode = desc.pipelineCompilationMode;
 
     m_persistentShaderCache = desc.persistentShaderCache;
     m_persistentPipelineCache = desc.persistentPipelineCache;
@@ -568,17 +581,38 @@ bool Device::hasFeature(Feature feature)
 bool Device::hasFeature(const char* feature)
 {
 #define SLANG_RHI_FEATURES_X(id, name) {name, Feature::id},
-    static const std::unordered_map<std::string_view, Feature> kFeatureNameMap = {
+    static constexpr std::pair<std::string_view, Feature> kFeatureNameMap[] = {
         SLANG_RHI_FEATURES(SLANG_RHI_FEATURES_X)
     };
 #undef SLANG_RHI_FEATURES_X
 
-    auto it = kFeatureNameMap.find(feature);
-    if (it != kFeatureNameMap.end())
+    for (const auto& [name, value] : kFeatureNameMap)
     {
-        return hasFeature(it->second);
+        if (name == feature)
+            return hasFeature(value);
     }
     return false;
+}
+
+Result Device::checkRequiredFeatures(const DeviceDesc& desc)
+{
+#define SLANG_RHI_FEATURES_X(id, name) name,
+    static constexpr const char* kFeatureNames[] = {SLANG_RHI_FEATURES(SLANG_RHI_FEATURES_X)};
+#undef SLANG_RHI_FEATURES_X
+
+    Result result = SLANG_OK;
+    for (uint32_t i = 0; i < desc.requiredFeatureCount; i++)
+    {
+        Feature feature = desc.requiredFeatures[i];
+        if (!hasFeature(feature))
+        {
+            const char* featureName =
+                size_t(feature) < size_t(Feature::_Count) ? kFeatureNames[size_t(feature)] : "unknown";
+            printError("Required feature '%s' is not available\n", featureName);
+            result = SLANG_E_NOT_AVAILABLE;
+        }
+    }
+    return result;
 }
 
 Result Device::getCapabilities(uint32_t* outCapabilityCount, Capability* outCapabilities)
@@ -625,15 +659,15 @@ bool Device::hasCapability(Capability capability)
 bool Device::hasCapability(const char* capability)
 {
 #define SLANG_RHI_CAPABILITIES_X(id) {#id, Capability::id},
-    static const std::unordered_map<std::string_view, Capability> kCapabilityMap = {
+    static constexpr std::pair<std::string_view, Capability> kCapabilityMap[] = {
         SLANG_RHI_CAPABILITIES(SLANG_RHI_CAPABILITIES_X)
     };
 #undef SLANG_RHI_CAPABILITIES_X
 
-    auto it = kCapabilityMap.find(capability);
-    if (it != kCapabilityMap.end())
+    for (const auto& [name, value] : kCapabilityMap)
     {
-        return hasCapability(it->second);
+        if (name == capability)
+            return hasCapability(value);
     }
     return false;
 }
@@ -703,7 +737,7 @@ Result Device::createInputLayout(const InputLayoutDesc& desc, IInputLayout** out
 Result Device::createRenderPipeline(const RenderPipelineDesc& desc, IRenderPipeline** outPipeline)
 {
     ShaderProgram* program = checked_cast<ShaderProgram*>(desc.program);
-    bool createVirtual = desc.deferTargetCompilation | program->isSpecializable();
+    bool createVirtual = shouldDeferPipelineCompilation(desc.compilationPolicy) || program->isSpecializable();
     if (createVirtual)
     {
         RefPtr<VirtualRenderPipeline> pipeline = new VirtualRenderPipeline(this, desc);
@@ -720,7 +754,7 @@ Result Device::createRenderPipeline(const RenderPipelineDesc& desc, IRenderPipel
 Result Device::createComputePipeline(const ComputePipelineDesc& desc, IComputePipeline** outPipeline)
 {
     ShaderProgram* program = checked_cast<ShaderProgram*>(desc.program);
-    bool createVirtual = desc.deferTargetCompilation | program->isSpecializable();
+    bool createVirtual = shouldDeferPipelineCompilation(desc.compilationPolicy) || program->isSpecializable();
     if (createVirtual)
     {
         RefPtr<VirtualComputePipeline> pipeline = new VirtualComputePipeline(this, desc);
@@ -737,7 +771,7 @@ Result Device::createComputePipeline(const ComputePipelineDesc& desc, IComputePi
 Result Device::createRayTracingPipeline(const RayTracingPipelineDesc& desc, IRayTracingPipeline** outPipeline)
 {
     ShaderProgram* program = checked_cast<ShaderProgram*>(desc.program);
-    bool createVirtual = desc.deferTargetCompilation | program->isSpecializable();
+    bool createVirtual = shouldDeferPipelineCompilation(desc.compilationPolicy) || program->isSpecializable();
     if (createVirtual)
     {
         RefPtr<VirtualRayTracingPipeline> pipeline = new VirtualRayTracingPipeline(this, desc);
@@ -783,13 +817,17 @@ Result Device::createShaderObjectFromTypeLayout(
     IShaderObject** outObject
 )
 {
-    // The session must be the one that owns `typeLayout`. Passing null falls
-    // back to the device's own session (correct only for layouts produced
-    // from it, the historical behavior).
+    // Build the layout directly rather than caching it.
+    //
+    // m_shaderObjectLayoutCache requires session-owned keys (see the invariant on its
+    // declaration). `typeLayout` comes from the caller instead, and in practice belongs
+    // to a `TargetProgram` that slang-rhi holds no reference to, so it does not qualify.
+    // More generally, slang-rhi cannot vouch for the lifetime of a pointer it was handed
+    // and so must not retain one past this call.
     if (session == nullptr)
         session = m_slangContext.session.get();
     RefPtr<ShaderObjectLayout> shaderObjectLayout;
-    SLANG_RETURN_ON_FAIL(getShaderObjectLayout(session, typeLayout, shaderObjectLayout.writeRef()));
+    SLANG_RETURN_ON_FAIL(createShaderObjectLayout(session, typeLayout, shaderObjectLayout.writeRef()));
     RefPtr<ShaderObject> shaderObject;
     SLANG_RETURN_ON_FAIL(createShaderObject(shaderObjectLayout, shaderObject.writeRef()));
     returnComPtr(outObject, shaderObject);
@@ -884,7 +922,9 @@ Result Device::readTexture(
     SLANG_RETURN_ON_FAIL(queue->createCommandEncoder(commandEncoder.writeRef()));
 
     StagingHeap::Allocation stagingAllocation;
-    SLANG_RETURN_ON_FAIL(m_readbackHeap.alloc(layout.sizeInBytes, {}, &stagingAllocation));
+    Size offsetAlignment;
+    SLANG_RETURN_ON_FAIL(getTextureBufferOffsetAlignment(texture->getDesc().format, &offsetAlignment));
+    SLANG_RETURN_ON_FAIL(m_readbackHeap.alloc(layout.sizeInBytes, offsetAlignment, {}, &stagingAllocation));
 
     commandEncoder->copyTextureToBuffer(
         stagingAllocation.getBuffer(),
@@ -955,6 +995,15 @@ Result Device::getTextureRowAlignment(Format format, Size* outAlignment)
 {
     *outAlignment = 0;
     return SLANG_E_NOT_AVAILABLE;
+}
+
+Result Device::getTextureBufferOffsetAlignment(Format format, Size* outAlignment)
+{
+    const Size blockSize = getFormatInfo(format).blockSizeInBytes;
+    if (blockSize == 0)
+        return SLANG_E_INVALID_ARG;
+    *outAlignment = blockSize;
+    return SLANG_OK;
 }
 
 Result Device::createSurface(WindowHandle windowHandle, ISurface** outSurface)
@@ -1094,18 +1143,12 @@ Result Device::getShaderObjectLayout(
         break;
     }
 
+    // Deriving the key here, rather than accepting one, is what keeps the cache
+    // safe: `getTypeLayout` returns a layout owned by the `Linkage`, and the entry
+    // records a strong reference to that same session below, so the key cannot
+    // outlive the entry. See the invariant on m_shaderObjectLayoutCache.
     auto typeLayout = session->getTypeLayout(type);
-    SLANG_RETURN_ON_FAIL(getShaderObjectLayout(session, typeLayout, outLayout));
-    (*outLayout)->m_slangSession = session;
-    return SLANG_OK;
-}
 
-Result Device::getShaderObjectLayout(
-    slang::ISession* session,
-    slang::TypeLayoutReflection* typeLayout,
-    ShaderObjectLayout** outLayout
-)
-{
     RefPtr<ShaderObjectLayout> shaderObjectLayout;
     {
         std::lock_guard<std::mutex> lock(m_shaderObjectLayoutCacheMutex);
@@ -1128,6 +1171,7 @@ Result Device::getShaderObjectLayout(
             shaderObjectLayout = it->second;
     }
     *outLayout = shaderObjectLayout.detach();
+    (*outLayout)->m_slangSession = session;
     return SLANG_OK;
 }
 

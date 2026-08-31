@@ -1,4 +1,5 @@
 #include "vk-device.h"
+#include "vk-backend.h"
 #include "vk-command.h"
 #include "vk-buffer.h"
 #include "vk-texture.h"
@@ -21,6 +22,7 @@
 #include "core/short_vector.h"
 #include "core/static_vector.h"
 #include "core/deferred.h"
+#include "core/platform.h"
 
 #include <algorithm>
 #include <set>
@@ -29,94 +31,115 @@
 
 namespace rhi::vk {
 
-inline Result getAdaptersImpl(std::vector<AdapterImpl>& outAdapters)
+static constexpr VkSubgroupFeatureFlags kWaveOpsSubgroupFeatureMask =
+    VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
+    VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
+    VK_SUBGROUP_FEATURE_CLUSTERED_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT | VK_SUBGROUP_FEATURE_PARTITIONED_BIT_NV;
+
+static Result queryCalibratedTimestampSupport(
+    VulkanApi& api,
+    const std::set<std::string>& extensionNames,
+    CalibratedTimestampSupport& outSupport
+)
 {
-    VulkanModule module;
-    SLANG_RETURN_ON_FAIL(module.init());
-    SLANG_RHI_DEFERRED({ module.destroy(); });
+    outSupport = {};
 
-    VulkanApi api;
-    SLANG_RETURN_ON_FAIL(api.initGlobalProcs(module));
-
-    VkInstanceCreateInfo instanceCreateInfo = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-    const char* instanceExtensions[] = {
-        VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
-#if SLANG_APPLE_FAMILY
-        VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
-#endif
-    };
-    instanceCreateInfo.enabledExtensionCount = SLANG_COUNT_OF(instanceExtensions);
-    instanceCreateInfo.ppEnabledExtensionNames = &instanceExtensions[0];
-#if SLANG_APPLE_FAMILY
-    instanceCreateInfo.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-#endif
-    VkInstance instance;
-    SLANG_VK_RETURN_ON_FAIL(api.vkCreateInstance(&instanceCreateInfo, nullptr, &instance));
-    SLANG_RHI_DEFERRED({ api.vkDestroyInstance(instance, nullptr); });
-
-    // This will fail due to not loading any extensions.
-    api.initInstanceProcs(instance);
-
-    if (!(api.vkEnumeratePhysicalDevices && api.vkGetPhysicalDeviceProperties2 &&
-          api.vkEnumerateDeviceExtensionProperties))
+    const char* calibratedTimestampExtension = nullptr;
+    if (extensionNames.count(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME))
     {
-        return SLANG_FAIL;
+        calibratedTimestampExtension = VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
+    }
+    else if (extensionNames.count(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME))
+    {
+        calibratedTimestampExtension = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
     }
 
-    uint32_t physicalDeviceCount = 0;
-    SLANG_VK_RETURN_ON_FAIL(api.vkEnumeratePhysicalDevices(instance, &physicalDeviceCount, nullptr));
-    std::vector<VkPhysicalDevice> physicalDevices(physicalDeviceCount);
-    SLANG_VK_RETURN_ON_FAIL(api.vkEnumeratePhysicalDevices(instance, &physicalDeviceCount, physicalDevices.data()));
-
-    for (const auto& physicalDevice : physicalDevices)
+    if (!calibratedTimestampExtension || !api.vkGetPhysicalDeviceCalibrateableTimeDomainsKHR)
     {
-        VkPhysicalDeviceIDProperties idProps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
-        VkPhysicalDeviceProperties2 props = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-        props.pNext = &idProps;
-        SLANG_RHI_ASSERT(api.vkGetPhysicalDeviceFeatures2);
-        api.vkGetPhysicalDeviceProperties2(physicalDevice, &props);
+        return SLANG_OK;
+    }
 
-        AdapterInfo info = {};
-        info.deviceType = DeviceType::Vulkan;
-        switch (props.properties.deviceType)
+    uint32_t timeDomainCount = 0;
+    SLANG_VK_RETURN_ON_FAIL(
+        api.vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(api.m_physicalDevice, &timeDomainCount, nullptr)
+    );
+    if (timeDomainCount == 0)
+    {
+        return SLANG_OK;
+    }
+
+    std::vector<VkTimeDomainKHR> timeDomains(timeDomainCount);
+    SLANG_VK_RETURN_ON_FAIL(
+        api.vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(api.m_physicalDevice, &timeDomainCount, timeDomains.data())
+    );
+
+    const auto hasTimeDomain = [&](VkTimeDomainKHR domain)
+    {
+        return std::find(timeDomains.begin(), timeDomains.end(), domain) != timeDomains.end();
+    };
+    if (!hasTimeDomain(VK_TIME_DOMAIN_DEVICE_KHR))
+    {
+        return SLANG_OK;
+    }
+
+    struct Candidate
+    {
+        VkTimeDomainKHR vkDomain;
+        CpuTimestampDomain cpuTimestampDomain;
+        uint64_t cpuTimestampFrequency;
+    };
+
+    const CpuTimestampDomain cpuTimestampDomain = getCpuTimestampDomain();
+    const uint64_t cpuTimestampFrequency = getCpuTimestampFrequency();
+    if (cpuTimestampDomain == CpuTimestampDomain::Unknown || cpuTimestampFrequency == 0)
+    {
+        return SLANG_OK;
+    }
+
+    short_vector<Candidate, 3> candidates;
+#if SLANG_WINDOWS_FAMILY
+    if (cpuTimestampDomain == CpuTimestampDomain::QueryPerformanceCounter)
+    {
+        candidates.push_back({
+            VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR,
+            CpuTimestampDomain::QueryPerformanceCounter,
+            cpuTimestampFrequency,
+        });
+    }
+#endif
+#if SLANG_LINUX_FAMILY
+    if (cpuTimestampDomain == CpuTimestampDomain::ClockMonotonicRaw)
+    {
+        candidates.push_back({
+            VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR,
+            CpuTimestampDomain::ClockMonotonicRaw,
+            cpuTimestampFrequency,
+        });
+    }
+    else if (cpuTimestampDomain == CpuTimestampDomain::ClockMonotonic)
+    {
+        candidates.push_back({
+            VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR,
+            CpuTimestampDomain::ClockMonotonic,
+            cpuTimestampFrequency,
+        });
+    }
+#endif
+
+    for (const Candidate& candidate : candidates)
+    {
+        if (candidate.cpuTimestampFrequency != 0 && hasTimeDomain(candidate.vkDomain))
         {
-        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
-            info.adapterType = AdapterType::Discrete;
-            break;
-        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
-            info.adapterType = AdapterType::Integrated;
-            break;
-        case VK_PHYSICAL_DEVICE_TYPE_CPU:
-            info.adapterType = AdapterType::Software;
-            break;
-        default:
-            info.adapterType = AdapterType::Unknown;
+            outSupport.available = true;
+            outSupport.deviceExtensionName = calibratedTimestampExtension;
+            outSupport.hostTimeDomain = candidate.vkDomain;
+            outSupport.cpuTimestampDomain = candidate.cpuTimestampDomain;
+            outSupport.cpuTimestampFrequency = candidate.cpuTimestampFrequency;
             break;
         }
-        string::copy_safe(info.name, sizeof(info.name), props.properties.deviceName);
-        info.vendorID = props.properties.vendorID;
-        info.deviceID = props.properties.deviceID;
-        info.luid = getAdapterLUID(idProps);
-
-        AdapterImpl adapter;
-        adapter.m_info = info;
-        memcpy(adapter.m_deviceUUID, idProps.deviceUUID, VK_UUID_SIZE);
-
-        outAdapters.push_back(adapter);
     }
 
-    // Mark default adapter (prefer discrete if available).
-    markDefaultAdapter(outAdapters);
-
     return SLANG_OK;
-}
-
-std::vector<AdapterImpl>& getAdapters()
-{
-    static std::vector<AdapterImpl> adapters;
-    static Result initResult = getAdaptersImpl(adapters);
-    SLANG_UNUSED(initResult);
-    return adapters;
 }
 
 DeviceImpl::DeviceImpl() {}
@@ -212,7 +235,7 @@ VkBool32 DeviceImpl::handleDebugMessage(
     // Ignore: VUID-VkShaderModuleCreateInfo-pCode-08737:
     // https://vulkan.lunarg.com/doc/view/1.4.321.1/windows/antora/spec/latest/chapters/shaders.html#VUID-VkShaderModuleCreateInfo-pCode-08737
     // This validation error is triggered by incorrect SPIR-V outputted by Slang:
-    // https://github.com/shader-slang/slang/issues/9106
+    // https://github.com/shader-slang/slang/issues/11841
     if (pCallbackData->messageIdNumber == -1520283006)
     {
         return VK_FALSE;
@@ -263,6 +286,39 @@ VKAPI_ATTR VkBool32 VKAPI_CALL DeviceImpl::debugMessageCallback(
     return ((DeviceImpl*)pUserData)->handleDebugMessage(messageSeverity, messageTypes, pCallbackData);
 }
 
+void DeviceImpl::reportShaderAbortMessage()
+{
+    // No-op unless the full shader-abort round-trip was enabled at device creation (Feature::ShaderAbort)
+    // and we still hold a device handle to query.
+    if (!hasFeature(Feature::ShaderAbort) || m_device == VK_NULL_HANDLE)
+        return;
+
+    // vkGetDeviceFaultDebugInfoKHR is an error-path entry point, so load it on demand rather than
+    // through the device proc table.
+    auto vkGetDeviceFaultDebugInfoKHR =
+        (PFN_vkGetDeviceFaultDebugInfoKHR)m_api.vkGetDeviceProcAddr(m_device, "vkGetDeviceFaultDebugInfoKHR");
+    if (!vkGetDeviceFaultDebugInfoKHR)
+        return;
+
+    // Chain VkDeviceFaultShaderAbortMessageInfoKHR so the driver fills in the message produced by
+    // OpAbortKHR. Use the standard two-call pattern: query the size first, then retrieve the data.
+    VkDeviceFaultShaderAbortMessageInfoKHR abortInfo = {VK_STRUCTURE_TYPE_DEVICE_FAULT_SHADER_ABORT_MESSAGE_INFO_KHR};
+    VkDeviceFaultDebugInfoKHR debugInfo = {VK_STRUCTURE_TYPE_DEVICE_FAULT_DEBUG_INFO_KHR};
+    debugInfo.pNext = &abortInfo;
+
+    if (vkGetDeviceFaultDebugInfoKHR(m_device, &debugInfo) != VK_SUCCESS || abortInfo.messageDataSize == 0)
+        return;
+
+    std::vector<char> buffer(abortInfo.messageDataSize);
+    abortInfo.pMessageData = buffer.data();
+    if (vkGetDeviceFaultDebugInfoKHR(m_device, &debugInfo) != VK_SUCCESS)
+        return;
+
+    // The message data is not guaranteed to be null-terminated; bound it to the reported size.
+    std::string message(buffer.data(), buffer.size());
+    handleMessage(DebugMessageType::Error, DebugMessageSource::Driver, ("Shader abort: " + message).c_str());
+}
+
 Result DeviceImpl::getNativeDeviceHandles(DeviceNativeHandles* outHandles)
 {
     outHandles->handles[0].type = NativeHandleType::VkInstance;
@@ -284,7 +340,11 @@ static bool _hasAnySetBits(const T& val, size_t offset)
     return false;
 }
 
-Result DeviceImpl::initVulkanInstance(const DeviceDesc& desc, const DebugLayerOptions& debugLayerOptions)
+Result DeviceImpl::initVulkanInstance(
+    const DeviceDesc& desc,
+    const VulkanDeviceExtendedDesc* extendedDesc,
+    const DebugLayerOptions& debugLayerOptions
+)
 {
     // Initialize Vulkan instance.
     VkInstance instance = VK_NULL_HANDLE;
@@ -297,7 +357,7 @@ Result DeviceImpl::initVulkanInstance(const DeviceDesc& desc, const DebugLayerOp
         applicationInfo.engineVersion = 1;
         applicationInfo.applicationVersion = 1;
 
-        static_vector<const char*, 16> instanceExtensions;
+        std::vector<const char*> instanceExtensions;
 
 #if SLANG_APPLE_FAMILY
         instanceExtensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
@@ -328,6 +388,21 @@ Result DeviceImpl::initVulkanInstance(const DeviceDesc& desc, const DebugLayerOp
                 instanceExtensions.push_back(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
         }
 
+        // Add user-provided instance extensions, skipping duplicates.
+        if (extendedDesc && extendedDesc->instanceExtensionCount > 0)
+        {
+            std::set<std::string> existingExtensions(instanceExtensions.begin(), instanceExtensions.end());
+            for (uint32_t i = 0; i < extendedDesc->instanceExtensionCount; ++i)
+            {
+                if (extendedDesc->instanceExtensions[i] &&
+                    existingExtensions.find(extendedDesc->instanceExtensions[i]) == existingExtensions.end())
+                {
+                    instanceExtensions.push_back(extendedDesc->instanceExtensions[i]);
+                    existingExtensions.insert(extendedDesc->instanceExtensions[i]);
+                }
+            }
+        }
+
         VkInstanceCreateInfo instanceCreateInfo = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
 #if SLANG_APPLE_FAMILY
         instanceCreateInfo.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
@@ -356,7 +431,7 @@ Result DeviceImpl::initVulkanInstance(const DeviceDesc& desc, const DebugLayerOp
             else
             {
                 // Cannot use DebugPrintf if `CoreValidation` is disabled
-                if (m_extendedDesc.enableDebugPrintf)
+                if (extendedDesc && extendedDesc->enableDebugPrintf)
                     enabledValidationFeatures.push_back(VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT);
             }
 
@@ -439,8 +514,9 @@ Result DeviceImpl::initVulkanInstance(const DeviceDesc& desc, const DebugLayerOp
         messengerCreateInfo.pfnUserCallback = &debugMessageCallback;
         messengerCreateInfo.pUserData = this;
 
-        SLANG_VK_RETURN_ON_FAIL(
-            m_api.vkCreateDebugUtilsMessengerEXT(instance, &messengerCreateInfo, nullptr, &m_debugReportCallback)
+        SLANG_VK_RETURN_ON_FAIL_REPORT(
+            m_api.vkCreateDebugUtilsMessengerEXT(instance, &messengerCreateInfo, nullptr, &m_debugReportCallback),
+            this
         );
     }
     return SLANG_OK;
@@ -448,6 +524,8 @@ Result DeviceImpl::initVulkanInstance(const DeviceDesc& desc, const DebugLayerOp
 
 Result DeviceImpl::initVulkanDevice(
     const DeviceDesc& desc,
+    const VulkanDeviceExtendedDesc* extendedDesc,
+    BackendImpl* backend,
     std::vector<Feature>& availableFeatures,
     std::vector<Capability>& availableCapabilities
 )
@@ -461,14 +539,18 @@ Result DeviceImpl::initVulkanDevice(
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     if (!desc.existingDeviceHandles.handles[1])
     {
-        AdapterImpl* adapter = nullptr;
-        SLANG_RETURN_ON_FAIL(selectAdapter(this, getAdapters(), desc, adapter));
+        const AdapterImpl* adapter = nullptr;
+        SLANG_RETURN_ON_FAIL(selectAdapter(this, backend->getAdapters(), desc, adapter));
 
         uint32_t physicalDeviceCount = 0;
-        SLANG_VK_RETURN_ON_FAIL(m_api.vkEnumeratePhysicalDevices(m_api.m_instance, &physicalDeviceCount, nullptr));
+        SLANG_VK_RETURN_ON_FAIL_REPORT(
+            m_api.vkEnumeratePhysicalDevices(m_api.m_instance, &physicalDeviceCount, nullptr),
+            this
+        );
         std::vector<VkPhysicalDevice> physicalDevices(physicalDeviceCount);
-        SLANG_VK_RETURN_ON_FAIL(
-            m_api.vkEnumeratePhysicalDevices(m_api.m_instance, &physicalDeviceCount, physicalDevices.data())
+        SLANG_VK_RETURN_ON_FAIL_REPORT(
+            m_api.vkEnumeratePhysicalDevices(m_api.m_instance, &physicalDeviceCount, physicalDevices.data()),
+            this
         );
 
         // Find the physical device that matches the selected adapter UUID.
@@ -534,6 +616,8 @@ Result DeviceImpl::initVulkanDevice(
     // Get the API version
     const uint32_t majorVersion = VK_VERSION_MAJOR(basicProps.apiVersion);
     const uint32_t minorVersion = VK_VERSION_MINOR(basicProps.apiVersion);
+    m_hasSubgroupSizeControl = VK_MAKE_VERSION(majorVersion, minorVersion, 0) >= VK_API_VERSION_1_3 ||
+                               extensionNames.count(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME) != 0;
 
     auto& extendedFeatures = m_api.m_extendedFeatures;
 
@@ -595,6 +679,9 @@ Result DeviceImpl::initVulkanDevice(
         EXTEND_DESC_CHAIN(deviceFeatures2, extendedFeatures.shaderDemoteToHelperInvocationFeatures);
         EXTEND_DESC_CHAIN(deviceFeatures2, extendedFeatures.shaderBfloat16Features);
         EXTEND_DESC_CHAIN(deviceFeatures2, extendedFeatures.cooperativeMatrix2Features);
+        EXTEND_DESC_CHAIN(deviceFeatures2, extendedFeatures.shaderAbortFeatures);
+        EXTEND_DESC_CHAIN(deviceFeatures2, extendedFeatures.faultFeatures);
+        EXTEND_DESC_CHAIN(deviceFeatures2, extendedFeatures.shaderConstantDataFeatures);
 
         if (VK_MAKE_VERSION(majorVersion, minorVersion, 0) >= VK_API_VERSION_1_2)
         {
@@ -662,6 +749,40 @@ Result DeviceImpl::initVulkanDevice(
             code                                                                                                       \
         }                                                                                                              \
     }
+
+        // VK_KHR_shader_abort lets a shader call abort() (lowered by Slang to OpAbortKHR). Executing
+        // it ceases the invocation and loses the device; the abort message is then retrievable only
+        // via VK_KHR_device_fault (vkGetDeviceFaultDebugInfoKHR + VkDeviceFaultShaderAbortMessageInfoKHR).
+        // VK_KHR_shader_abort hard-depends on both VK_KHR_device_fault and VK_KHR_shader_constant_data,
+        // so the three must be enabled together. Feature::ShaderAbort is reported only when the whole
+        // round-trip (abort + fault-message retrieval) is available, since that is what the dependent
+        // runtime test (shader-slang/slang#11790) needs.
+        if (extensionNames.count(VK_KHR_SHADER_ABORT_EXTENSION_NAME) &&
+            extensionNames.count(VK_KHR_DEVICE_FAULT_EXTENSION_NAME) &&
+            extensionNames.count(VK_KHR_SHADER_CONSTANT_DATA_EXTENSION_NAME) &&
+            extendedFeatures.shaderAbortFeatures.shaderAbort && extendedFeatures.faultFeatures.deviceFault &&
+            extendedFeatures.shaderConstantDataFeatures.shaderConstantData)
+        {
+            // Enable all three extensions/features together (shader_abort hard-depends on the other
+            // two), chaining each queried feature struct into the device-create chain. The gate above
+            // has already verified each feature bit, so every call here succeeds.
+            addFeatureExtension(
+                extendedFeatures.shaderConstantDataFeatures.shaderConstantData,
+                extendedFeatures.shaderConstantDataFeatures,
+                VK_KHR_SHADER_CONSTANT_DATA_EXTENSION_NAME
+            );
+            addFeatureExtension(
+                extendedFeatures.faultFeatures.deviceFault,
+                extendedFeatures.faultFeatures,
+                VK_KHR_DEVICE_FAULT_EXTENSION_NAME
+            );
+            addFeatureExtension(
+                extendedFeatures.shaderAbortFeatures.shaderAbort,
+                extendedFeatures.shaderAbortFeatures,
+                VK_KHR_SHADER_ABORT_EXTENSION_NAME
+            );
+            availableFeatures.push_back(Feature::ShaderAbort);
+        }
 
         SIMPLE_EXTENSION_FEATURE(
             extendedFeatures.shaderDrawParametersFeatures,
@@ -758,7 +879,8 @@ Result DeviceImpl::initVulkanDevice(
             deviceExtensions.push_back(VK_KHR_SHADER_SUBGROUP_ROTATE_EXTENSION_NAME);
         }
 
-        if (extendedFeatures.accelerationStructureFeatures.accelerationStructure &&
+        // See DeviceDesc::enableRayTracing for rationale.
+        if (desc.enableRayTracing && extendedFeatures.accelerationStructureFeatures.accelerationStructure &&
             extensionNames.count(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
             extensionNames.count(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME))
         {
@@ -1076,6 +1198,12 @@ Result DeviceImpl::initVulkanDevice(
 
 #undef SIMPLE_EXTENSION_FEATURE
 
+        SLANG_RETURN_ON_FAIL(queryCalibratedTimestampSupport(m_api, extensionNames, m_calibratedTimestampSupport));
+        if (m_calibratedTimestampSupport.available && !desc.existingDeviceHandles.handles[2])
+        {
+            deviceExtensions.push_back(m_calibratedTimestampSupport.deviceExtensionName);
+        }
+
         if (extendedFeatures.vulkan12Features.shaderBufferInt64Atomics)
             availableFeatures.push_back(Feature::AtomicInt64);
 
@@ -1101,11 +1229,7 @@ Result DeviceImpl::initVulkanDevice(
         m_api.m_rayTracingPipelineProperties = rtpProps;
 
         // Approximate DX12's WaveOps boolean
-        if (subgroupProps.supportedOperations &
-            (VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
-             VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
-             VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT | VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
-             VK_SUBGROUP_FEATURE_QUAD_BIT | VK_SUBGROUP_FEATURE_PARTITIONED_BIT_NV))
+        if (subgroupProps.supportedOperations & kWaveOpsSubgroupFeatureMask)
         {
             availableFeatures.push_back(Feature::WaveOps);
         }
@@ -1161,7 +1285,8 @@ Result DeviceImpl::initVulkanDevice(
         {
             deviceExtensions.push_back(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
         }
-        if (extensionNames.count(VK_NVX_BINARY_IMPORT_EXTENSION_NAME))
+        // See DeviceDesc::enableCUDALaunchFromGfx for rationale.
+        if (desc.enableCUDALaunchFromGfx && extensionNames.count(VK_NVX_BINARY_IMPORT_EXTENSION_NAME))
         {
             deviceExtensions.push_back(VK_NVX_BINARY_IMPORT_EXTENSION_NAME);
         }
@@ -1276,6 +1401,21 @@ Result DeviceImpl::initVulkanDevice(
 
         deviceCreateInfo.pQueueCreateInfos = &queueCreateInfo;
 
+        // Add user-provided device extensions, skipping duplicates.
+        if (extendedDesc && extendedDesc->deviceExtensionCount > 0)
+        {
+            std::set<std::string> existingExtensions(deviceExtensions.begin(), deviceExtensions.end());
+            for (uint32_t i = 0; i < extendedDesc->deviceExtensionCount; ++i)
+            {
+                if (extendedDesc->deviceExtensions[i] &&
+                    existingExtensions.find(extendedDesc->deviceExtensions[i]) == existingExtensions.end())
+                {
+                    deviceExtensions.push_back(extendedDesc->deviceExtensions[i]);
+                    existingExtensions.insert(extendedDesc->deviceExtensions[i]);
+                }
+            }
+        }
+
         deviceCreateInfo.enabledExtensionCount = uint32_t(deviceExtensions.size());
         deviceCreateInfo.ppEnabledExtensionNames = deviceExtensions.data();
 
@@ -1294,12 +1434,79 @@ Result DeviceImpl::initVulkanDevice(
     {
         return SLANG_FAIL;
     }
+    m_api.initDerivedDeviceProperties();
     SLANG_RETURN_ON_FAIL(m_api.initDeviceProcs(m_device));
+
+    if (m_calibratedTimestampSupport.available && m_api.vkGetCalibratedTimestampsKHR)
+    {
+        availableFeatures.push_back(Feature::TimestampCalibration);
+    }
+    else
+    {
+        m_calibratedTimestampSupport = {};
+    }
+
+#if SLANG_PROCESSOR_ARM_64
+    // Ray tracing pipelines are currently broken on ARM64 lavapipe. Keep feature detection and device
+    // creation unchanged, but do not advertise the affected features or shader capabilities.
+    if (m_api.vkGetPhysicalDeviceProperties2 && (VK_MAKE_VERSION(majorVersion, minorVersion, 0) >= VK_API_VERSION_1_2 ||
+                                                 extensionNames.count(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)))
+    {
+        VkPhysicalDeviceDriverProperties driverProps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 props = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        EXTEND_DESC_CHAIN(props, driverProps);
+        m_api.vkGetPhysicalDeviceProperties2(m_api.m_physicalDevice, &props);
+        if (driverProps.driverID == VK_DRIVER_ID_MESA_LLVMPIPE)
+        {
+            auto remove = [](auto& values, auto value)
+            {
+                values.erase(std::remove(values.begin(), values.end(), value), values.end());
+            };
+
+            for (Feature feature : {
+                     Feature::AccelerationStructure,
+                     Feature::AccelerationStructureSpheres,
+                     Feature::AccelerationStructureLinearSweptSpheres,
+                     Feature::RayTracing,
+                     Feature::RayQuery,
+                     Feature::ShaderExecutionReordering,
+                     Feature::RayTracingMotionBlur,
+                     Feature::RayTracingValidation,
+                     Feature::ClusterAccelerationStructure,
+                 })
+            {
+                remove(availableFeatures, feature);
+            }
+
+            for (Capability capability : {
+                     Capability::SPV_KHR_ray_tracing,
+                     Capability::SPV_KHR_ray_query,
+                     Capability::SPV_KHR_ray_tracing_position_fetch,
+                     Capability::SPV_NV_ray_tracing_motion_blur,
+                     Capability::SPV_NV_shader_invocation_reorder,
+                     Capability::SPV_NV_cluster_acceleration_structure,
+                     Capability::SPV_NV_linear_swept_spheres,
+                     Capability::spvRayTracingMotionBlurNV,
+                     Capability::spvRayTracingKHR,
+                     Capability::spvRayTracingPositionFetchKHR,
+                     Capability::spvRayQueryKHR,
+                     Capability::spvRayQueryPositionFetchKHR,
+                     Capability::spvShaderInvocationReorderNV,
+                     Capability::spirv_nv,
+                     Capability::spvRayTracingClusterAccelerationStructureNV,
+                     Capability::spvRayTracingLinearSweptSpheresGeometryNV,
+                 })
+            {
+                remove(availableCapabilities, capability);
+            }
+        }
+    }
+#endif
 
     return SLANG_OK;
 }
 
-Result DeviceImpl::initialize(const DeviceDesc& desc)
+Result DeviceImpl::initialize(const DeviceDesc& desc, BackendImpl* backend)
 {
     SLANG_RETURN_ON_FAIL(Device::initialize(desc));
 
@@ -1307,13 +1514,14 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     m_existingDeviceHandles = desc.existingDeviceHandles;
 
     // Process chained descs
+    const VulkanDeviceExtendedDesc* extendedDesc = nullptr;
     for (const DescStructHeader* header = static_cast<const DescStructHeader*>(desc.next); header;
          header = header->next)
     {
         switch (header->type)
         {
         case StructType::VulkanDeviceExtendedDesc:
-            memcpy(static_cast<void*>(&m_extendedDesc), header, sizeof(m_extendedDesc));
+            extendedDesc = reinterpret_cast<const VulkanDeviceExtendedDesc*>(header);
             break;
         default:
             break;
@@ -1327,7 +1535,7 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
 
     // Initialize Vulkan instance.
     DebugLayerOptions debugLayerOptions = getRHI()->getDebugLayerOptions();
-    Result instanceResult = initVulkanInstance(desc, debugLayerOptions);
+    Result instanceResult = initVulkanInstance(desc, extendedDesc, debugLayerOptions);
     // If instance creation failed due to missing debug layers,
     // disable debug layers and try again (if they were optional).
     if (SLANG_FAILED(instanceResult) && debugLayerOptions.isDebugLayersEnabled())
@@ -1341,7 +1549,7 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
         if (debugLayersRequired)
             return SLANG_FAIL;
         debugLayerOptions = {};
-        instanceResult = initVulkanInstance(desc, debugLayerOptions);
+        instanceResult = initVulkanInstance(desc, extendedDesc, debugLayerOptions);
     }
     if (SLANG_FAILED(instanceResult))
     {
@@ -1352,11 +1560,20 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     // Initialize Vulkan device and query available features and capabilities.
     std::vector<Feature> availableFeatures;
     std::vector<Capability> availableCapabilities;
-    SLANG_RETURN_ON_FAIL(initVulkanDevice(desc, availableFeatures, availableCapabilities));
+    SLANG_RETURN_ON_FAIL(initVulkanDevice(desc, extendedDesc, backend, availableFeatures, availableCapabilities));
 
     VkPhysicalDeviceIDProperties idProps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceSubgroupProperties subgroupProps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceSubgroupSizeControlProperties subgroupSizeControlProps = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES
+    };
     VkPhysicalDeviceProperties2 props = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-    props.pNext = &idProps;
+    EXTEND_DESC_CHAIN(props, idProps);
+    EXTEND_DESC_CHAIN(props, subgroupProps);
+    if (m_hasSubgroupSizeControl)
+    {
+        EXTEND_DESC_CHAIN(props, subgroupSizeControlProps);
+    }
     m_api.vkGetPhysicalDeviceProperties2(m_api.m_physicalDevice, &props);
     const VkPhysicalDeviceProperties& basicProps = props.properties;
 
@@ -1405,6 +1622,21 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
         limits.maxFramebufferDimensions[2] = basicProps.limits.maxFramebufferLayers;
 
         limits.maxShaderVisibleSamplers = basicProps.limits.maxPerStageDescriptorSamplers;
+
+        if (subgroupProps.subgroupSize > 0 && (subgroupProps.supportedOperations & kWaveOpsSubgroupFeatureMask))
+        {
+            if (m_hasSubgroupSizeControl && subgroupSizeControlProps.minSubgroupSize > 0 &&
+                subgroupSizeControlProps.maxSubgroupSize >= subgroupSizeControlProps.minSubgroupSize)
+            {
+                limits.minWaveSize = subgroupSizeControlProps.minSubgroupSize;
+                limits.maxWaveSize = subgroupSizeControlProps.maxSubgroupSize;
+            }
+            else
+            {
+                limits.minWaveSize = subgroupProps.subgroupSize;
+                limits.maxWaveSize = subgroupProps.subgroupSize;
+            }
+        }
 
         m_info.limits = limits;
     }
@@ -1464,7 +1696,7 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
         for (int i = SLANG_COUNT_OF(featureTable) - 1; i >= 0; --i)
         {
             Feature feature = featureTable[i];
-            if (int(feature) >= int(Feature::SM_6_0) && int(feature) <= int(Feature::SM_6_9))
+            if (int(feature) >= int(Feature::SM_6_0) && int(feature) <= int(Feature::SM_6_10))
             {
                 addFeature(feature);
             }
@@ -1594,7 +1826,7 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
         samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         samplerInfo.minLod = 0.0f;
         samplerInfo.maxLod = 0.0f;
-        SLANG_VK_RETURN_ON_FAIL(m_api.vkCreateSampler(m_device, &samplerInfo, nullptr, &m_defaultSampler));
+        SLANG_VK_RETURN_ON_FAIL_REPORT(m_api.vkCreateSampler(m_device, &samplerInfo, nullptr, &m_defaultSampler), this);
     }
 
     // Create bindless descriptor set if needed.
@@ -1613,6 +1845,8 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     m_queue = new CommandQueueImpl(this, QueueType::Graphics);
     m_queue->init(m_deviceQueue.getQueue(), m_queueFamilyIndex);
     m_queue->setInternalReferenceCount(1);
+
+    SLANG_RETURN_ON_FAIL(checkRequiredFeatures(desc));
 
     return SLANG_OK;
 }
@@ -1656,13 +1890,15 @@ Result DeviceImpl::readBuffer(IBuffer* buffer, Offset offset, Size size, void* o
     VkBufferMemoryBarrier barrier = {};
     barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     barrier.srcAccessMask = calcAccessFlags(bufferImpl->m_desc.defaultState);
-    barrier.dstAccessMask = calcAccessFlags(ResourceState::CopyDestination);
+    barrier.dstAccessMask = calcAccessFlags(ResourceState::CopySource);
     barrier.buffer = bufferImpl->m_buffer.m_buffer;
     barrier.offset = 0;
     barrier.size = bufferImpl->m_desc.size;
 
-    VkPipelineStageFlags srcStageFlags = calcPipelineStageFlags(bufferImpl->m_desc.defaultState, true);
-    VkPipelineStageFlags dstStageFlags = calcPipelineStageFlags(ResourceState::CopySource, false);
+    VkPipelineStageFlags srcStageFlags =
+        calcPipelineStageFlags(m_api.m_supportedShaderStageFlags, bufferImpl->m_desc.defaultState, true);
+    VkPipelineStageFlags dstStageFlags =
+        calcPipelineStageFlags(m_api.m_supportedShaderStageFlags, ResourceState::CopySource, false);
 
     m_api.vkCmdPipelineBarrier(
         commandBuffer,
@@ -1797,8 +2033,9 @@ Result DeviceImpl::createAccelerationStructure(
             createInfo.pNext = &motionInfo;
         }
     }
-    SLANG_VK_RETURN_ON_FAIL(
-        m_api.vkCreateAccelerationStructureKHR(m_api.m_device, &createInfo, nullptr, &result->m_vkHandle)
+    SLANG_VK_RETURN_ON_FAIL_REPORT(
+        m_api.vkCreateAccelerationStructureKHR(m_api.m_device, &createInfo, nullptr, &result->m_vkHandle),
+        this
     );
     returnComPtr(outAccelerationStructure, result);
     return SLANG_OK;
@@ -1932,7 +2169,7 @@ Result DeviceImpl::getTextureAllocationInfo(const TextureDesc& desc_, Size* outS
     imageInfo.samples = (VkSampleCountFlagBits)desc.sampleCount;
 
     VkImage image;
-    SLANG_VK_RETURN_ON_FAIL(m_api.vkCreateImage(m_device, &imageInfo, nullptr, &image));
+    SLANG_VK_RETURN_ON_FAIL_REPORT(m_api.vkCreateImage(m_device, &imageInfo, nullptr, &image), this);
 
     VkMemoryRequirements memRequirements;
     m_api.vkGetImageMemoryRequirements(m_device, image, &memRequirements);
@@ -1946,17 +2183,32 @@ Result DeviceImpl::getTextureAllocationInfo(const TextureDesc& desc_, Size* outS
 
 Result DeviceImpl::getTextureRowAlignment(Format format, Size* outAlignment)
 {
+    Size blockSize = getFormatInfo(format).blockSizeInBytes;
+    if (blockSize == 0)
+        blockSize = 1;
+
     switch (format)
     {
     case Format::D16Unorm:
     case Format::D32Float:
     case Format::D32FloatS8Uint:
-        *outAlignment = 4;
+        *outAlignment = math::calcAligned(4, blockSize);
         break;
     default:
-        *outAlignment = 1;
+        // VkBufferImageCopy expresses bufferRowLength in texels, so the byte
+        // row pitch must represent a whole number of format blocks.
+        *outAlignment = blockSize;
         break;
     }
+    return SLANG_OK;
+}
+
+Result DeviceImpl::getTextureBufferOffsetAlignment(Format format, Size* outAlignment)
+{
+    const FormatInfo& formatInfo = getFormatInfo(format);
+    if (formatInfo.blockSizeInBytes == 0)
+        return SLANG_E_INVALID_ARG;
+    *outAlignment = formatInfo.kind == FormatKind::DepthStencil ? 4 : formatInfo.blockSizeInBytes;
     return SLANG_OK;
 }
 
@@ -2134,11 +2386,14 @@ Result DeviceImpl::getCooperativeVectorProperties(CooperativeVectorProperties* p
             vkPropertyCount,
             {VK_STRUCTURE_TYPE_COOPERATIVE_VECTOR_PROPERTIES_NV}
         );
-        SLANG_VK_RETURN_ON_FAIL(m_api.vkGetPhysicalDeviceCooperativeVectorPropertiesNV(
-            m_api.m_physicalDevice,
-            &vkPropertyCount,
-            vkProperties.data()
-        ));
+        SLANG_VK_RETURN_ON_FAIL_REPORT(
+            m_api.vkGetPhysicalDeviceCooperativeVectorPropertiesNV(
+                m_api.m_physicalDevice,
+                &vkPropertyCount,
+                vkProperties.data()
+            ),
+            this
+        );
         for (const auto& vkProps : vkProperties)
         {
             CooperativeVectorProperties props;
@@ -2183,7 +2438,7 @@ Result DeviceImpl::getCooperativeVectorMatrixSize(
     info.srcStride = rowColumnStride;
     info.dstLayout = translateCooperativeVectorMatrixLayout(layout);
     info.dstStride = rowColumnStride;
-    SLANG_VK_RETURN_ON_FAIL(m_api.vkConvertCooperativeVectorMatrixNV(m_api.m_device, &info));
+    SLANG_VK_RETURN_ON_FAIL_REPORT(m_api.vkConvertCooperativeVectorMatrixNV(m_api.m_device, &info), this);
     return SLANG_OK;
 }
 
@@ -2218,7 +2473,7 @@ Result DeviceImpl::convertCooperativeVectorMatrix(
         info.srcStride = srcDesc.rowColumnStride;
         info.dstLayout = translateCooperativeVectorMatrixLayout(dstDesc.layout);
         info.dstStride = dstDesc.rowColumnStride;
-        SLANG_VK_RETURN_ON_FAIL(m_api.vkConvertCooperativeVectorMatrixNV(m_api.m_device, &info));
+        SLANG_VK_RETURN_ON_FAIL_REPORT(m_api.vkConvertCooperativeVectorMatrixNV(m_api.m_device, &info), this);
     }
     return SLANG_OK;
 }
@@ -2335,25 +2590,15 @@ Result DeviceImpl::waitForFences(
     auto result = m_api.vkWaitSemaphores(m_api.m_device, &waitInfo, timeout);
     if (result == VK_TIMEOUT)
         return SLANG_E_TIME_OUT;
-    return result == VK_SUCCESS ? SLANG_OK : SLANG_FAIL;
-}
-
-} // namespace rhi::vk
-
-namespace rhi {
-
-IAdapter* getVKAdapter(uint32_t index)
-{
-    std::vector<vk::AdapterImpl>& adapters = vk::getAdapters();
-    return index < adapters.size() ? &adapters[index] : nullptr;
-}
-
-Result createVKDevice(const DeviceDesc* desc, IDevice** outDevice)
-{
-    RefPtr<vk::DeviceImpl> result = new vk::DeviceImpl();
-    SLANG_RETURN_ON_FAIL(result->initialize(*desc));
-    returnComPtr(outDevice, result);
+    if (result != VK_SUCCESS)
+    {
+        // Report the failure instead of dropping it silently, so that device loss (and any
+        // shader-abort message it carries) is surfaced when a caller waits on timeline fences
+        // after an aborting dispatch rather than via the command queue.
+        reportVulkanError(result, "vkWaitSemaphores", SLANG_RHI_SOURCE_LOCATION(), this);
+        return SLANG_FAIL;
+    }
     return SLANG_OK;
 }
 
-} // namespace rhi
+} // namespace rhi::vk

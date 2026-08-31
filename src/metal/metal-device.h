@@ -4,7 +4,10 @@
 #include "metal-clear-engine.h"
 #include "metal-indirect-engine.h"
 
+#include "metal-buffer-address-map.h"
+
 #include <string>
+#include <unordered_map>
 
 namespace rhi::metal {
 
@@ -21,12 +24,17 @@ class DeviceImpl : public Device
 public:
     using Device::readBuffer;
 
-    virtual SLANG_NO_THROW Result SLANG_MCALL initialize(const DeviceDesc& desc) override;
+    Result initialize(const DeviceDesc& desc, BackendImpl* backend);
     virtual SLANG_NO_THROW Result SLANG_MCALL getQueue(QueueType type, ICommandQueue** outQueue) override;
     virtual SLANG_NO_THROW Result SLANG_MCALL createSurface(WindowHandle windowHandle, ISurface** outSurface) override;
     virtual SLANG_NO_THROW Result SLANG_MCALL createTexture(
         const TextureDesc& desc,
         const SubresourceData* initData,
+        ITexture** outTexture
+    ) override;
+    virtual SLANG_NO_THROW Result SLANG_MCALL createTextureFromNativeHandle(
+        NativeHandle handle,
+        const TextureDesc& desc,
         ITexture** outTexture
     ) override;
     virtual SLANG_NO_THROW Result SLANG_MCALL createBuffer(
@@ -159,6 +167,9 @@ public:
     bool autoCaptureOnLaunch() const { return std::getenv("SLANG_RHI_CAPTURE_ON_LAUNCH") != nullptr; }
 
     NS::SharedPtr<MTL::Device> m_device;
+    /// The single command queue. Device-level operations (readBuffer,
+    /// createBuffer, createTexture) use m_queue->m_queueFence to participate
+    /// in the fence chain. See synchronization model in metal-command.h.
     RefPtr<CommandQueueImpl> m_queue;
     NS::SharedPtr<MTL::CommandQueue> m_commandQueue;
     ClearEngine m_clearEngine;
@@ -172,23 +183,33 @@ public:
         std::vector<MTL::AccelerationStructure*> list;
         std::vector<uint32_t> freeList;
         NS::SharedPtr<NS::Array> array;
-        bool dirty = true;
+        bool arrayDirty = true;
+        std::vector<MTL::Resource*> resources;
+        bool resourcesDirty = true;
     } m_accelerationStructures;
 
+    uint32_t registerAccelerationStructure(MTL::AccelerationStructure* accelerationStructure);
+    void unregisterAccelerationStructure(uint32_t index, MTL::AccelerationStructure* accelerationStructure);
     NS::Array* getAccelerationStructureArray();
+    std::span<MTL::Resource* const> getAccelerationStructureResources();
 
     bool m_hasUnifiedMemory = false;
     bool m_hasArgumentBufferTier2 = false;
     bool m_hasRasterOrderGroups = false;
-
     RefPtr<BindlessDescriptorSet> m_bindlessDescriptorSet;
+
+    NS::SharedPtr<MTL::ResidencySet> m_residencySet;
+    bool m_hasResidencySet = false;
+    bool m_residencySetDirty = false;
+    std::mutex m_residencySetMutex;
+    std::unordered_map<MTL::Resource*, uint32_t> m_residencySetResourceRefCounts;
+
+    // Fallback residency: maps GPU virtual addresses to their owning BufferImpl.
+    // Only active when !m_hasResidencySet.
+    BufferAddressMap m_addressToBuffer;
+
+    void registerResource(MTL::Resource* resource);
+    void unregisterResource(MTL::Resource* resource);
 };
 
 } // namespace rhi::metal
-
-namespace rhi {
-
-IAdapter* getMetalAdapter(uint32_t index);
-Result createMetalDevice(const DeviceDesc* desc, IDevice** outDevice);
-
-} // namespace rhi

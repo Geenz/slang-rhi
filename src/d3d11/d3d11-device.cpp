@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "d3d11-device.h"
+#include "d3d11-backend.h"
 #include "d3d11-buffer.h"
 #include "d3d11-utils.h"
 #include "d3d11-query.h"
@@ -16,43 +17,16 @@
 
 #include "core/string.h"
 
+#include <chrono>
+#include <thread>
+
 namespace rhi::d3d11 {
-
-inline Result getAdaptersImpl(std::vector<AdapterImpl>& outAdapters)
-{
-    std::vector<ComPtr<IDXGIAdapter>> dxgiAdapters;
-    SLANG_RETURN_ON_FAIL(enumAdapters(dxgiAdapters));
-
-    for (const auto& dxgiAdapter : dxgiAdapters)
-    {
-        AdapterInfo info = getAdapterInfo(dxgiAdapter);
-        info.deviceType = DeviceType::D3D11;
-
-        AdapterImpl adapter;
-        adapter.m_info = info;
-        adapter.m_dxgiAdapter = dxgiAdapter;
-        outAdapters.push_back(adapter);
-    }
-
-    // Mark default adapter (prefer discrete if available).
-    markDefaultAdapter(outAdapters);
-
-    return SLANG_OK;
-}
-
-std::vector<AdapterImpl>& getAdapters()
-{
-    static std::vector<AdapterImpl> adapters;
-    static Result initResult = getAdaptersImpl(adapters);
-    SLANG_UNUSED(initResult);
-    return adapters;
-}
 
 DeviceImpl::DeviceImpl() {}
 
 DeviceImpl::~DeviceImpl() {}
 
-Result DeviceImpl::initialize(const DeviceDesc& desc)
+Result DeviceImpl::initialize(const DeviceDesc& desc, BackendImpl* backend)
 {
     SLANG_RETURN_ON_FAIL(Device::initialize(desc));
 
@@ -87,8 +61,8 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
 
     m_dxgiFactory = getDXGIFactory(getRHI()->getDebugLayerOptions(), this);
 
-    AdapterImpl* adapter = nullptr;
-    SLANG_RETURN_ON_FAIL(selectAdapter(this, getAdapters(), desc, adapter));
+    const AdapterImpl* adapter = nullptr;
+    SLANG_RETURN_ON_FAIL(selectAdapter(this, backend->getAdapters(), desc, adapter));
     m_dxgiAdapter = adapter->m_dxgiAdapter;
 
     // We will ask for the highest feature level that can be supported.
@@ -199,7 +173,7 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
 #endif
 
     SLANG_RHI_ASSERT(m_device && m_immediateContext);
-    SLANG_RETURN_ON_FAIL(m_immediateContext->QueryInterface(m_immediateContext1.writeRef()));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(m_immediateContext->QueryInterface(m_immediateContext1.writeRef()), this);
 
     // Initialize device info
     {
@@ -220,13 +194,21 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     {
         D3D11_QUERY_DESC disjointQueryDesc = {};
         disjointQueryDesc.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
-        SLANG_RETURN_ON_FAIL(m_device->CreateQuery(&disjointQueryDesc, m_disjointQuery.writeRef()));
-        m_immediateContext->Begin(m_disjointQuery);
-        m_immediateContext->End(m_disjointQuery);
+        ComPtr<ID3D11Query> disjointQuery;
+        SLANG_D3D_RETURN_ON_FAIL_REPORT(m_device->CreateQuery(&disjointQueryDesc, disjointQuery.writeRef()), this);
+        m_immediateContext->Begin(disjointQuery);
+        m_immediateContext->End(disjointQuery);
         D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData = {};
         m_immediateContext->Flush();
-        m_immediateContext->GetData(m_disjointQuery, &disjointData, sizeof(disjointData), 0);
-        m_info.timestampFrequency = disjointData.Frequency;
+        HRESULT hr = S_FALSE;
+        while ((hr = m_immediateContext->GetData(disjointQuery, &disjointData, sizeof(disjointData), 0)) == S_FALSE)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (SUCCEEDED(hr) && !disjointData.Disjoint)
+        {
+            m_info.timestampFrequency = disjointData.Frequency;
+        }
     }
 
     // Query device limits
@@ -314,6 +296,7 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     if (m_info.timestampFrequency > 0)
     {
         addFeature(Feature::TimestampQuery);
+        addFeature(Feature::TimestampCalibration);
     }
 
     addCapability(Capability::hlsl);
@@ -440,6 +423,8 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     m_queue = new CommandQueueImpl(this, QueueType::Graphics);
     m_queue->setInternalReferenceCount(1);
 
+    SLANG_RETURN_ON_FAIL(checkRequiredFeatures(desc));
+
     return SLANG_OK;
 }
 
@@ -540,9 +525,10 @@ Result DeviceImpl::readTexture(
     // Now just read back texels from the staging textures
     {
         D3D11_MAPPED_SUBRESOURCE mappedResource;
-        SLANG_RETURN_ON_FAIL(
+        SLANG_D3D_RETURN_ON_FAIL_REPORT(
             m_immediateContext
-                ->Map(stagingTextureImpl->m_resource.get(), subResourceIdx, D3D11_MAP_READ, 0, &mappedResource)
+                ->Map(stagingTextureImpl->m_resource.get(), subResourceIdx, D3D11_MAP_READ, 0, &mappedResource),
+            this
         );
 
         auto blob = OwnedBlob::create(layout.sizeInBytes);
@@ -589,7 +575,10 @@ Result DeviceImpl::readBuffer(IBuffer* buffer, Offset offset, Size size, void* o
     stagingBufferDesc.ByteWidth = size;
     stagingBufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     stagingBufferDesc.Usage = D3D11_USAGE_STAGING;
-    SLANG_RETURN_ON_FAIL(m_device->CreateBuffer(&stagingBufferDesc, nullptr, stagingBuffer.writeRef()));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(
+        m_device->CreateBuffer(&stagingBufferDesc, nullptr, stagingBuffer.writeRef()),
+        this
+    );
 
     // Copy to staging buffer.
     D3D11_BOX srcBox = {};
@@ -600,7 +589,10 @@ Result DeviceImpl::readBuffer(IBuffer* buffer, Offset offset, Size size, void* o
 
     // Map the staging buffer and copy data.
     D3D11_MAPPED_SUBRESOURCE mappedResource;
-    SLANG_RETURN_ON_FAIL(m_immediateContext->Map(stagingBuffer, 0, D3D11_MAP_READ, 0, &mappedResource));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(
+        m_immediateContext->Map(stagingBuffer, 0, D3D11_MAP_READ, 0, &mappedResource),
+        this
+    );
     std::memcpy(outData, mappedResource.pData, size);
     m_immediateContext->Unmap(stagingBuffer, 0);
 
@@ -665,21 +657,3 @@ Result DeviceImpl::createRootShaderObjectLayout(
 }
 
 } // namespace rhi::d3d11
-
-namespace rhi {
-
-IAdapter* getD3D11Adapter(uint32_t index)
-{
-    std::vector<d3d11::AdapterImpl>& adapters = d3d11::getAdapters();
-    return index < adapters.size() ? &adapters[index] : nullptr;
-}
-
-Result createD3D11Device(const DeviceDesc* desc, IDevice** outDevice)
-{
-    RefPtr<d3d11::DeviceImpl> result = new d3d11::DeviceImpl();
-    SLANG_RETURN_ON_FAIL(result->initialize(*desc));
-    returnComPtr(outDevice, result);
-    return SLANG_OK;
-}
-
-} // namespace rhi

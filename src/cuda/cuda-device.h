@@ -21,6 +21,12 @@ public:
 class DeviceImpl : public Device
 {
 public:
+    virtual bool canCreatePipelineOnTaskPool(const Pipeline* pipeline) const override
+    {
+        SLANG_UNUSED(pipeline);
+        return true;
+    }
+
     Context m_ctx;
     std::string m_adapterName;
     RefPtr<CommandQueueImpl> m_queue;
@@ -35,11 +41,11 @@ public:
     DeviceImpl();
     ~DeviceImpl();
 
+    Result initialize(const DeviceDesc& desc, BackendImpl* backend);
+
     void deferDelete(Resource* resource);
 
     virtual SLANG_NO_THROW Result SLANG_MCALL getNativeDeviceHandles(DeviceNativeHandles* outHandles) override;
-
-    virtual SLANG_NO_THROW Result SLANG_MCALL initialize(const DeviceDesc& desc) override;
 
     virtual SLANG_NO_THROW Result SLANG_MCALL createTexture(
         const TextureDesc& desc,
@@ -50,6 +56,12 @@ public:
     virtual SLANG_NO_THROW Result SLANG_MCALL createBuffer(
         const BufferDesc& desc,
         const void* initData,
+        IBuffer** outBuffer
+    ) override;
+
+    virtual SLANG_NO_THROW Result SLANG_MCALL createBufferFromNativeHandle(
+        NativeHandle handle,
+        const BufferDesc& desc,
         IBuffer** outBuffer
     ) override;
 
@@ -69,6 +81,14 @@ public:
         const size_t size,
         ITexture** outTexture
     ) override;
+
+    Result createTextureFromSharedHandle(
+        NativeHandle handle,
+        const TextureDesc& desc,
+        const size_t size,
+        bool isDedicated,
+        ITexture** outTexture
+    );
 
     virtual SLANG_NO_THROW Result SLANG_MCALL createTextureView(
         ITexture* texture,
@@ -209,10 +229,3 @@ public:
 };
 
 } // namespace rhi::cuda
-
-namespace rhi {
-
-IAdapter* getCUDAAdapter(uint32_t index);
-Result createCUDADevice(const DeviceDesc* desc, IDevice** outDevice);
-
-} // namespace rhi

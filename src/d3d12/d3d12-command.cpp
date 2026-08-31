@@ -17,6 +17,7 @@
 
 #include "core/short_vector.h"
 #include "core/common.h"
+#include "core/platform.h"
 
 namespace rhi::d3d12 {
 
@@ -106,8 +107,6 @@ public:
     void cmdBuildAccelerationStructure(const commands::BuildAccelerationStructure& cmd);
     void cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd);
     void cmdQueryAccelerationStructureProperties(const commands::QueryAccelerationStructureProperties& cmd);
-    void cmdSerializeAccelerationStructure(const commands::SerializeAccelerationStructure& cmd);
-    void cmdDeserializeAccelerationStructure(const commands::DeserializeAccelerationStructure& cmd);
     void cmdExecuteClusterOperation(const commands::ExecuteClusterOperation& cmd);
     void cmdConvertCooperativeVectorMatrix(const commands::ConvertCooperativeVectorMatrix& cmd);
     void cmdSetBufferState(const commands::SetBufferState& cmd);
@@ -131,6 +130,18 @@ public:
     void requireBufferState(BufferImpl* buffer, ResourceState state);
     void requireTextureState(TextureImpl* texture, SubresourceRange subresourceRange, ResourceState state);
     void commitBarriers();
+
+    void resolveTimestampQueryResults(const CommandList::QueryWriteRangeList& queryWrites);
+
+    void requireAccelerationStructureQueryResultBuffers(
+        uint32_t queryCount,
+        const AccelerationStructureQueryDesc* queryDescs
+    );
+    void copyAccelerationStructureQueryResults(
+        uint32_t queryCount,
+        const AccelerationStructureQueryDesc* queryDescs,
+        uint32_t resultCount
+    );
 };
 
 Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
@@ -168,12 +179,17 @@ Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
 #undef SLANG_RHI_COMMAND_EXECUTE_X
     }
 
+    if (commandList.writesTimestamp())
+    {
+        resolveTimestampQueryResults(commandList.getQueryWrites());
+    }
+
     // Transition all resources back to their default states.
     m_stateTracking.requireDefaultStates();
     commitBarriers();
     m_stateTracking.clear();
 
-    SLANG_RETURN_ON_FAIL(m_cmdList->Close());
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(m_cmdList->Close(), m_device);
 
     return SLANG_OK;
 }
@@ -216,7 +232,7 @@ void CommandRecorder::cmdCopyTexture(const commands::CopyTexture& cmd)
         requireTextureState(dst, kEntireTexture, ResourceState::CopyDestination);
         requireTextureState(src, kEntireTexture, ResourceState::CopySource);
         commitBarriers();
-        m_cmdList->CopyResource(dst->m_resource.getResource(), src->m_resource.getResource());
+        m_cmdList->CopyResource(dst->m_resource, src->m_resource);
         return;
     }
 
@@ -289,7 +305,7 @@ void CommandRecorder::cmdCopyTexture(const commands::CopyTexture& cmd)
                 D3D12_TEXTURE_COPY_LOCATION dstRegion = {};
 
                 dstRegion.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                dstRegion.pResource = dst->m_resource.getResource();
+                dstRegion.pResource = dst->m_resource;
                 dstRegion.SubresourceIndex = getSubresourceIndex(
                     dstMip,
                     dstSubresource.layer + layer,
@@ -300,7 +316,7 @@ void CommandRecorder::cmdCopyTexture(const commands::CopyTexture& cmd)
 
                 D3D12_TEXTURE_COPY_LOCATION srcRegion = {};
                 srcRegion.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                srcRegion.pResource = src->m_resource.getResource();
+                srcRegion.pResource = src->m_resource;
                 srcRegion.SubresourceIndex = getSubresourceIndex(
                     srcMip,
                     srcSubresource.layer + layer,
@@ -384,12 +400,12 @@ void CommandRecorder::cmdCopyTextureToBuffer(const commands::CopyTextureToBuffer
     srcRegion.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     srcRegion.SubresourceIndex =
         getSubresourceIndex(srcMip, srcLayer, 0, src->m_desc.mipCount, src->m_desc.arrayLength);
-    srcRegion.pResource = src->m_resource.getResource();
+    srcRegion.pResource = src->m_resource;
 
     // Setup the destination resource.
     D3D12_TEXTURE_COPY_LOCATION dstRegion = {};
     dstRegion.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dstRegion.pResource = dst->m_resource.getResource();
+    dstRegion.pResource = dst->m_resource;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = dstRegion.PlacedFootprint;
     footprint.Offset = dstOffset;
     footprint.Footprint.Format = src->m_resource.getResource()->GetDesc().Format;
@@ -477,7 +493,7 @@ void CommandRecorder::cmdClearTextureFloat(const commands::ClearTextureFloat& cm
             m_cmdList->ClearUnorderedAccessViewFloat(
                 descriptor.getGpuHandle(0),
                 uav,
-                texture->m_resource.getResource(),
+                texture->m_resource,
                 cmd.clearValue,
                 0,
                 nullptr
@@ -508,7 +524,7 @@ void CommandRecorder::cmdClearTextureUint(const commands::ClearTextureUint& cmd)
             m_cmdList->ClearUnorderedAccessViewUint(
                 descriptor.getGpuHandle(0),
                 uav,
-                texture->m_resource.getResource(),
+                texture->m_resource,
                 clearValue,
                 0,
                 nullptr
@@ -565,14 +581,14 @@ void CommandRecorder::cmdUploadTextureData(const commands::UploadTextureData& cm
 
             D3D12_TEXTURE_COPY_LOCATION dstRegion = {};
             dstRegion.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            dstRegion.pResource = dst->m_resource.getResource();
+            dstRegion.pResource = dst->m_resource;
 
             dstRegion.SubresourceIndex =
                 getSubresourceIndex(mip, layer, 0, dst->m_desc.mipCount, dst->m_desc.arrayLength);
 
             D3D12_TEXTURE_COPY_LOCATION srcRegion = {};
             srcRegion.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            srcRegion.pResource = buffer->m_resource.getResource();
+            srcRegion.pResource = buffer->m_resource;
 
             D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = srcRegion.PlacedFootprint;
             footprint.Offset = bufferOffset;
@@ -602,31 +618,20 @@ void CommandRecorder::cmdResolveQuery(const commands::ResolveQuery& cmd)
     {
     case QueryType::AccelerationStructureCompactedSize:
     case QueryType::AccelerationStructureCurrentSize:
-    case QueryType::AccelerationStructureSerializedSize:
     {
         auto queryPoolImpl = checked_cast<PlainBufferProxyQueryPoolImpl*>(queryPool);
         auto srcQueryBuffer = queryPoolImpl->m_buffer->m_resource.getResource();
 
-        D3D12_RESOURCE_BARRIER barrier = {};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        barrier.Transition.pResource = srcQueryBuffer;
-        m_cmdList->ResourceBarrier(1, &barrier);
+        requireBufferState(queryPoolImpl->m_buffer, ResourceState::CopySource);
+        commitBarriers();
 
         m_cmdList->CopyBufferRegion(
             buffer->m_resource.getResource(),
             cmd.offset,
             srcQueryBuffer,
-            cmd.index * sizeof(uint64_t),
-            cmd.count * sizeof(uint64_t)
+            uint64_t(cmd.index) * queryPoolImpl->m_stride,
+            uint64_t(cmd.count) * queryPoolImpl->m_stride
         );
-
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        barrier.Transition.pResource = srcQueryBuffer;
-        m_cmdList->ResourceBarrier(1, &barrier);
     }
     break;
     default:
@@ -776,22 +781,66 @@ void CommandRecorder::cmdEndRenderPass(const commands::EndRenderPass& cmd)
     {
         if (m_renderTargetViews[i] && m_resolveTargetViews[i])
         {
-            requireTextureState(
-                m_renderTargetViews[i]->m_texture,
-                m_renderTargetViews[i]->m_desc.subresourceRange,
-                ResourceState::ResolveSource
-            );
-            requireTextureState(
-                m_resolveTargetViews[i]->m_texture,
-                m_resolveTargetViews[i]->m_desc.subresourceRange,
-                ResourceState::ResolveDestination
-            );
             needsResolve = true;
         }
     }
 
     if (needsResolve)
     {
+        // Discard resolve destinations while they are still in render target state.
+        // This satisfies D3D12's initialization requirement for resources in non-zeroed heaps
+        // with render target or depth stencil flags.
+        for (size_t i = 0; i < m_renderTargetViews.size(); ++i)
+        {
+            if (m_renderTargetViews[i] && m_resolveTargetViews[i])
+            {
+                requireTextureState(
+                    m_resolveTargetViews[i]->m_texture,
+                    m_resolveTargetViews[i]->m_desc.subresourceRange,
+                    ResourceState::RenderTarget
+                );
+            }
+        }
+        commitBarriers();
+        for (size_t i = 0; i < m_renderTargetViews.size(); ++i)
+        {
+            if (m_renderTargetViews[i] && m_resolveTargetViews[i])
+            {
+                // DiscardResource is only valid for resources created with ALLOW_RENDER_TARGET or
+                // ALLOW_DEPTH_STENCIL (set via calcResourceFlags from TextureUsage). Only discard
+                // m_resolveTargetViews entries whose textures have the appropriate usage flags.
+                TextureUsage usage = m_resolveTargetViews[i]->m_texture->m_desc.usage;
+                if (is_set(usage, TextureUsage::RenderTarget) || is_set(usage, TextureUsage::DepthStencil))
+                {
+                    const SubresourceRange& range = m_resolveTargetViews[i]->m_desc.subresourceRange;
+                    const TextureDesc& texDesc = m_resolveTargetViews[i]->m_texture->m_desc;
+                    UINT firstSubresource = range.layer * texDesc.mipCount + range.mip;
+                    UINT numSubresources = (range.layerCount - 1) * texDesc.mipCount + range.mipCount;
+                    D3D12_DISCARD_REGION region = {};
+                    region.FirstSubresource = firstSubresource;
+                    region.NumSubresources = numSubresources;
+                    m_cmdList->DiscardResource(m_resolveTargetViews[i]->m_texture->m_resource, &region);
+                }
+            }
+        }
+
+        // Transition to resolve states.
+        for (size_t i = 0; i < m_renderTargetViews.size(); ++i)
+        {
+            if (m_renderTargetViews[i] && m_resolveTargetViews[i])
+            {
+                requireTextureState(
+                    m_renderTargetViews[i]->m_texture,
+                    m_renderTargetViews[i]->m_desc.subresourceRange,
+                    ResourceState::ResolveSource
+                );
+                requireTextureState(
+                    m_resolveTargetViews[i]->m_texture,
+                    m_resolveTargetViews[i]->m_desc.subresourceRange,
+                    ResourceState::ResolveDestination
+                );
+            }
+        }
         commitBarriers();
 
         for (size_t i = 0; i < m_renderTargetViews.size(); ++i)
@@ -800,6 +849,7 @@ void CommandRecorder::cmdEndRenderPass(const commands::EndRenderPass& cmd)
             {
                 TextureViewImpl* srcView = m_renderTargetViews[i].get();
                 TextureViewImpl* dstView = m_resolveTargetViews[i].get();
+
                 // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-resolvesubresource
                 DXGI_FORMAT format = srcView->m_texture->m_format;
                 if (!dstView->m_texture->m_isTypeless)
@@ -807,9 +857,9 @@ void CommandRecorder::cmdEndRenderPass(const commands::EndRenderPass& cmd)
                     format = dstView->m_texture->m_format;
                 }
                 m_cmdList->ResolveSubresource(
-                    dstView->m_texture->m_resource.getResource(),
+                    dstView->m_texture->m_resource,
                     0, // TODO iterate subresources
-                    srcView->m_texture->m_resource.getResource(),
+                    srcView->m_texture->m_resource,
                     0, // TODO iterate subresources
                     format
                 );
@@ -1341,6 +1391,7 @@ void CommandRecorder::cmdBuildAccelerationStructure(const commands::BuildAcceler
         }
     }
 
+    requireAccelerationStructureQueryResultBuffers(cmd.propertyQueryCount, cmd.queryDescs);
     commitBarriers();
 
 #if SLANG_RHI_ENABLE_NVAPI
@@ -1384,6 +1435,8 @@ void CommandRecorder::cmdBuildAccelerationStructure(const commands::BuildAcceler
 
         m_cmdList4->BuildRaytracingAccelerationStructure(&buildDesc, cmd.propertyQueryCount, postBuildInfoDescs.data());
     }
+
+    copyAccelerationStructureQueryResults(cmd.propertyQueryCount, cmd.queryDescs, 1);
 }
 
 void CommandRecorder::cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd)
@@ -1418,43 +1471,14 @@ void CommandRecorder::cmdQueryAccelerationStructureProperties(const commands::Qu
     for (uint32_t i = 0; i < cmd.accelerationStructureCount; i++)
         asAddresses[i] = cmd.accelerationStructures[i]->getDeviceAddress();
     translatePostBuildInfoDescs(cmd.queryCount, cmd.queryDescs, postBuildInfoDescs);
+    requireAccelerationStructureQueryResultBuffers(cmd.queryCount, cmd.queryDescs);
+    commitBarriers();
     m_cmdList4->EmitRaytracingAccelerationStructurePostbuildInfo(
         postBuildInfoDescs.data(),
         cmd.accelerationStructureCount,
         asAddresses.data()
     );
-}
-
-void CommandRecorder::cmdSerializeAccelerationStructure(const commands::SerializeAccelerationStructure& cmd)
-{
-    BufferImpl* dstBuffer = checked_cast<BufferImpl*>(cmd.dst.buffer);
-    AccelerationStructureImpl* src = checked_cast<AccelerationStructureImpl*>(cmd.src);
-
-    requireBufferState(dstBuffer, ResourceState::UnorderedAccess);
-    requireBufferState(src->m_buffer, ResourceState::AccelerationStructureRead);
-    commitBarriers();
-
-    m_cmdList4->CopyRaytracingAccelerationStructure(
-        cmd.dst.getDeviceAddress(),
-        src->getDeviceAddress(),
-        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE
-    );
-}
-
-void CommandRecorder::cmdDeserializeAccelerationStructure(const commands::DeserializeAccelerationStructure& cmd)
-{
-    AccelerationStructureImpl* dst = checked_cast<AccelerationStructureImpl*>(cmd.dst);
-    BufferImpl* srcBuffer = checked_cast<BufferImpl*>(cmd.src.buffer);
-
-    requireBufferState(dst->m_buffer, ResourceState::AccelerationStructureWrite);
-    requireBufferState(srcBuffer, ResourceState::ShaderResource);
-    commitBarriers();
-
-    m_cmdList4->CopyRaytracingAccelerationStructure(
-        dst->getDeviceAddress(),
-        cmd.src.getDeviceAddress(),
-        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE
-    );
+    copyAccelerationStructureQueryResults(cmd.queryCount, cmd.queryDescs, cmd.accelerationStructureCount);
 }
 
 void CommandRecorder::cmdExecuteClusterOperation(const commands::ExecuteClusterOperation& cmd)
@@ -1660,7 +1684,18 @@ void CommandRecorder::cmdWriteTimestamp(const commands::WriteTimestamp& cmd)
 
 void CommandRecorder::cmdExecuteCallback(const commands::ExecuteCallback& cmd)
 {
-    cmd.callback(cmd.userData);
+    commitBarriers();
+
+    NativeHandle nativeHandle{
+        NativeHandleType::D3D12GraphicsCommandList,
+        reinterpret_cast<uint64_t>(m_cmdList.get()),
+    };
+    invokeExecuteCallback(cmd, nativeHandle);
+
+    m_renderStateValid = false;
+    m_computeStateValid = false;
+    m_rayTracingStateValid = false;
+    m_bindingData = nullptr;
 }
 
 void CommandRecorder::setBindings(BindingDataImpl* bindingData, BindMode bindMode)
@@ -1827,6 +1862,72 @@ void CommandRecorder::commitBarriers()
     m_stateTracking.clearBarriers();
 }
 
+void CommandRecorder::resolveTimestampQueryResults(const CommandList::QueryWriteRangeList& queryWrites)
+{
+    for (const auto& queryWrite : queryWrites)
+    {
+        if (queryWrite.queryPool->getDesc().type != QueryType::Timestamp)
+            continue;
+
+        auto queryPool = checked_cast<QueryPoolImpl*>(queryWrite.queryPool);
+        m_cmdList->ResolveQueryData(
+            queryPool->m_queryHeap,
+            queryPool->m_queryType,
+            queryWrite.index,
+            queryWrite.count,
+            queryPool->m_readBackBuffer,
+            uint64_t(queryWrite.index) * sizeof(uint64_t)
+        );
+    }
+}
+
+void CommandRecorder::requireAccelerationStructureQueryResultBuffers(
+    uint32_t queryCount,
+    const AccelerationStructureQueryDesc* queryDescs
+)
+{
+    if (!queryDescs)
+        return;
+
+    for (uint32_t i = 0; i < queryCount; ++i)
+    {
+        auto queryPool = checked_cast<PlainBufferProxyQueryPoolImpl*>(queryDescs[i].queryPool);
+        requireBufferState(queryPool->m_buffer, ResourceState::UnorderedAccess);
+    }
+}
+
+void CommandRecorder::copyAccelerationStructureQueryResults(
+    uint32_t queryCount,
+    const AccelerationStructureQueryDesc* queryDescs,
+    uint32_t resultCount
+)
+{
+    if (!queryDescs || queryCount == 0 || resultCount == 0)
+        return;
+
+    for (uint32_t i = 0; i < queryCount; ++i)
+    {
+        auto queryPool = checked_cast<PlainBufferProxyQueryPoolImpl*>(queryDescs[i].queryPool);
+        requireBufferState(queryPool->m_buffer, ResourceState::CopySource);
+    }
+    commitBarriers();
+
+    for (uint32_t i = 0; i < queryCount; ++i)
+    {
+        auto queryPool = checked_cast<PlainBufferProxyQueryPoolImpl*>(queryDescs[i].queryPool);
+        uint64_t offset = uint64_t(queryDescs[i].firstQueryIndex) * queryPool->m_stride;
+        uint64_t size = uint64_t(resultCount) * queryPool->m_stride;
+        m_cmdList->CopyBufferRegion(
+            queryPool->m_readBackBuffer.getResource(),
+            offset,
+            queryPool->m_buffer->m_resource.getResource(),
+            offset,
+            size
+        );
+    }
+}
+
+
 // CommandQueueImpl
 
 CommandQueueImpl::CommandQueueImpl(Device* device, QueueType type)
@@ -1844,7 +1945,10 @@ Result CommandQueueImpl::init(uint32_t queueIndex)
 
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    SLANG_RETURN_ON_FAIL(m_d3dDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(m_d3dQueue.writeRef())));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(
+        m_d3dDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(m_d3dQueue.writeRef())),
+        m_device
+    );
 
 #if SLANG_RHI_ENABLE_AFTERMATH
     if (device->m_aftermathCrashDumper)
@@ -1853,17 +1957,36 @@ Result CommandQueueImpl::init(uint32_t queueIndex)
     }
 #endif
 
-    SLANG_RETURN_ON_FAIL(m_d3dDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(m_trackingFence.writeRef())));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(
+        m_d3dDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(m_trackingFence.writeRef())),
+        m_device
+    );
     m_globalWaitHandle =
         CreateEventEx(nullptr, nullptr, CREATE_EVENT_INITIAL_SET | CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS);
+
+    TransientBufferHeapDesc constantBufferHeapDesc;
+    constantBufferHeapDesc.initialPageSize = 64 * 1024;
+    constantBufferHeapDesc.maxPageSize = 4 * 1024 * 1024;
+    constantBufferHeapDesc.maxRetainedSize = 4 * 1024 * 1024;
+    constantBufferHeapDesc.memoryType = MemoryType::Upload;
+    constantBufferHeapDesc.usage = BufferUsage::ConstantBuffer;
+    constantBufferHeapDesc.defaultState = ResourceState::ConstantBuffer;
+    constantBufferHeapDesc.alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+    constantBufferHeapDesc.allocationGranularity = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+    m_constantBufferHeap.initialize(device, constantBufferHeapDesc);
     return SLANG_OK;
 }
 
 void CommandQueueImpl::shutdown()
 {
     waitOnHost();
+    // A failed device wait may leave command buffers in the in-flight list. Destroy them before
+    // releasing the heap so their allocation handles cannot outlive its pages.
+    m_commandBuffersInFlight.clear();
     // Release all command buffers in order to release all resources they may hold.
     m_commandBuffersPool.clear();
+    // Release the shared constant-buffer pages while deferred deletion is still available.
+    m_constantBufferHeap.release();
     // Execute remaining deferred deletes.
     executeDeferredDeletes();
     SLANG_RHI_ASSERT(m_deferredDeleteQueue.empty());
@@ -1975,7 +2098,7 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
     for (uint32_t i = 0; i < desc.waitFenceCount; ++i)
     {
         FenceImpl* fence = checked_cast<FenceImpl*>(desc.waitFences[i]);
-        SLANG_RETURN_ON_FAIL(m_d3dQueue->Wait(fence->m_fence.get(), desc.waitFenceValues[i]));
+        SLANG_D3D_RETURN_ON_FAIL_REPORT(m_d3dQueue->Wait(fence->m_fence.get(), desc.waitFenceValues[i]), m_device);
     }
 
     // Execute command lists.
@@ -1984,6 +2107,11 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
     {
         CommandBufferImpl* commandBuffer = checked_cast<CommandBufferImpl*>(desc.commandBuffers[i]);
         commandBuffer->m_submissionID = m_lastSubmittedID;
+        for (const auto& queryWrite : commandBuffer->m_commandList.getQueryWrites())
+        {
+            checked_cast<QueryPool*>(queryWrite.queryPool)
+                ->markQueryRangeSubmitted(queryWrite.index, queryWrite.count, m_lastSubmittedID);
+        }
         m_commandBuffersInFlight.push_back(commandBuffer);
         commandLists.push_back(commandBuffer->m_d3dCommandList);
     }
@@ -1996,10 +2124,10 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
     for (uint32_t i = 0; i < desc.signalFenceCount; ++i)
     {
         FenceImpl* fence = checked_cast<FenceImpl*>(desc.signalFences[i]);
-        SLANG_RETURN_ON_FAIL(m_d3dQueue->Signal(fence->m_fence.get(), desc.signalFenceValues[i]));
+        SLANG_D3D_RETURN_ON_FAIL_REPORT(m_d3dQueue->Signal(fence->m_fence.get(), desc.signalFenceValues[i]), m_device);
     }
 
-    SLANG_RETURN_ON_FAIL(m_d3dQueue->Signal(m_trackingFence.get(), m_lastSubmittedID));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(m_d3dQueue->Signal(m_trackingFence.get(), m_lastSubmittedID), m_device);
 
     retireCommandBuffers();
 
@@ -2021,9 +2149,12 @@ Result CommandQueueImpl::waitOnHost()
 {
     DeviceImpl* device = getDevice<DeviceImpl>();
     m_lastSubmittedID++;
-    SLANG_RETURN_ON_FAIL(m_d3dQueue->Signal(m_trackingFence.get(), m_lastSubmittedID));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(m_d3dQueue->Signal(m_trackingFence.get(), m_lastSubmittedID), m_device);
     ResetEvent(m_globalWaitHandle);
-    SLANG_RETURN_ON_FAIL(m_trackingFence->SetEventOnCompletion(m_lastSubmittedID, m_globalWaitHandle));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(
+        m_trackingFence->SetEventOnCompletion(m_lastSubmittedID, m_globalWaitHandle),
+        m_device
+    );
     WaitForSingleObject(m_globalWaitHandle, INFINITE);
     device->flushValidationMessages();
     retireCommandBuffers();
@@ -2034,6 +2165,41 @@ Result CommandQueueImpl::getNativeHandle(NativeHandle* outHandle)
 {
     outHandle->type = NativeHandleType::D3D12CommandQueue;
     outHandle->value = (uint64_t)m_d3dQueue.get();
+    return SLANG_OK;
+}
+
+Result CommandQueueImpl::getTimestampCalibration(TimestampCalibration* outCalibration)
+{
+    if (!outCalibration)
+    {
+        return SLANG_E_INVALID_ARG;
+    }
+
+    if (getCpuTimestampDomain() != CpuTimestampDomain::QueryPerformanceCounter)
+    {
+        return SLANG_FAIL;
+    }
+
+    const uint64_t before = getCpuTimestamp();
+
+    UINT64 gpuTimestamp = 0;
+    UINT64 cpuTimestamp = 0;
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(m_d3dQueue->GetClockCalibration(&gpuTimestamp, &cpuTimestamp), m_device);
+
+    const uint64_t after = getCpuTimestamp();
+
+    UINT64 gpuFrequency = 0;
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(m_d3dQueue->GetTimestampFrequency(&gpuFrequency), m_device);
+
+    const uint64_t cpuFrequency = getCpuTimestampFrequency();
+
+    outCalibration->cpuDomain = CpuTimestampDomain::QueryPerformanceCounter;
+    outCalibration->cpuTimestamp = cpuTimestamp;
+    outCalibration->cpuFrequency = cpuFrequency;
+    outCalibration->gpuTimestamp = gpuTimestamp;
+    outCalibration->gpuFrequency = gpuFrequency;
+    outCalibration->maxDeviationNs = ticksToNanoseconds(after - before, cpuFrequency);
+
     return SLANG_OK;
 }
 
@@ -2070,7 +2236,7 @@ Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingD
     builder.m_device = getDevice<DeviceImpl>();
     builder.m_allocator = &m_commandBuffer->m_allocator;
     builder.m_bindingCache = &m_commandBuffer->m_bindingCache;
-    builder.m_constantBufferPool = &m_commandBuffer->m_constantBufferPool;
+    builder.m_constantBufferArena = &m_commandBuffer->m_constantBufferArena;
     builder.m_cbvSrvUavArena = &m_commandBuffer->m_cbvSrvUavArena;
     builder.m_samplerArena = &m_commandBuffer->m_samplerArena;
     ShaderObjectLayout* specializedLayout = nullptr;
@@ -2134,17 +2300,21 @@ CommandBufferImpl::~CommandBufferImpl()
 Result CommandBufferImpl::init()
 {
     DeviceImpl* device = getDevice<DeviceImpl>();
-    SLANG_RETURN_ON_FAIL(device->m_device->CreateCommandAllocator(
-        D3D12_COMMAND_LIST_TYPE_DIRECT,
-        IID_PPV_ARGS(m_d3dCommandAllocator.writeRef())
-    ));
-    SLANG_RETURN_ON_FAIL(device->m_device->CreateCommandList(
-        0,
-        D3D12_COMMAND_LIST_TYPE_DIRECT,
-        m_d3dCommandAllocator,
-        nullptr,
-        IID_PPV_ARGS(m_d3dCommandList.writeRef())
-    ));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(
+        device->m_device
+            ->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(m_d3dCommandAllocator.writeRef())),
+        device
+    );
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(
+        device->m_device->CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            m_d3dCommandAllocator,
+            nullptr,
+            IID_PPV_ARGS(m_d3dCommandList.writeRef())
+        ),
+        device
+    );
 
 #if SLANG_RHI_ENABLE_AFTERMATH
     if (device->m_aftermathCrashDumper)
@@ -2159,7 +2329,7 @@ Result CommandBufferImpl::init()
     };
     m_d3dCommandList->SetDescriptorHeaps(SLANG_COUNT_OF(heaps), heaps);
 
-    m_constantBufferPool.init(device);
+    m_constantBufferArena.initialize(&m_queue->m_constantBufferHeap);
 
     SLANG_RETURN_ON_FAIL(m_cbvSrvUavArena.init(device->m_gpuCbvSrvUavHeap, 128));
     SLANG_RETURN_ON_FAIL(m_samplerArena.init(device->m_gpuSamplerHeap, 4));
@@ -2170,8 +2340,8 @@ Result CommandBufferImpl::init()
 Result CommandBufferImpl::reset()
 {
     DeviceImpl* device = getDevice<DeviceImpl>();
-    SLANG_RETURN_ON_FAIL(m_d3dCommandAllocator->Reset());
-    SLANG_RETURN_ON_FAIL(m_d3dCommandList->Reset(m_d3dCommandAllocator, nullptr));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(m_d3dCommandAllocator->Reset(), device);
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(m_d3dCommandList->Reset(m_d3dCommandAllocator, nullptr), device);
     ID3D12DescriptorHeap* heaps[] = {
         device->m_gpuCbvSrvUavHeap->getHeap(),
         device->m_gpuSamplerHeap->getHeap(),
@@ -2180,7 +2350,7 @@ Result CommandBufferImpl::reset()
 
     m_cbvSrvUavArena.reset();
     m_samplerArena.reset();
-    m_constantBufferPool.reset();
+    m_constantBufferArena.reset();
     m_bindingCache.reset();
     return CommandBuffer::reset();
 }

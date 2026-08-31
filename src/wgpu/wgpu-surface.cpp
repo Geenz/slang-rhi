@@ -11,8 +11,13 @@
 
 namespace rhi::wgpu {
 
-static auto translateWGPUFormat =
-    reverseMap<Format, WGPUTextureFormat>(translateTextureFormat, Format::Undefined, Format::_Count);
+static Format translateWGPUFormat(WGPUTextureFormat format)
+{
+    return reverseMapLookup<Format, WGPUTextureFormat, Format::Undefined, Format::_Count>(
+        translateTextureFormat,
+        format
+    );
+}
 
 SurfaceImpl::~SurfaceImpl()
 {
@@ -40,6 +45,8 @@ Result SurfaceImpl::init(DeviceImpl* device, WindowHandle windowHandle)
     WGPUSurfaceSourceXlibWindow descXlib = {};
 #elif SLANG_APPLE_FAMILY
     WGPUSurfaceSourceMetalLayer descMetal = {};
+#elif SLANG_WASM
+    WGPUEmscriptenSurfaceSourceCanvasHTMLSelector descCanvas = {};
 #endif
 
     switch (windowHandle.type)
@@ -65,6 +72,15 @@ Result SurfaceImpl::init(DeviceImpl* device, WindowHandle windowHandle)
         descXlib.window = (uint64_t)windowHandle.handleValues[1];
         desc.nextInChain = (WGPUChainedStruct*)&descXlib;
         break;
+#elif SLANG_WASM
+    case WindowHandleType::WGPUCanvas:
+        descCanvas.chain.sType = WGPUSType_EmscriptenSurfaceSourceCanvasHTMLSelector;
+        {
+            const char* selector = windowHandle.canvasSelector;
+            descCanvas.selector = {selector, strlen(selector)};
+        }
+        desc.nextInChain = (WGPUChainedStruct*)&descCanvas;
+        break;
 #endif
     default:
         return SLANG_E_INVALID_HANDLE;
@@ -73,7 +89,7 @@ Result SurfaceImpl::init(DeviceImpl* device, WindowHandle windowHandle)
     m_surface = m_device->m_ctx.api.wgpuInstanceCreateSurface(m_device->m_ctx.instance, &desc);
 
     // Query capabilities
-    WGPUSurfaceCapabilities capabilities;
+    WGPUSurfaceCapabilities capabilities = {};
     m_device->m_ctx.api.wgpuSurfaceGetCapabilities(m_surface, m_device->m_ctx.adapter, &capabilities);
 
     // Get supported formats
@@ -104,10 +120,17 @@ Result SurfaceImpl::init(DeviceImpl* device, WindowHandle windowHandle)
     if (capabilities.usages & WGPUTextureUsage_RenderAttachment)
         usage |= TextureUsage::RenderTarget;
 
+#if SLANG_WASM
+    // wgpuSurfaceGetCapabilities might return 0 usages if the adapter was created
+    // without a compatible surface. Force RenderTarget as it's required for swapchains.
+    if (usage == TextureUsage::None)
+        usage = TextureUsage::RenderTarget;
+#endif
+
     m_info.preferredFormat = preferredFormat;
     m_info.formats = m_supportedFormats.data();
     m_info.formatCount = (uint32_t)m_supportedFormats.size();
-    m_info.supportedUsage = usage;
+    m_info.supportedUsage = TextureUsage::Present | usage;
 
     auto findPresentMode = [&](const WGPUPresentMode* modes, size_t modeCount) -> WGPUPresentMode
     {
@@ -131,8 +154,8 @@ Result SurfaceImpl::init(DeviceImpl* device, WindowHandle windowHandle)
         WGPUPresentMode_Fifo,
     };
     static const WGPUPresentMode kVsyncOnModes[] = {
-        WGPUPresentMode_FifoRelaxed,
         WGPUPresentMode_Fifo,
+        WGPUPresentMode_FifoRelaxed,
         WGPUPresentMode_Immediate,
         WGPUPresentMode_Mailbox,
     };
@@ -144,40 +167,51 @@ Result SurfaceImpl::init(DeviceImpl* device, WindowHandle windowHandle)
 
 Result SurfaceImpl::configure(const SurfaceConfig& config)
 {
-    setConfig(config);
-
-    if (m_config.width == 0 || m_config.height == 0)
+    SLANG_RETURN_ON_FAIL(validateConfig(config));
+    SurfaceConfig resolvedConfig = config;
+    if (resolvedConfig.format == Format::Undefined)
     {
-        return SLANG_FAIL;
+        resolvedConfig.format = m_info.preferredFormat;
     }
-    if (m_config.format == Format::Undefined)
+    if (resolvedConfig.usage == TextureUsage::None)
     {
-        m_config.format = m_info.preferredFormat;
-    }
-    if (m_config.usage == TextureUsage::None)
-    {
-        m_config.usage = m_info.supportedUsage;
+        resolvedConfig.usage = (TextureUsage::Present | TextureUsage::RenderTarget | TextureUsage::CopyDestination) &
+                               m_info.supportedUsage;
     }
 
-    // sRGB formats cannot be used as storage textures.
-    TextureUsage usage = m_config.usage;
-    if (getFormatInfo(m_config.format).isSrgb)
+    if (is_set(resolvedConfig.usage, TextureUsage::UnorderedAccess))
     {
-        usage &= ~TextureUsage::UnorderedAccess;
+        FormatSupport formatSupport = FormatSupport::None;
+        SLANG_RETURN_ON_FAIL(m_device->getFormatSupport(resolvedConfig.format, &formatSupport));
+        if (!is_set(formatSupport, FormatSupport::ShaderUavStore))
+            return SLANG_E_INVALID_ARG;
     }
+
+    WGPUTextureUsage usage = translateTextureUsage(resolvedConfig.usage);
+    // Present is an RHI surface semantic, while WebGPU requires a concrete native usage.
+    // Keep RenderAttachment as an internal implementation detail for Present-only configs.
+    if (usage == WGPUTextureUsage_None)
+        usage = WGPUTextureUsage_RenderAttachment;
 
     WGPUSurfaceConfiguration wgpuConfig = {};
     wgpuConfig.device = m_device->m_ctx.device;
-    wgpuConfig.format = translateTextureFormat(m_config.format);
-    wgpuConfig.usage = translateTextureUsage(usage);
+    wgpuConfig.format = translateTextureFormat(resolvedConfig.format);
+    wgpuConfig.usage = usage;
     // TODO: support more view formats
     wgpuConfig.viewFormatCount = 1;
     wgpuConfig.viewFormats = &wgpuConfig.format;
     wgpuConfig.alphaMode = WGPUCompositeAlphaMode_Opaque;
-    wgpuConfig.width = m_config.width;
-    wgpuConfig.height = m_config.height;
-    wgpuConfig.presentMode = m_config.vsync ? m_vsyncOnMode : m_vsyncOffMode;
+    wgpuConfig.width = resolvedConfig.width;
+    wgpuConfig.height = resolvedConfig.height;
+    wgpuConfig.presentMode = resolvedConfig.vsync ? m_vsyncOnMode : m_vsyncOffMode;
+    if (m_device->getAndClearLastUncapturedError() != WGPUErrorType_NoError)
+        m_device->printWarning("WebGPU device had reported an error before surface configuration.");
+
     m_device->m_ctx.api.wgpuSurfaceConfigure(m_surface, &wgpuConfig);
+    if (m_device->getAndClearLastUncapturedError() != WGPUErrorType_NoError)
+        return SLANG_FAIL;
+
+    setConfig(resolvedConfig);
     m_configured = true;
 
     return SLANG_OK;
@@ -207,7 +241,8 @@ Result SurfaceImpl::acquireNextImage(ITexture** outTexture)
 
     WGPUSurfaceTexture surfaceTexture;
     m_device->m_ctx.api.wgpuSurfaceGetCurrentTexture(m_surface, &surfaceTexture);
-    if (surfaceTexture.status != WGPUSurfaceGetCurrentTextureStatus_Success)
+    if (surfaceTexture.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal &&
+        surfaceTexture.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal)
     {
         return SLANG_FAIL;
     }
@@ -235,7 +270,9 @@ Result SurfaceImpl::present()
     {
         return SLANG_FAIL;
     }
+#if !SLANG_WASM
     m_device->m_ctx.api.wgpuSurfacePresent(m_surface);
+#endif
     return SLANG_OK;
 }
 

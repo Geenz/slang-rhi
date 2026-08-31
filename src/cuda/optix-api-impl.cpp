@@ -12,7 +12,15 @@
 
 #include "core/stable_vector.h"
 #include "core/string.h"
+#include "core/task-pool.h"
 #include "cooperative-vector-utils.h"
+
+#include <atomic>
+#include <memory>
+#include <span>
+
+// Set to 0 to disable parallel module compilation via the OptiX task API.
+#define SLANG_RHI_OPTIX_USE_TASK_API 1
 
 #define OPTIX_DONT_INCLUDE_CUDA
 #define OPTIX_ENABLE_SDK_MIXING
@@ -27,69 +35,39 @@
 
 namespace rhi::cuda::optix::VERSION_TAG {
 
-inline bool isOptixError(OptixResult result)
+void reportOptixError(OptixResult result, const char* call, const SourceLocation location, Device* device = nullptr)
 {
-    return result != OPTIX_SUCCESS;
-}
-
-void reportOptixError(OptixResult result, const char* call, const char* file, int line, DeviceAdapter device)
-{
-    if (!device)
-        return;
-
-    char buf[4096];
-    snprintf(
-        buf,
-        sizeof(buf),
-        "%s failed: %s (%s)\nAt %s:%d\n",
-        call,
-        optixGetErrorName(result),
-        optixGetErrorName(result),
-        file,
-        line
-    );
-    buf[sizeof(buf) - 1] = 0; // Ensure null termination
-    device->handleMessage(DebugMessageType::Error, DebugMessageSource::Driver, buf);
-}
-
-void reportOptixAssert(OptixResult result, const char* call, const char* file, int line)
-{
-    std::fprintf(
-        stderr,
-        "%s:%d: %s failed: %s (%s)\n",
-        file,
-        line,
-        call,
-        optixGetErrorString(result),
-        optixGetErrorName(result)
-    );
+    const char* errorString = optixGetErrorString(result);
+    const char* errorName = optixGetErrorName(result);
+    reportNativeCallError(device, call, result, errorName, location, errorString);
 }
 
 #define SLANG_OPTIX_RETURN_ON_FAIL(x)                                                                                  \
     {                                                                                                                  \
-        auto _res = x;                                                                                                 \
-        if (::rhi::cuda::optix::VERSION_TAG::isOptixError(_res))                                                       \
+        OptixResult _res = x;                                                                                          \
+        if (_res != OPTIX_SUCCESS)                                                                                     \
         {                                                                                                              \
             return SLANG_FAIL;                                                                                         \
         }                                                                                                              \
     }
 
+/// Pass nullptr for device to write the diagnostic to stderr.
 #define SLANG_OPTIX_RETURN_ON_FAIL_REPORT(x, device)                                                                   \
     {                                                                                                                  \
-        auto _res = x;                                                                                                 \
-        if (::rhi::cuda::optix::VERSION_TAG::isOptixError(_res))                                                       \
+        OptixResult _res = x;                                                                                          \
+        if (_res != OPTIX_SUCCESS)                                                                                     \
         {                                                                                                              \
-            ::rhi::cuda::optix::VERSION_TAG::reportOptixError(_res, #x, __FILE__, __LINE__, device);                   \
+            ::rhi::cuda::optix::VERSION_TAG::reportOptixError(_res, #x, SLANG_RHI_SOURCE_LOCATION(), device);          \
             return SLANG_FAIL;                                                                                         \
         }                                                                                                              \
     }
 
 #define SLANG_OPTIX_ASSERT_ON_FAIL(x)                                                                                  \
     {                                                                                                                  \
-        auto _res = x;                                                                                                 \
-        if (::rhi::cuda::optix::VERSION_TAG::isOptixError(_res))                                                       \
+        OptixResult _res = x;                                                                                          \
+        if (_res != OPTIX_SUCCESS)                                                                                     \
         {                                                                                                              \
-            ::rhi::cuda::optix::VERSION_TAG::reportOptixAssert(_res, #x, __FILE__, __LINE__);                          \
+            ::rhi::cuda::optix::VERSION_TAG::reportOptixError(_res, #x, SLANG_RHI_SOURCE_LOCATION());                  \
             SLANG_RHI_ASSERT_FAILURE("OptiX call failed");                                                             \
         }                                                                                                              \
     }
@@ -384,6 +362,7 @@ Result AccelerationStructureBuildDescConverter::convert(
             buildInput.customPrimitiveArray.aabbBuffers = &pointerList.back();
             buildInput.customPrimitiveArray.numPrimitives = proceduralPrimitives.primitiveCount;
             buildInput.customPrimitiveArray.strideInBytes = proceduralPrimitives.aabbStride;
+            flagList.push_back(translateGeometryFlags(proceduralPrimitives.flags));
             buildInput.customPrimitiveArray.flags = &flagList.back();
             buildInput.customPrimitiveArray.numSbtRecords = 1;
         }
@@ -575,6 +554,93 @@ public:
     ~ShaderBindingTableImpl() { SLANG_CUDA_ASSERT_ON_FAIL(cuMemFree(m_buffer)); }
 };
 
+#if SLANG_RHI_OPTIX_USE_TASK_API
+
+/// Execute a list of OptiX tasks in parallel using the global task pool.
+/// Each task may spawn additional sub-tasks which are also submitted to the pool.
+/// If any task fails, remaining sub-tasks are skipped and SLANG_FAIL is returned.
+Result executeOptixTasks(ITaskPool* taskPool, std::span<OptixTask> initialTasks)
+{
+    static constexpr unsigned int MAX_OPTIX_ADDITIONAL_TASKS = 16;
+
+    ITaskPool::TaskGroupHandle group = taskPool->createTaskGroup();
+
+    // Shared flag so tasks can detect a failure in a sibling and skip further work.
+    std::atomic<bool> failed(false);
+
+    struct OptixTaskPayload
+    {
+        OptixTask task;
+        ITaskPool* taskPool;
+        ITaskPool::TaskGroupHandle group;
+        std::atomic<bool>* failed;
+    };
+
+    // Forward declaration - the task function submits newly spawned sub-tasks.
+    static void (*executeFunc)(void*) = [](void* payload_)
+    {
+        auto* payload = static_cast<OptixTaskPayload*>(payload_);
+
+        // Skip execution if a previous task already failed.
+        if (payload->failed->load(std::memory_order_relaxed))
+            return;
+
+        OptixTask additionalTasks[MAX_OPTIX_ADDITIONAL_TASKS];
+        unsigned int numAdditionalTasks = 0;
+        OptixResult result =
+            optixTaskExecute(payload->task, additionalTasks, MAX_OPTIX_ADDITIONAL_TASKS, &numAdditionalTasks);
+
+        if (result != OPTIX_SUCCESS)
+        {
+            payload->failed->store(true, std::memory_order_relaxed);
+            return;
+        }
+
+        // Submit any spawned sub-tasks.
+        for (unsigned int i = 0; i < numAdditionalTasks; ++i)
+        {
+            auto* subPayload =
+                new OptixTaskPayload{additionalTasks[i], payload->taskPool, payload->group, payload->failed};
+            ITaskPool::TaskHandle handle = payload->taskPool->submitTask(
+                executeFunc,
+                subPayload,
+                [](void* p)
+                {
+                    delete static_cast<OptixTaskPayload*>(p);
+                },
+                payload->group
+            );
+            payload->taskPool->releaseTask(handle);
+        }
+    };
+
+    // Submit all initial tasks.
+    for (OptixTask& task : initialTasks)
+    {
+        auto* payload = new OptixTaskPayload{task, taskPool, group, &failed};
+        ITaskPool::TaskHandle handle = taskPool->submitTask(
+            executeFunc,
+            payload,
+            [](void* p)
+            {
+                delete static_cast<OptixTaskPayload*>(p);
+            },
+            group
+        );
+        taskPool->releaseTask(handle);
+    }
+
+    // Wait for all tasks (including recursively spawned sub-tasks) to complete.
+    taskPool->waitAndReleaseTaskGroup(group);
+
+    if (failed.load(std::memory_order_relaxed))
+        return SLANG_FAIL;
+
+    return SLANG_OK;
+}
+
+#endif // SLANG_RHI_OPTIX_USE_TASK_API
+
 class ContextImpl : public Context
 {
 public:
@@ -651,14 +717,67 @@ public:
         optixModuleCompileOptions.numPayloadTypes = 0;
         optixModuleCompileOptions.payloadTypes = nullptr;
 
-        // Create optix modules & program groups
-        std::vector<OptixModule> optixModules;
+        // Phase 1: Create all optix modules.
+        std::vector<OptixModule> optixModules(program->m_modules.size());
         std::map<std::string, uint32_t> moduleIndexByEntryPointName;
-        std::vector<OptixProgramGroup> optixProgramGroups;
-        std::map<std::string, uint32_t> programGroupIndexByName;
-        std::vector<uint32_t> raygenEntryPointIndices;
-        for (const auto& module : program->m_modules)
+
+#if SLANG_RHI_OPTIX_USE_TASK_API
+        // Per-module log buffers. These must stay alive until compilation is complete,
+        // as the task API continues writing to them during optixTaskExecute.
+        static constexpr size_t LOG_BUFFER_SIZE = 4096;
+        std::vector<std::array<char, LOG_BUFFER_SIZE>> logBuffers(program->m_modules.size());
+        std::vector<size_t> logSizes(program->m_modules.size(), LOG_BUFFER_SIZE);
+
         {
+            // Phase 1a: Initiate module creation with tasks.
+            std::vector<OptixTask> initialTasks;
+            for (size_t i = 0; i < program->m_modules.size(); ++i)
+            {
+                const auto& module = program->m_modules[i];
+                OptixTask task = nullptr;
+                logSizes[i] = LOG_BUFFER_SIZE;
+                SLANG_OPTIX_RETURN_ON_FAIL_REPORT(
+                    optixModuleCreateWithTasks(
+                        m_deviceContext,
+                        &optixModuleCompileOptions,
+                        &optixPipelineCompileOptions,
+                        static_cast<const char*>(module.code->getBufferPointer()),
+                        module.code->getBufferSize(),
+                        logBuffers[i].data(),
+                        &logSizes[i],
+                        &optixModules[i],
+                        &task
+                    ),
+                    m_device
+                );
+                moduleIndexByEntryPointName[module.entryPointName] = (uint32_t)i;
+                initialTasks.push_back(task);
+            }
+
+            // Phase 1b: Execute all module compilation tasks in parallel.
+            SLANG_RETURN_ON_FAIL(executeOptixTasks(globalTaskPool(), initialTasks));
+
+            // Phase 1c: Check compilation state for all modules.
+            for (size_t i = 0; i < optixModules.size(); ++i)
+            {
+                OptixModuleCompileState state = {};
+                SLANG_OPTIX_RETURN_ON_FAIL_REPORT(optixModuleGetCompilationState(optixModules[i], &state), m_device);
+                if (state != OPTIX_MODULE_COMPILE_STATE_COMPLETED)
+                {
+                    // Report compilation log for the failed module.
+                    if (logSizes[i] > 1)
+                    {
+                        m_device
+                            ->handleMessage(DebugMessageType::Error, DebugMessageSource::Driver, logBuffers[i].data());
+                    }
+                    return SLANG_FAIL;
+                }
+            }
+        }
+#else  // SLANG_RHI_OPTIX_USE_TASK_API
+        for (size_t i = 0; i < program->m_modules.size(); ++i)
+        {
+            const auto& module = program->m_modules[i];
             SLANG_OPTIX_RETURN_ON_FAIL_REPORT(
                 optixModuleCreate(
                     m_deviceContext,
@@ -668,11 +787,21 @@ public:
                     module.code->getBufferSize(),
                     nullptr,
                     0,
-                    &optixModules.emplace_back()
+                    &optixModules[i]
                 ),
                 m_device
             );
-            moduleIndexByEntryPointName[module.entryPointName] = optixModules.size() - 1;
+            moduleIndexByEntryPointName[module.entryPointName] = (uint32_t)i;
+        }
+#endif // SLANG_RHI_OPTIX_USE_TASK_API
+
+        // Phase 2: Create program groups sequentially (no task API available).
+        std::vector<OptixProgramGroup> optixProgramGroups;
+        std::map<std::string, uint32_t> programGroupIndexByName;
+        std::vector<uint32_t> raygenEntryPointIndices;
+        for (size_t i = 0; i < program->m_modules.size(); ++i)
+        {
+            const auto& module = program->m_modules[i];
 
             OptixProgramGroupDesc optixProgramGroupDesc = {};
             OptixProgramGroupOptions optixProgramGroupOptions = {};
@@ -683,7 +812,7 @@ public:
             {
             case SLANG_STAGE_RAY_GENERATION:
                 optixProgramGroupDesc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
-                optixProgramGroupDesc.raygen.module = optixModules.back();
+                optixProgramGroupDesc.raygen.module = optixModules[i];
                 entryFunctionName = "__raygen__" + module.entryPointName;
                 optixProgramGroupDesc.raygen.entryFunctionName = entryFunctionName.data();
                 // Raygen entrypoint parameters are passed via the shader binding table.
@@ -708,14 +837,14 @@ public:
                 break;
             case SLANG_STAGE_MISS:
                 optixProgramGroupDesc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
-                optixProgramGroupDesc.miss.module = optixModules.back();
+                optixProgramGroupDesc.miss.module = optixModules[i];
                 entryFunctionName = "__miss__" + module.entryPointName;
                 optixProgramGroupDesc.miss.entryFunctionName = entryFunctionName.data();
                 break;
             case SLANG_STAGE_CALLABLE:
                 optixProgramGroupDesc.kind = OPTIX_PROGRAM_GROUP_KIND_CALLABLES;
                 // TODO: support continuation callables
-                optixProgramGroupDesc.callables.moduleDC = optixModules.back();
+                optixProgramGroupDesc.callables.moduleDC = optixModules[i];
                 entryFunctionName = "__callable__" + module.entryPointName;
                 optixProgramGroupDesc.callables.entryFunctionNameDC = entryFunctionName.data();
                 break;
@@ -858,7 +987,8 @@ public:
                 startTime,
                 Timer::now(),
                 false,
-                0
+                0,
+                nullptr
             );
         }
 
@@ -1481,8 +1611,6 @@ Result createContext(const ContextDesc& desc, Context** outContext)
     returnRefPtr(outContext, context);
     return SLANG_OK;
 }
-
-uint32_t optixVersion = OPTIX_VERSION;
 
 bool initialize(IDebugCallback* debugCallback)
 {

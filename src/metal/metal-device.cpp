@@ -1,4 +1,5 @@
 #include "metal-device.h"
+#include "metal-backend.h"
 #include "../resource-desc-utils.h"
 #include "metal-bindless-descriptor-set.h"
 #include "metal-command.h"
@@ -16,63 +17,12 @@
 
 #include "core/common.h"
 
-#include <cstdio>
+#include <Foundation/NSProcessInfo.hpp>
+
+#include <cstdlib>
 #include <vector>
 
 namespace rhi::metal {
-
-inline Result getAdaptersImpl(std::vector<AdapterImpl>& outAdapters)
-{
-    AUTORELEASEPOOL
-
-    auto addAdapter = [&](MTL::Device* device)
-    {
-        AdapterInfo info = {};
-        info.deviceType = DeviceType::Metal;
-        info.adapterType = device->hasUnifiedMemory() ? AdapterType::Integrated : AdapterType::Discrete;
-        const char* name = device->name()->cString(NS::ASCIIStringEncoding);
-        string::copy_safe(info.name, sizeof(info.name), name);
-        uint64_t registryID = device->registryID();
-        memcpy(&info.luid.luid[0], &registryID, sizeof(registryID));
-
-        AdapterImpl adapter;
-        adapter.m_info = info;
-        adapter.m_device = NS::RetainPtr(device);
-        outAdapters.push_back(adapter);
-    };
-
-    NS::Array* devices = MTL::CopyAllDevices();
-    if (devices->count() > 0)
-    {
-        for (int i = 0; i < devices->count(); ++i)
-        {
-            MTL::Device* device = static_cast<MTL::Device*>(devices->object(i));
-            addAdapter(device);
-        }
-    }
-    else
-    {
-        MTL::Device* device = MTL::CreateSystemDefaultDevice();
-        addAdapter(device);
-        device->release();
-    }
-
-    // Make the first adapter the default one.
-    if (!outAdapters.empty())
-    {
-        outAdapters[0].m_isDefault = true;
-    }
-
-    return SLANG_OK;
-}
-
-std::vector<AdapterImpl>& getAdapters()
-{
-    static std::vector<AdapterImpl> adapters;
-    static Result initResult = getAdaptersImpl(adapters);
-    SLANG_UNUSED(initResult);
-    return adapters;
-}
 
 DeviceImpl::DeviceImpl() {}
 
@@ -91,6 +41,11 @@ DeviceImpl::~DeviceImpl()
     {
         m_queue->shutdown();
         m_queue.setNull();
+    }
+
+    if (m_commandQueue && m_residencySet)
+    {
+        m_commandQueue->removeResidencySet(m_residencySet.get());
     }
 
     m_indirectEngine.release();
@@ -113,14 +68,14 @@ Result DeviceImpl::getNativeDeviceHandles(DeviceNativeHandles* outHandles)
     return SLANG_OK;
 }
 
-Result DeviceImpl::initialize(const DeviceDesc& desc)
+Result DeviceImpl::initialize(const DeviceDesc& desc, BackendImpl* backend)
 {
     AUTORELEASEPOOL
 
     SLANG_RETURN_ON_FAIL(Device::initialize(desc));
 
-    AdapterImpl* adapter = nullptr;
-    selectAdapter(this, getAdapters(), desc, adapter);
+    const AdapterImpl* adapter = nullptr;
+    SLANG_RETURN_ON_FAIL(selectAdapter(this, backend->getAdapters(), desc, adapter));
     m_device = adapter->m_device;
     if (!m_device)
     {
@@ -133,6 +88,69 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     {
         return SLANG_FAIL;
     }
+
+    // Gate on Argument Buffers Tier 2 - the actual functional requirement
+    // for gpuAddress() and bindless argument buffer access.
+    if (m_device->argumentBuffersSupport() < MTL::ArgumentBuffersTier2)
+    {
+        handleMessage(
+            DebugMessageType::Error,
+            DebugMessageSource::Driver,
+            "Metal backend requires Argument Buffers Tier 2"
+        );
+        return SLANG_FAIL;
+    }
+
+    if (!m_device->hasUnifiedMemory())
+    {
+        handleMessage(
+            DebugMessageType::Warning,
+            DebugMessageSource::Driver,
+            "Non-UMA device detected; shared texture support may be limited"
+        );
+    }
+
+    // Try residency set (requires GPUFamilyApple6 + runtime support).
+    // Environment variable to force fallback path for testing.
+    {
+        bool forceUseResourceFallback = std::getenv("SLANG_RHI_METAL_NO_RESIDENCY_SET") != nullptr;
+        if (forceUseResourceFallback)
+        {
+            handleMessage(
+                DebugMessageType::Info,
+                DebugMessageSource::Driver,
+                "SLANG_RHI_METAL_NO_RESIDENCY_SET set; using per-encoder useResource fallback"
+            );
+        }
+        else if (m_device->supportsFamily(MTL::GPUFamilyApple6))
+        {
+            NS::Error* error = nullptr;
+            auto rsDesc = NS::TransferPtr(MTL::ResidencySetDescriptor::alloc()->init());
+            m_residencySet = NS::TransferPtr(m_device->newResidencySet(rsDesc.get(), &error));
+            if (m_residencySet)
+            {
+                m_commandQueue->addResidencySet(m_residencySet.get());
+                m_hasResidencySet = true;
+            }
+            else
+            {
+                handleMessage(
+                    DebugMessageType::Warning,
+                    DebugMessageSource::Driver,
+                    "MTLResidencySet creation failed; using per-encoder useResource fallback"
+                );
+            }
+        }
+        else
+        {
+            handleMessage(
+                DebugMessageType::Info,
+                DebugMessageSource::Driver,
+                "GPUFamilyApple6 not supported; using per-encoder useResource fallback"
+            );
+        }
+    }
+
     m_queue = new CommandQueueImpl(this, QueueType::Graphics);
     m_queue->init(m_commandQueue);
     m_queue->setInternalReferenceCount(1);
@@ -174,11 +192,9 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     {
         m_info.deviceType = DeviceType::Metal;
         m_info.apiName = "Metal";
-        m_info.adapterName = "default";
-        m_info.adapterLUID = {};
-        // Apple Silicon uses a unified CPU/GPU timebase measured in
-        // nanoseconds; `MTLCounterSampleBuffer` resolved timestamps
-        // are therefore already in ns. Frequency = 1e9 ticks/second.
+        m_info.adapterName = adapter->m_info.name;
+        m_info.adapterLUID = adapter->m_info.luid;
+        // MTLCounterSampleBuffer timestamps resolve in nanoseconds.
         m_info.timestampFrequency = 1'000'000'000ull;
 
         // TODO: Most limits cannot be queried through the Metal API but are described in
@@ -244,6 +260,7 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     if (m_device->supportsRaytracing())
     {
         addFeature(Feature::AccelerationStructure);
+        addFeature(Feature::RayQuery);
     }
     if (m_hasArgumentBufferTier2)
     {
@@ -261,8 +278,28 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
     {
         addFeature(Feature::RasterizerOrderedViews);
     }
+    if (m_hasResidencySet)
+    {
+        addFeature(Feature::ResidencySet);
+    }
 
     addCapability(Capability::metal);
+    const auto osVersion = NS::ProcessInfo::processInfo()->operatingSystemVersion();
+    if (osVersion.majorVersion >= 11)
+        addCapability(Capability::metallib_2_3);
+    if (osVersion.majorVersion >= 12)
+        addCapability(Capability::metallib_2_4);
+    if (osVersion.majorVersion >= 13)
+        addCapability(Capability::metallib_3_0);
+    if (osVersion.majorVersion >= 14)
+        addCapability(Capability::metallib_3_1);
+    if (osVersion.majorVersion >= 15)
+        addCapability(Capability::metallib_3_2);
+    // TODO: Re-enable once Slang passes -std=metal4.0 to the downstream Metal compiler.
+    // Slang 2026.12.2 emits Metal 4.0-only attributes when this capability is enabled.
+    // https://github.com/shader-slang/slang/issues/12325
+    // if (osVersion.majorVersion >= 26)
+    //     addCapability(Capability::metallib_4_0);
 
     auto supportsAnyGPUFamilyInRange = [&](MTL::GPUFamily first, MTL::GPUFamily last)
     {
@@ -362,6 +399,8 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
         SLANG_RETURN_ON_FAIL(m_bindlessDescriptorSet->initialize());
     }
 
+    SLANG_RETURN_ON_FAIL(checkRequiredFeatures(desc));
+
     return SLANG_OK;
 }
 
@@ -387,19 +426,22 @@ Result DeviceImpl::readBuffer(IBuffer* buffer, Offset offset, Size size, void* o
         return SLANG_FAIL;
     }
 
-    // create staging buffer
-    NS::SharedPtr<MTL::Buffer> stagingBuffer =
-        NS::TransferPtr(m_device->newBuffer(size, stagingStorageMode(m_hasUnifiedMemory)));
+    auto stagingOpts = makeResourceOptions(MTL::ResourceStorageModeShared);
+    NS::SharedPtr<MTL::Buffer> stagingBuffer = NS::TransferPtr(m_device->newBuffer(size, stagingOpts));
     if (!stagingBuffer)
     {
         return SLANG_FAIL;
     }
 
     MTL::CommandBuffer* commandBuffer = m_commandQueue->commandBuffer();
+    if (!commandBuffer)
+        return SLANG_FAIL;
     MTL::BlitCommandEncoder* blitEncoder = commandBuffer->blitCommandEncoder();
+    if (!blitEncoder)
+        return SLANG_FAIL;
+    blitEncoder->waitForFence(m_queue->m_queueFence.get());
     blitEncoder->copyFromBuffer(bufferImpl->m_buffer.get(), offset, stagingBuffer.get(), 0, size);
-    if (!m_hasUnifiedMemory)
-        blitEncoder->synchronizeResource(stagingBuffer.get());
+    blitEncoder->updateFence(m_queue->m_queueFence.get());
     blitEncoder->endEncoding();
     commandBuffer->commit();
     commandBuffer->waitUntilCompleted();
@@ -426,9 +468,45 @@ Result DeviceImpl::getAccelerationStructureSizes(
     return SLANG_OK;
 }
 
+uint32_t DeviceImpl::registerAccelerationStructure(MTL::AccelerationStructure* accelerationStructure)
+{
+    SLANG_RHI_ASSERT(accelerationStructure);
+
+    uint32_t index = 0;
+    if (!m_accelerationStructures.freeList.empty())
+    {
+        index = m_accelerationStructures.freeList.back();
+        m_accelerationStructures.freeList.pop_back();
+        m_accelerationStructures.list[index] = accelerationStructure;
+    }
+    else
+    {
+        index = uint32_t(m_accelerationStructures.list.size());
+        m_accelerationStructures.list.push_back(accelerationStructure);
+    }
+
+    m_accelerationStructures.arrayDirty = true;
+    m_accelerationStructures.resourcesDirty = true;
+
+    return index;
+}
+
+void DeviceImpl::unregisterAccelerationStructure(uint32_t index, MTL::AccelerationStructure* accelerationStructure)
+{
+    SLANG_RHI_ASSERT(accelerationStructure);
+    SLANG_RHI_ASSERT(index < m_accelerationStructures.list.size());
+    SLANG_RHI_ASSERT(m_accelerationStructures.list[index] == accelerationStructure);
+
+    m_accelerationStructures.freeList.push_back(index);
+    m_accelerationStructures.list[index] = nullptr;
+
+    m_accelerationStructures.arrayDirty = true;
+    m_accelerationStructures.resourcesDirty = true;
+}
+
 NS::Array* DeviceImpl::getAccelerationStructureArray()
 {
-    if (m_accelerationStructures.dirty)
+    if (m_accelerationStructures.arrayDirty)
     {
         m_accelerationStructures.array = NS::TransferPtr(
             NS::Array::alloc()->init(
@@ -436,9 +514,27 @@ NS::Array* DeviceImpl::getAccelerationStructureArray()
                 m_accelerationStructures.list.size()
             )
         );
-        m_accelerationStructures.dirty = false;
+        m_accelerationStructures.arrayDirty = false;
     }
     return m_accelerationStructures.array.get();
+}
+
+std::span<MTL::Resource* const> DeviceImpl::getAccelerationStructureResources()
+{
+    if (m_accelerationStructures.resourcesDirty)
+    {
+        m_accelerationStructures.resources.clear();
+        for (auto* as : m_accelerationStructures.list)
+        {
+            if (as)
+                m_accelerationStructures.resources.push_back(as);
+        }
+        m_accelerationStructures.resourcesDirty = false;
+    }
+    return std::span<MTL::Resource* const>(
+        m_accelerationStructures.resources.data(),
+        m_accelerationStructures.resources.size()
+    );
 }
 
 Result DeviceImpl::getTextureAllocationInfo(const TextureDesc& desc_, Size* outSize, Size* outAlignment)
@@ -556,22 +652,47 @@ Result DeviceImpl::createQueryPool(const QueryPoolDesc& desc, IQueryPool** outPo
     return SLANG_OK;
 }
 
+void DeviceImpl::registerResource(MTL::Resource* resource)
+{
+    SLANG_RHI_ASSERT(resource);
+    if (m_hasResidencySet)
+    {
+        std::lock_guard<std::mutex> lock(m_residencySetMutex);
+        uint32_t& refCount = m_residencySetResourceRefCounts[resource];
+        if (refCount == 0)
+        {
+            m_residencySet->addAllocation(resource);
+            m_residencySetDirty = true;
+        }
+        refCount++;
+    }
+}
+
+void DeviceImpl::unregisterResource(MTL::Resource* resource)
+{
+    SLANG_RHI_ASSERT(resource);
+    if (m_hasResidencySet)
+    {
+        std::lock_guard<std::mutex> lock(m_residencySetMutex);
+        auto it = m_residencySetResourceRefCounts.find(resource);
+        SLANG_RHI_ASSERT(it != m_residencySetResourceRefCounts.end());
+        if (it == m_residencySetResourceRefCounts.end())
+        {
+            return;
+        }
+
+        SLANG_RHI_ASSERT(it->second > 0);
+        if (it->second <= 1)
+        {
+            m_residencySet->removeAllocation(resource);
+            m_residencySetResourceRefCounts.erase(it);
+            m_residencySetDirty = true;
+        }
+        else
+        {
+            it->second--;
+        }
+    }
+}
+
 } // namespace rhi::metal
-
-namespace rhi {
-
-IAdapter* getMetalAdapter(uint32_t index)
-{
-    std::vector<metal::AdapterImpl>& adapters = metal::getAdapters();
-    return index < adapters.size() ? &adapters[index] : nullptr;
-}
-
-Result SLANG_MCALL createMetalDevice(const DeviceDesc* desc, IDevice** outDevice)
-{
-    RefPtr<metal::DeviceImpl> result = new metal::DeviceImpl();
-    SLANG_RETURN_ON_FAIL(result->initialize(*desc));
-    returnComPtr(outDevice, result);
-    return SLANG_OK;
-}
-
-} // namespace rhi

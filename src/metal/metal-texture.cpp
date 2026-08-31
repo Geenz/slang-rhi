@@ -1,5 +1,7 @@
 #include "metal-texture.h"
 #include "metal-bindless-descriptor-set.h"
+#include "metal-buffer.h"
+#include "metal-command.h"
 #include "metal-device.h"
 #include "metal-utils.h"
 
@@ -13,6 +15,10 @@ TextureImpl::TextureImpl(Device* device, const TextureDesc& desc)
 TextureImpl::~TextureImpl()
 {
     m_defaultView.setNull();
+    if (m_texture && !m_isSwapchainTexture)
+    {
+        getDevice<DeviceImpl>()->unregisterResource(m_texture.get());
+    }
 }
 
 void TextureImpl::deleteThis()
@@ -164,11 +170,11 @@ Result DeviceImpl::createTexture(const TextureDesc& desc_, const SubresourceData
     }
 
     textureDesc->setUsage(textureUsage);
-    // Atomic-access textures must use the plain (uncompressed) layout; Metal
-    // silently drops atomic writes on a GPU-optimized/lossless-compressed
-    // texture, so disable optimized contents whenever atomics are requested.
-    textureDesc->setAllowGPUOptimizedContents(desc.memoryType == MemoryType::DeviceLocal &&
-                                              !wantsAtomic);
+    // Metal silently drops atomic writes on GPU-optimized (lossless-compressed)
+    // textures, so keep atomic-capable textures linear.
+    textureDesc->setAllowGPUOptimizedContents(desc.memoryType == MemoryType::DeviceLocal && !wantsAtomic);
+    SLANG_RHI_ASSERT(textureDesc->storageMode() != MTL::StorageModeManaged);
+    textureDesc->setHazardTrackingMode(MTL::HazardTrackingModeUntracked);
 
     textureImpl->m_texture = NS::TransferPtr(m_device->newTexture(textureDesc.get()));
     if (!textureImpl->m_texture)
@@ -178,6 +184,8 @@ Result DeviceImpl::createTexture(const TextureDesc& desc_, const SubresourceData
     textureImpl->m_textureType = textureDesc->textureType();
     textureImpl->m_pixelFormat = textureDesc->pixelFormat();
 
+    registerResource(textureImpl->m_texture.get());
+
     if (desc.label)
     {
         textureImpl->m_texture->setLabel(createString(desc.label).get());
@@ -185,16 +193,20 @@ Result DeviceImpl::createTexture(const TextureDesc& desc_, const SubresourceData
 
     if (initData)
     {
-        textureDesc->setStorageMode(stagingTextureMode(m_hasUnifiedMemory));
+        // Staging texture: shared mode, on UMA replaceRegion writes are immediately coherent.
+        textureDesc->setStorageMode(MTL::StorageModeShared);
         textureDesc->setCpuCacheMode(MTL::CPUCacheModeDefaultCache);
+        textureDesc->setHazardTrackingMode(MTL::HazardTrackingModeUntracked);
         NS::SharedPtr<MTL::Texture> stagingTexture = NS::TransferPtr(m_device->newTexture(textureDesc.get()));
 
-        MTL::CommandBuffer* commandBuffer = m_commandQueue->commandBuffer();
-        MTL::BlitCommandEncoder* encoder = commandBuffer->blitCommandEncoder();
-        if (!stagingTexture || !commandBuffer || !encoder)
-        {
+        if (!stagingTexture)
             return SLANG_FAIL;
-        }
+        MTL::CommandBuffer* commandBuffer = m_commandQueue->commandBuffer();
+        if (!commandBuffer)
+            return SLANG_FAIL;
+        MTL::BlitCommandEncoder* encoder = commandBuffer->blitCommandEncoder();
+        if (!encoder)
+            return SLANG_FAIL;
 
         uint32_t sliceCount = desc.getLayerCount();
 
@@ -216,18 +228,59 @@ Result DeviceImpl::createTexture(const TextureDesc& desc_, const SubresourceData
                     subresourceData.rowPitch,
                     subresourceData.slicePitch
                 );
-                if (!m_hasUnifiedMemory)
-                    encoder->synchronizeTexture(stagingTexture.get(), slice, level);
                 region.size.width = region.size.width > 0 ? max(1ul, region.size.width >> 1) : 0;
                 region.size.height = region.size.height > 0 ? max(1ul, region.size.height >> 1) : 0;
                 region.size.depth = region.size.depth > 0 ? max(1ul, region.size.depth >> 1) : 0;
             }
         }
 
+        encoder->waitForFence(m_queue->m_queueFence.get());
         encoder->copyFromTexture(stagingTexture.get(), textureImpl->m_texture.get());
+        encoder->updateFence(m_queue->m_queueFence.get());
         encoder->endEncoding();
         commandBuffer->commit();
         commandBuffer->waitUntilCompleted();
+    }
+
+    returnComPtr(outTexture, textureImpl);
+    return SLANG_OK;
+}
+
+Result DeviceImpl::createTextureFromNativeHandle(NativeHandle handle, const TextureDesc& desc_, ITexture** outTexture)
+{
+    AUTORELEASEPOOL
+
+    if (handle.type != NativeHandleType::MTLTexture || handle.value == 0)
+    {
+        *outTexture = nullptr;
+        return SLANG_E_INVALID_HANDLE;
+    }
+
+    MTL::Texture* nativeTexture = reinterpret_cast<MTL::Texture*>(handle.value);
+
+    TextureDesc desc = fixupTextureDesc(desc_);
+    const MTL::TextureType nativeTextureType = nativeTexture->textureType();
+    const MTL::PixelFormat nativePixelFormat = nativeTexture->pixelFormat();
+    const MTL::PixelFormat descPixelFormat = translatePixelFormat(desc.format);
+    if (descPixelFormat == MTL::PixelFormatInvalid || translateTextureType(desc.type) != nativeTextureType ||
+        descPixelFormat != nativePixelFormat || desc.size.width != nativeTexture->width() ||
+        desc.size.height != nativeTexture->height() || desc.size.depth != nativeTexture->depth() ||
+        desc.mipCount != nativeTexture->mipmapLevelCount() || desc.arrayLength != nativeTexture->arrayLength() ||
+        desc.sampleCount != nativeTexture->sampleCount())
+    {
+        return SLANG_E_INVALID_ARG;
+    }
+
+    RefPtr<TextureImpl> textureImpl(new TextureImpl(this, desc));
+    textureImpl->m_texture = NS::RetainPtr(nativeTexture);
+    textureImpl->m_textureType = nativeTextureType;
+    textureImpl->m_pixelFormat = nativePixelFormat;
+
+    registerResource(textureImpl->m_texture.get());
+
+    if (desc.label)
+    {
+        textureImpl->m_texture->setLabel(createString(desc.label).get());
     }
 
     returnComPtr(outTexture, textureImpl);

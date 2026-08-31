@@ -2,7 +2,7 @@
 
 #include "d3d12-base.h"
 #include "d3d12-shader-object.h"
-#include "d3d12-constant-buffer-pool.h"
+#include "../transient-buffer-heap.h"
 
 #include "core/ring-queue.h"
 
@@ -66,6 +66,7 @@ public:
     virtual SLANG_NO_THROW Result SLANG_MCALL submit(const SubmitDesc& desc) override;
     virtual SLANG_NO_THROW Result SLANG_MCALL waitOnHost() override;
     virtual SLANG_NO_THROW Result SLANG_MCALL getNativeHandle(NativeHandle* outHandle) override;
+    virtual SLANG_NO_THROW Result SLANG_MCALL getTimestampCalibration(TimestampCalibration* outCalibration) override;
 };
 
 class CommandEncoderImpl : public CommandEncoder
@@ -97,7 +98,7 @@ public:
     ComPtr<ID3D12GraphicsCommandList> m_d3dCommandList;
     GPUDescriptorArena m_cbvSrvUavArena;
     GPUDescriptorArena m_samplerArena;
-    ConstantBufferPool m_constantBufferPool;
+    TransientBufferArena m_constantBufferArena;
     BindingCache m_bindingCache;
     uint64_t m_submissionID = 0;
 

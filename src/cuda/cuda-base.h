@@ -14,6 +14,9 @@
 
 namespace rhi::cuda {
 
+static constexpr uint64_t kInvalidTimestampAnchorGeneration = uint64_t(-1);
+
+class BackendImpl;
 class AdapterImpl;
 class BufferImpl;
 class TextureImpl;

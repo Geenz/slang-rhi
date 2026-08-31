@@ -7,6 +7,52 @@
 
 namespace rhi::debug {
 
+namespace {
+
+bool isAccelerationStructureQueryType(QueryType queryType)
+{
+    return queryType == QueryType::AccelerationStructureCompactedSize ||
+           queryType == QueryType::AccelerationStructureCurrentSize;
+}
+
+bool validateAccelerationStructureQueryDescs(
+    DebugContext* ctx,
+    uint32_t queryCount,
+    const AccelerationStructureQueryDesc* queryDescs,
+    uint32_t resultCount
+)
+{
+    for (uint32_t i = 0; i < queryCount; ++i)
+    {
+        const AccelerationStructureQueryDesc& queryDesc = queryDescs[i];
+        if (!queryDesc.queryPool)
+        {
+            RHI_VALIDATION_ERROR_FORMAT("'queryDescs[%u].queryPool' must not be null.", i);
+            return false;
+        }
+        if (!isAccelerationStructureQueryType(queryDesc.queryType))
+        {
+            RHI_VALIDATION_ERROR_FORMAT("'queryDescs[%u].queryType' is not valid for acceleration structures.", i);
+            return false;
+        }
+
+        const QueryPoolDesc& queryPoolDesc = queryDesc.queryPool->getDesc();
+        if (queryPoolDesc.type != queryDesc.queryType)
+        {
+            RHI_VALIDATION_ERROR_FORMAT("'queryDescs[%u].queryPool' type must match 'queryType'.", i);
+            return false;
+        }
+        if (resultCount > 0 && !isValidSubrange(queryDesc.firstQueryIndex, resultCount, queryPoolDesc.count))
+        {
+            RHI_VALIDATION_ERROR_FORMAT("'queryDescs[%u]' query range exceeds the query pool size.", i);
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 // ----------------------------------------------------------------------------
 // DebugRenderPassEncoder
 // ----------------------------------------------------------------------------
@@ -872,7 +918,7 @@ void DebugCommandEncoder::copyBuffer(IBuffer* dst, Offset dstOffset, IBuffer* sr
     }
     if (dst == src)
     {
-        // Check for overlapping ranges — overlapping same-buffer copies are undefined behavior
+        // Check for overlapping ranges - overlapping same-buffer copies are undefined behavior
         // on all major APIs (D3D12, Vulkan, Metal), so skip the call to avoid driver errors.
         if (srcOffset < dstOffset + size && dstOffset < srcOffset + size)
         {
@@ -1546,6 +1592,10 @@ void DebugCommandEncoder::buildAccelerationStructure(
             return;
         }
     }
+    if (!validateAccelerationStructureQueryDescs(ctx, propertyQueryCount, queryDescs, 1))
+    {
+        return;
+    }
 
     std::vector<AccelerationStructureQueryDesc> innerQueryDescs;
     for (uint32_t i = 0; i < propertyQueryCount; ++i)
@@ -1612,6 +1662,10 @@ void DebugCommandEncoder::queryAccelerationStructureProperties(
         RHI_VALIDATION_ERROR("'queryDescs' must not be null when 'queryCount' > 0.");
         return;
     }
+    if (!validateAccelerationStructureQueryDescs(ctx, queryCount, queryDescs, accelerationStructureCount))
+    {
+        return;
+    }
 
     std::vector<AccelerationStructureQueryDesc> innerQueryDescs;
     for (uint32_t i = 0; i < queryCount; ++i)
@@ -1629,48 +1683,6 @@ void DebugCommandEncoder::queryAccelerationStructureProperties(
         queryCount,
         innerQueryDescs.data()
     );
-}
-
-void DebugCommandEncoder::serializeAccelerationStructure(BufferOffsetPair dst, IAccelerationStructure* src)
-{
-    SLANG_RHI_DEBUG_API(ICommandEncoder, serializeAccelerationStructure);
-
-    requireOpen();
-    requireNoPass();
-
-    if (!src)
-    {
-        RHI_VALIDATION_ERROR("'src' must not be null.");
-        return;
-    }
-    if (!dst.buffer)
-    {
-        RHI_VALIDATION_ERROR("'dst.buffer' must not be null.");
-        return;
-    }
-
-    baseObject->serializeAccelerationStructure(dst, src);
-}
-
-void DebugCommandEncoder::deserializeAccelerationStructure(IAccelerationStructure* dst, BufferOffsetPair src)
-{
-    SLANG_RHI_DEBUG_API(ICommandEncoder, deserializeAccelerationStructure);
-
-    requireOpen();
-    requireNoPass();
-
-    if (!dst)
-    {
-        RHI_VALIDATION_ERROR("'dst' must not be null.");
-        return;
-    }
-    if (!src.buffer)
-    {
-        RHI_VALIDATION_ERROR("'src.buffer' must not be null.");
-        return;
-    }
-
-    baseObject->deserializeAccelerationStructure(dst, src);
 }
 
 void DebugCommandEncoder::executeClusterOperation(const ClusterOperationDesc& desc)
@@ -1906,6 +1918,37 @@ void DebugCommandEncoder::writeTimestamp(IQueryPool* pool, uint32_t index)
     }
 
     baseObject->writeTimestamp(getInnerObj(pool), index);
+}
+
+void DebugCommandEncoder::executeCallback(const ExecuteCallbackDesc& desc)
+{
+    SLANG_RHI_DEBUG_API(ICommandEncoder, executeCallback);
+
+    requireOpen();
+    requireNoPass();
+
+    if (!desc.callback)
+    {
+        RHI_VALIDATION_ERROR("'callback' must not be null.");
+        return;
+    }
+    if (desc.userDataSize > 0 && !desc.userData)
+    {
+        RHI_VALIDATION_ERROR("'userData' must not be null when 'userDataSize' is non-zero.");
+        return;
+    }
+    if (desc.userData && desc.userDataSize == 0)
+    {
+        RHI_VALIDATION_ERROR("'userDataSize' must be non-zero when 'userData' is set.");
+        return;
+    }
+    if (desc.userObject && (desc.retainUserObject == nullptr || desc.releaseUserObject == nullptr))
+    {
+        RHI_VALIDATION_ERROR("'retainUserObject' and 'releaseUserObject' are required when 'userObject' is set.");
+        return;
+    }
+
+    baseObject->executeCallback(desc);
 }
 
 Result DebugCommandEncoder::finish(const CommandBufferDesc& desc, ICommandBuffer** outCommandBuffer)

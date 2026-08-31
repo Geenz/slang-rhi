@@ -27,7 +27,8 @@ public:
 
 public:
     NS::SharedPtr<MTL::Buffer> m_buffer;
-    CpuAccessMode m_lastCpuAccessMode;
+    DeviceAddress m_deviceAddress = 0;
+    BufferImpl* m_nextAtSameAddr = nullptr;
     DescriptorHandle m_descriptorHandle[2] = {}; // [0]=Read, [1]=ReadWrite
 };
 

@@ -10,7 +10,6 @@
 
 #include "core/deferred.h"
 
-
 namespace rhi::wgpu {
 
 template<typename T>
@@ -83,8 +82,6 @@ public:
     void cmdBuildAccelerationStructure(const commands::BuildAccelerationStructure& cmd);
     void cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd);
     void cmdQueryAccelerationStructureProperties(const commands::QueryAccelerationStructureProperties& cmd);
-    void cmdSerializeAccelerationStructure(const commands::SerializeAccelerationStructure& cmd);
-    void cmdDeserializeAccelerationStructure(const commands::DeserializeAccelerationStructure& cmd);
     void cmdExecuteClusterOperation(const commands::ExecuteClusterOperation& cmd);
     void cmdConvertCooperativeVectorMatrix(const commands::ConvertCooperativeVectorMatrix& cmd);
     void cmdSetBufferState(const commands::SetBufferState& cmd);
@@ -696,6 +693,7 @@ void CommandRecorder::cmdDrawIndirect(const commands::DrawIndirect& cmd)
     if (!m_renderStateValid)
         return;
 
+#if !SLANG_WASM
     m_ctx.api.wgpuRenderPassEncoderMultiDrawIndirect(
         m_renderPassEncoder,
         checked_cast<BufferImpl*>(cmd.argBuffer.buffer)->m_buffer,
@@ -704,6 +702,10 @@ void CommandRecorder::cmdDrawIndirect(const commands::DrawIndirect& cmd)
         cmd.countBuffer ? checked_cast<BufferImpl*>(cmd.countBuffer.buffer)->m_buffer : nullptr,
         cmd.countBuffer.offset
     );
+#else
+    SLANG_UNUSED(cmd);
+    NOT_SUPPORTED(IRenderPassEncoder, drawIndirect);
+#endif
 }
 
 void CommandRecorder::cmdDrawIndexedIndirect(const commands::DrawIndexedIndirect& cmd)
@@ -711,6 +713,7 @@ void CommandRecorder::cmdDrawIndexedIndirect(const commands::DrawIndexedIndirect
     if (!m_renderStateValid)
         return;
 
+#if !SLANG_WASM
     m_ctx.api.wgpuRenderPassEncoderMultiDrawIndexedIndirect(
         m_renderPassEncoder,
         checked_cast<BufferImpl*>(cmd.argBuffer.buffer)->m_buffer,
@@ -719,6 +722,10 @@ void CommandRecorder::cmdDrawIndexedIndirect(const commands::DrawIndexedIndirect
         cmd.countBuffer ? checked_cast<BufferImpl*>(cmd.countBuffer.buffer)->m_buffer : nullptr,
         cmd.countBuffer.offset
     );
+#else
+    SLANG_UNUSED(cmd);
+    NOT_SUPPORTED(IRenderPassEncoder, drawIndexedIndirect);
+#endif
 }
 
 void CommandRecorder::cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd)
@@ -840,18 +847,6 @@ void CommandRecorder::cmdQueryAccelerationStructureProperties(const commands::Qu
     NOT_SUPPORTED(ICommandEncoder, queryAccelerationStructureProperties);
 }
 
-void CommandRecorder::cmdSerializeAccelerationStructure(const commands::SerializeAccelerationStructure& cmd)
-{
-    SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(ICommandEncoder, serializeAccelerationStructure);
-}
-
-void CommandRecorder::cmdDeserializeAccelerationStructure(const commands::DeserializeAccelerationStructure& cmd)
-{
-    SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(ICommandEncoder, deserializeAccelerationStructure);
-}
-
 void CommandRecorder::cmdExecuteClusterOperation(const commands::ExecuteClusterOperation& cmd)
 {
     SLANG_UNUSED(cmd);
@@ -935,7 +930,11 @@ void CommandRecorder::cmdWriteTimestamp(const commands::WriteTimestamp& cmd)
 
 void CommandRecorder::cmdExecuteCallback(const commands::ExecuteCallback& cmd)
 {
-    cmd.callback(cmd.userData);
+    NativeHandle nativeHandle{
+        NativeHandleType::WGPUCommandEncoder,
+        reinterpret_cast<uint64_t>(m_commandEncoder),
+    };
+    invokeExecuteCallback(cmd, nativeHandle);
 }
 
 void CommandRecorder::endPassEncoder()
@@ -1030,17 +1029,17 @@ Result CommandQueueImpl::waitOnHost()
         WGPUQueueWorkDoneStatus status = WGPUQueueWorkDoneStatus(0);
         WGPUQueueWorkDoneCallbackInfo callbackInfo = {};
         callbackInfo.mode = WGPUCallbackMode_WaitAnyOnly;
+#if !SLANG_WASM
         callbackInfo.callback = [](WGPUQueueWorkDoneStatus status_, void* userdata1, void* userdata2)
+#else
+        callbackInfo.callback = [](WGPUQueueWorkDoneStatus status_, WGPUStringView, void* userdata1, void* userdata2)
+#endif
         {
             *(WGPUQueueWorkDoneStatus*)userdata1 = status_;
         };
         callbackInfo.userdata1 = &status;
         WGPUFuture future = device->m_ctx.api.wgpuQueueOnSubmittedWorkDone(m_queue, callbackInfo);
-        constexpr size_t futureCount = 1;
-        WGPUFutureWaitInfo futures[futureCount] = {{future}};
-        uint64_t timeoutNS = UINT64_MAX;
-        WGPUWaitStatus waitStatus =
-            device->m_ctx.api.wgpuInstanceWaitAny(device->m_ctx.instance, futureCount, futures, timeoutNS);
+        WGPUWaitStatus waitStatus = wgpu::wait(device->m_ctx, future);
         if (waitStatus != WGPUWaitStatus_Success || status != WGPUQueueWorkDoneStatus_Success)
         {
             return SLANG_FAIL;

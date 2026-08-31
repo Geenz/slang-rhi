@@ -20,8 +20,9 @@ inline WGPUTextureViewDimension getViewDimension(SlangResourceShape shape)
     case SLANG_TEXTURE_3D:
         return WGPUTextureViewDimension_3D;
     default:
-        return WGPUTextureViewDimension_Undefined;
+        break;
     }
+    return WGPUTextureViewDimension_Undefined;
 }
 
 inline WGPUTextureSampleType getSampleType(slang::TypeReflection* type)
@@ -52,6 +53,8 @@ inline WGPUTextureSampleType getSampleType(slang::TypeReflection* type)
     case slang::TypeReflection::ScalarType::Float32:
     case slang::TypeReflection::ScalarType::Float64:
         return WGPUTextureSampleType_Float;
+    default:
+        break;
     }
     return WGPUTextureSampleType_Undefined;
 }
@@ -406,8 +409,13 @@ void ShaderObjectLayoutImpl::Builder::addBindingRanges(slang::TypeLayoutReflecti
         {
         default:
         {
-            auto varLayout = slangLeafTypeLayout->getElementVarLayout();
-            auto subTypeLayout = varLayout->getTypeLayout();
+            // Parameter groups expose the relative element layout through their element
+            // variable. Other containers, such as structured buffers, only expose an
+            // element type layout.
+            auto subTypeLayout = slangLeafTypeLayout->getElementTypeLayout();
+            if (auto elementVarLayout = slangLeafTypeLayout->getElementVarLayout())
+                subTypeLayout = elementVarLayout->getTypeLayout();
+            SLANG_RHI_ASSERT(subTypeLayout);
             ShaderObjectLayoutImpl::createForElementType(
                 m_device,
                 m_session,

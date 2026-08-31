@@ -5,11 +5,13 @@
 #include "cpu-shader-program.h"
 #include "cpu-texture.h"
 
+#include "core/platform.h"
+
 namespace rhi::cpu {
 
 DeviceImpl::~DeviceImpl() {}
 
-Result DeviceImpl::initialize(const DeviceDesc& desc)
+Result DeviceImpl::initialize(const DeviceDesc& desc, BackendImpl* backend)
 {
     SLANG_RETURN_ON_FAIL(Device::initialize(desc));
 
@@ -19,13 +21,14 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
         m_info.apiName = "CPU";
         m_info.adapterName = "CPU";
         m_info.adapterLUID = {};
-        m_info.timestampFrequency = 1000000000;
+        m_info.timestampFrequency = getCpuTimestampFrequency();
     }
 
     // Initialize features & capabilities
     addFeature(Feature::SoftwareDevice);
     addFeature(Feature::ParameterBlock);
     addFeature(Feature::TimestampQuery);
+    addFeature(Feature::TimestampCalibration);
     addFeature(Feature::Pointer);
 
     addCapability(Capability::cpp);
@@ -60,6 +63,8 @@ Result DeviceImpl::initialize(const DeviceDesc& desc)
 
     m_queue = new CommandQueueImpl(this, QueueType::Graphics);
     m_queue->setInternalReferenceCount(1);
+
+    SLANG_RETURN_ON_FAIL(checkRequiredFeatures(desc));
 
     return SLANG_OK;
 }
@@ -139,31 +144,3 @@ void DeviceImpl::customizeShaderObject(ShaderObject* shaderObject)
 }
 
 } // namespace rhi::cpu
-
-namespace rhi {
-
-IAdapter* getCPUAdapter(uint32_t index)
-{
-    static Adapter adapter = []()
-    {
-        Adapter outAdapter;
-        AdapterInfo info = {};
-        info.deviceType = DeviceType::CPU;
-        info.adapterType = AdapterType::Software;
-        string::copy_safe(info.name, sizeof(info.name), "Default");
-        outAdapter.m_info = info;
-        outAdapter.m_isDefault = true;
-        return outAdapter;
-    }();
-    return index == 0 ? &adapter : nullptr;
-}
-
-Result createCPUDevice(const DeviceDesc* desc, IDevice** outDevice)
-{
-    RefPtr<cpu::DeviceImpl> result = new cpu::DeviceImpl();
-    SLANG_RETURN_ON_FAIL(result->initialize(*desc));
-    returnComPtr(outDevice, result);
-    return SLANG_OK;
-}
-
-} // namespace rhi

@@ -31,7 +31,14 @@ public:
 class DeviceImpl : public Device
 {
 public:
-    D3D12DeviceExtendedDesc m_extendedDesc;
+    virtual bool canCreatePipelineOnTaskPool(const Pipeline* pipeline) const override
+    {
+        SLANG_UNUSED(pipeline);
+        return true;
+    }
+
+    std::string m_rootParameterShaderAttributeNameBuffer;
+    const char* m_rootParameterShaderAttributeName = nullptr;
 
     std::string m_adapterName;
 
@@ -41,6 +48,8 @@ public:
     ComPtr<IDXGIAdapter> m_dxgiAdapter;
     ComPtr<ID3D12Device> m_device;
     ComPtr<ID3D12Device5> m_device5;
+
+    ComPtr<D3D12MA::Allocator> m_allocator;
 
     RefPtr<CommandQueueImpl> m_queue;
 
@@ -82,7 +91,7 @@ public:
 public:
     using Device::readBuffer;
 
-    virtual SLANG_NO_THROW Result SLANG_MCALL initialize(const DeviceDesc& desc) override;
+    Result initialize(const DeviceDesc& desc, BackendImpl* backend);
 
     virtual SLANG_NO_THROW Result SLANG_MCALL getQueue(QueueType type, ICommandQueue** outQueue) override;
     virtual SLANG_NO_THROW Result SLANG_MCALL createSurface(WindowHandle windowHandle, ISurface** outSurface) override;
@@ -92,6 +101,7 @@ public:
         Size* outAlignment
     ) override;
     virtual SLANG_NO_THROW Result SLANG_MCALL getTextureRowAlignment(Format format, Size* outAlignment) override;
+    virtual SLANG_NO_THROW Result getTextureBufferOffsetAlignment(Format format, Size* outAlignment) override;
     virtual SLANG_NO_THROW Result SLANG_MCALL createTexture(
         const TextureDesc& desc,
         const SubresourceData* initData,
@@ -268,15 +278,8 @@ public:
     D3D12_CPU_DESCRIPTOR_HANDLE getNullSamplerDescriptor();
 
 private:
-    void processExperimentalFeaturesDesc(SharedLibraryHandle d3dModule, const void* desc);
+    void processExperimentalFeaturesDesc(SharedLibraryHandle d3dModule, const D3D12ExperimentalFeaturesDesc* desc);
     inline Result setupDebugLayer(SharedLibraryHandle d3dModule);
 };
 
 } // namespace rhi::d3d12
-
-namespace rhi {
-
-IAdapter* getD3D12Adapter(uint32_t index);
-Result createD3D12Device(const DeviceDesc* desc, IDevice** outDevice);
-
-} // namespace rhi

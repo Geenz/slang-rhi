@@ -13,12 +13,18 @@ public:
 class DeviceImpl : public Device
 {
 public:
+    virtual bool canCreatePipelineOnTaskPool(const Pipeline* pipeline) const override
+    {
+        SLANG_UNUSED(pipeline);
+        return true;
+    }
+
     using Device::readBuffer;
 
     DeviceImpl();
     ~DeviceImpl();
 
-    virtual SLANG_NO_THROW Result SLANG_MCALL initialize(const DeviceDesc& desc) override;
+    Result initialize(const DeviceDesc& desc, BackendImpl* backend);
 
     virtual SLANG_NO_THROW Result SLANG_MCALL createSurface(WindowHandle windowHandle, ISurface** outSurface) override;
 
@@ -107,7 +113,6 @@ public:
     ComPtr<ID3D11Device> m_device;
     ComPtr<ID3D11DeviceContext> m_immediateContext;
     ComPtr<ID3D11DeviceContext1> m_immediateContext1;
-    ComPtr<ID3D11Query> m_disjointQuery;
 
 #if SLANG_RHI_ENABLE_NVAPI
     NVAPIShaderExtension m_nvapiShaderExtension;
@@ -121,10 +126,3 @@ public:
 };
 
 } // namespace rhi::d3d11
-
-namespace rhi {
-
-IAdapter* getD3D11Adapter(uint32_t index);
-Result createD3D11Device(const DeviceDesc* desc, IDevice** outDevice);
-
-} // namespace rhi

@@ -95,7 +95,7 @@ Result ShaderObjectLayoutImpl::Builder::setElementTypeLayout(slang::TypeLayoutRe
 
         bool isRootParameter = isBindingRangeRootParameter(
             m_device->m_slangContext.globalSession,
-            checked_cast<DeviceImpl*>(m_device)->m_extendedDesc.rootParameterShaderAttributeName,
+            checked_cast<DeviceImpl*>(m_device)->m_rootParameterShaderAttributeName,
             typeLayout,
             r
         );
@@ -229,12 +229,15 @@ Result ShaderObjectLayoutImpl::Builder::setElementTypeLayout(slang::TypeLayoutRe
         // know the appropraite type/layout of sub-object to allocate.
         //
         RefPtr<ShaderObjectLayoutImpl> subObjectLayout;
-        createForElementType(
-            m_device,
-            m_session,
-            slangLeafTypeLayout->getElementTypeLayout(),
-            subObjectLayout.writeRef()
-        );
+        if (slangBindingType != slang::BindingType::ExistentialValue)
+        {
+            createForElementType(
+                m_device,
+                m_session,
+                slangLeafTypeLayout->getElementTypeLayout(),
+                subObjectLayout.writeRef()
+            );
+        }
 
         SubObjectRangeInfo subObjectRange;
         subObjectRange.bindingRangeIndex = bindingRangeIndex;
@@ -586,7 +589,7 @@ void RootShaderObjectLayoutImpl::RootSignatureDescBuilder::addBindingRange(
     uint32_t descriptorRangeCount = typeLayout->getBindingRangeDescriptorRangeCount(bindingRangeIndex);
     bool isRootParameter = isBindingRangeRootParameter(
         m_device->m_slangContext.globalSession,
-        m_device->m_extendedDesc.rootParameterShaderAttributeName,
+        m_device->m_rootParameterShaderAttributeName,
         typeLayout,
         bindingRangeIndex
     );
@@ -944,12 +947,15 @@ Result RootShaderObjectLayoutImpl::createRootSignatureFromSlang(
         return SLANG_FAIL;
     }
 
-    SLANG_RETURN_ON_FAIL(device->m_device->CreateRootSignature(
-        0,
-        signature->GetBufferPointer(),
-        signature->GetBufferSize(),
-        IID_PPV_ARGS(outRootSignature)
-    ));
+    SLANG_D3D_RETURN_ON_FAIL_REPORT(
+        device->m_device->CreateRootSignature(
+            0,
+            signature->GetBufferPointer(),
+            signature->GetBufferSize(),
+            IID_PPV_ARGS(outRootSignature)
+        ),
+        device
+    );
     return SLANG_OK;
 }
 
