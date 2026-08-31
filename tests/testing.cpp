@@ -894,6 +894,8 @@ void renderDocEndFrame() {}
 #endif
 
 static std::map<DeviceType, bool> sDeviceTypeAvailable;
+// Stable storage: reportSkip() keeps the raw pointer.
+static std::map<DeviceType, std::string> sDeviceTypeUnavailableReason;
 
 DeviceAvailabilityResult checkDeviceTypeAvailable(DeviceType deviceType)
 {
@@ -903,6 +905,12 @@ DeviceAvailabilityResult checkDeviceTypeAvailable(DeviceType deviceType)
         result.error = msg;                                                                                            \
         result.debugCallbackOutput = sCaptureDebugCallback.getOutput();                                                \
         result.diagnostics = diagnostics ? (const char*)diagnostics->getBufferPointer() : "";                          \
+        std::string& reason = sDeviceTypeUnavailableReason[deviceType];                                                \
+        reason = "device not available: " + result.error;                                                              \
+        if (!result.diagnostics.empty())                                                                               \
+            reason += " (" + result.diagnostics + ")";                                                                 \
+        while (!reason.empty() && (reason.back() == '\n' || reason.back() == '\r'))                                    \
+            reason.pop_back();                                                                                         \
         return result;                                                                                                 \
     }
 
@@ -1141,7 +1149,9 @@ static void gpuTestTrampoline()
     }
     else
     {
-        SKIP("device not available");
+        const std::string& reason = sDeviceTypeUnavailableReason[deviceType];
+        reportSkip(::doctest::getContextOptions()->currentTest, reason.empty() ? "device not available" : reason.c_str());
+        return;
     }
 }
 

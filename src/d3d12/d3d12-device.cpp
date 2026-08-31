@@ -1008,6 +1008,21 @@ Result DeviceImpl::initialize(const DeviceDesc& desc, BackendImpl* backend)
             if (options.MeshShaderTier >= D3D12_MESH_SHADER_TIER_1)
             {
                 addFeature(Feature::MeshShader);
+
+                D3D12_INDIRECT_ARGUMENT_DESC args;
+                args.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+
+                D3D12_COMMAND_SIGNATURE_DESC signatureDesc;
+                signatureDesc.ByteStride = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
+                signatureDesc.NumArgumentDescs = 1;
+                signatureDesc.pArgumentDescs = &args;
+                signatureDesc.NodeMask = 0;
+
+                SLANG_RETURN_ON_FAIL(m_device->CreateCommandSignature(
+                    &signatureDesc,
+                    nullptr,
+                    IID_PPV_ARGS(drawMeshTasksIndirectCmdSignature.writeRef())
+                ));
             }
             // Check sampler feedback support
             if (options.SamplerFeedbackTier >= D3D12_SAMPLER_FEEDBACK_TIER_1_0)

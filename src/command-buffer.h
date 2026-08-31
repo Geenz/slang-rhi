@@ -72,9 +72,10 @@ public:
     /// Command list, nullptr if pass encoder is not active.
     CommandList* m_commandList = nullptr;
 
-    // Binding data cache (single-entry MRU)
-    IPipeline* m_cachedPipeline = nullptr;
-    RootShaderObject* m_cachedRootObject = nullptr;
+    // Binding data cache (single-entry MRU). Owning refs: a raw key could dangle and
+    // alias a new object allocated at the same address with an equal composite version.
+    ComPtr<IRenderPipeline> m_cachedPipeline;
+    RefPtr<RootShaderObject> m_cachedRootObject;
     uint64_t m_cachedCompositeVersion = 0;
     BindingData* m_cachedBindingData = nullptr;
 
@@ -126,9 +127,10 @@ public:
     /// Command list, nullptr if pass encoder is not active.
     CommandList* m_commandList;
 
-    // Binding data cache (single-entry MRU)
-    IComputePipeline* m_cachedPipeline = nullptr;
-    RootShaderObject* m_cachedRootObject = nullptr;
+    // Binding data cache (single-entry MRU). Owning refs: a raw key could dangle and
+    // alias a new object allocated at the same address with an equal composite version.
+    ComPtr<IComputePipeline> m_cachedPipeline;
+    RefPtr<RootShaderObject> m_cachedRootObject;
     uint64_t m_cachedCompositeVersion = 0;
     BindingData* m_cachedBindingData = nullptr;
 
@@ -171,9 +173,10 @@ public:
     /// Command list, nullptr if pass encoder is not active.
     CommandList* m_commandList;
 
-    // Binding data cache (single-entry MRU)
-    IRayTracingPipeline* m_cachedPipeline = nullptr;
-    RootShaderObject* m_cachedRootObject = nullptr;
+    // Binding data cache (single-entry MRU). Owning refs: a raw key could dangle and
+    // alias a new object allocated at the same address with an equal composite version.
+    ComPtr<IRayTracingPipeline> m_cachedPipeline;
+    RefPtr<RootShaderObject> m_cachedRootObject;
     uint64_t m_cachedCompositeVersion = 0;
     BindingData* m_cachedBindingData = nullptr;
 

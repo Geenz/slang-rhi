@@ -963,7 +963,7 @@ void CommandRecorder::cmdDrawIndirect(const commands::DrawIndirect& cmd)
             argBuffer->m_buffer.m_buffer,
             cmd.argBuffer.offset,
             countBuffer->m_buffer.m_buffer,
-            cmd.argBuffer.offset,
+            cmd.countBuffer.offset,
             cmd.maxDrawCount,
             sizeof(VkDrawIndirectCommand)
         );
@@ -1029,8 +1029,21 @@ void CommandRecorder::cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd)
 
 void CommandRecorder::cmdDrawMeshTasksIndirect(const commands::DrawMeshTasksIndirect& cmd)
 {
-    SLANG_UNUSED(cmd);
-    NOT_SUPPORTED(IRenderPassEncoder, drawMeshTasksIndirect);
+    if (!m_renderStateValid)
+        return;
+
+    auto argBuffer = checked_cast<BufferImpl*>(cmd.argBuffer.buffer);
+
+    requireBufferState(argBuffer, ResourceState::IndirectArgument);
+    commitBarriers();
+
+    m_api.vkCmdDrawMeshTasksIndirectEXT(
+        m_cmdBuffer,
+        argBuffer->m_buffer.m_buffer,
+        cmd.argBuffer.offset,
+        1,
+        sizeof(VkDrawMeshTasksIndirectCommandEXT)
+    );
 }
 
 void CommandRecorder::cmdBeginComputePass(const commands::BeginComputePass& cmd)
@@ -1064,6 +1077,11 @@ void CommandRecorder::cmdSetComputeState(const commands::SetComputeState& cmd)
         m_bindingData = static_cast<BindingDataImpl*>(cmd.bindingData);
         requireBindingStates(m_bindingData);
         setBindings(m_bindingData, VK_PIPELINE_BIND_POINT_COMPUTE);
+    }
+    else if (m_bindingData)
+    {
+        // Reused binding data still needs hazard barriers (e.g. UAV) between dispatches.
+        requireBindingStates(m_bindingData);
     }
 
     commitBarriers();
@@ -1127,6 +1145,11 @@ void CommandRecorder::cmdSetRayTracingState(const commands::SetRayTracingState& 
         m_bindingData = static_cast<BindingDataImpl*>(cmd.bindingData);
         requireBindingStates(m_bindingData);
         setBindings(m_bindingData, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
+    }
+    else if (m_bindingData)
+    {
+        // Reused binding data still needs hazard barriers (e.g. UAV) between dispatches.
+        requireBindingStates(m_bindingData);
     }
 
     if (updateShaderTable)

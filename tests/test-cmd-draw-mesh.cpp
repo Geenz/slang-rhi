@@ -23,7 +23,7 @@ static ComPtr<ITexture> createColorBuffer(IDevice* device)
     return colorBuffer;
 }
 
-GPU_TEST_CASE("cmd-draw-mesh-tasks", D3D12 | Metal)
+GPU_TEST_CASE("cmd-draw-mesh-tasks", D3D12 | Vulkan | Metal)
 {
     if (!device->hasFeature(Feature::MeshShader))
         SKIP("mesh shaders not supported");
@@ -84,7 +84,7 @@ GPU_TEST_CASE("cmd-draw-mesh-tasks", D3D12 | Metal)
     CHECK(pixel[3] > 0.0f);
 }
 
-GPU_TEST_CASE("cmd-draw-mesh-tasks-with-object", D3D12 | Metal)
+GPU_TEST_CASE("cmd-draw-mesh-tasks-with-object", D3D12 | Vulkan | Metal)
 {
     if (!device->hasFeature(Feature::MeshShader))
         SKIP("mesh shaders not supported");

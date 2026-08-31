@@ -148,6 +148,7 @@ void CommandList::write(commands::DrawMeshTasks&& cmd)
 
 void CommandList::write(commands::DrawMeshTasksIndirect&& cmd)
 {
+    retainResource<Buffer>(cmd.argBuffer.buffer);
     writeCommand(std::move(cmd));
 }
 

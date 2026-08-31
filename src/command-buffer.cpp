@@ -32,7 +32,7 @@ void RenderPassEncoder::writeRenderState()
 
     uint64_t compositeVersion = m_rootObject->getCompositeVersion();
 
-    if (m_cachedBindingData && m_cachedPipeline == m_pipeline.get() && m_cachedRootObject == m_rootObject.get() &&
+    if (m_cachedBindingData && m_cachedPipeline.get() == m_pipeline.get() && m_cachedRootObject.get() == m_rootObject.get() &&
         m_cachedCompositeVersion == compositeVersion)
     {
         cmd.bindingData = m_cachedBindingData;
@@ -45,8 +45,8 @@ void RenderPassEncoder::writeRenderState()
                 ->handleMessage(DebugMessageType::Error, DebugMessageSource::Layer, "Failed to get binding data");
             return;
         }
-        m_cachedPipeline = m_pipeline.get();
-        m_cachedRootObject = m_rootObject.get();
+        m_cachedPipeline = m_pipeline;
+        m_cachedRootObject = m_rootObject;
         m_cachedCompositeVersion = compositeVersion;
         m_cachedBindingData = cmd.bindingData;
     }
@@ -241,7 +241,7 @@ void ComputePassEncoder::writeComputeState()
     m_commandEncoder->getPipelineSpecializationArgs(m_pipeline, m_rootObject, cmd.specializationArgs);
 
     uint64_t compositeVersion = m_rootObject->getCompositeVersion();
-    if (m_cachedBindingData && m_cachedPipeline == m_pipeline.get() && m_cachedRootObject == m_rootObject.get() &&
+    if (m_cachedBindingData && m_cachedPipeline.get() == m_pipeline.get() && m_cachedRootObject.get() == m_rootObject.get() &&
         m_cachedCompositeVersion == compositeVersion)
     {
         cmd.bindingData = m_cachedBindingData;
@@ -254,8 +254,8 @@ void ComputePassEncoder::writeComputeState()
                 ->handleMessage(DebugMessageType::Error, DebugMessageSource::Layer, "Failed to get binding data");
             return;
         }
-        m_cachedPipeline = m_pipeline.get();
-        m_cachedRootObject = m_rootObject.get();
+        m_cachedPipeline = m_pipeline;
+        m_cachedRootObject = m_rootObject;
         m_cachedCompositeVersion = compositeVersion;
         m_cachedBindingData = cmd.bindingData;
     }
@@ -385,7 +385,7 @@ void RayTracingPassEncoder::writeRayTracingState()
     m_commandEncoder->getPipelineSpecializationArgs(m_pipeline, m_rootObject, cmd.specializationArgs);
 
     uint64_t compositeVersion = m_rootObject->getCompositeVersion();
-    if (m_cachedBindingData && m_cachedPipeline == m_pipeline.get() && m_cachedRootObject == m_rootObject.get() &&
+    if (m_cachedBindingData && m_cachedPipeline.get() == m_pipeline.get() && m_cachedRootObject.get() == m_rootObject.get() &&
         m_cachedCompositeVersion == compositeVersion)
     {
         cmd.bindingData = m_cachedBindingData;
@@ -398,8 +398,8 @@ void RayTracingPassEncoder::writeRayTracingState()
                 ->handleMessage(DebugMessageType::Error, DebugMessageSource::Layer, "Failed to get binding data");
             return;
         }
-        m_cachedPipeline = m_pipeline.get();
-        m_cachedRootObject = m_rootObject.get();
+        m_cachedPipeline = m_pipeline;
+        m_cachedRootObject = m_rootObject;
         m_cachedCompositeVersion = compositeVersion;
         m_cachedBindingData = cmd.bindingData;
     }

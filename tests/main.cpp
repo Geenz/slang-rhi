@@ -57,8 +57,90 @@ bool checkRequiredDevices()
 
 } // namespace rhi::testing
 
+// Prints a symbolized stack for the first access violation so crashes in CI/terminal runs are attributable.
+#if SLANG_WINDOWS_FAMILY
+#include <windows.h>
+#include <psapi.h>
+#include <dbghelp.h>
+#pragma comment(lib, "psapi")
+#pragma comment(lib, "dbghelp")
+static LONG WINAPI crashProbe(EXCEPTION_POINTERS* info)
+{
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    static LONG once = 0;
+    if (InterlockedExchange(&once, 1))
+        return EXCEPTION_CONTINUE_SEARCH;
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+    auto printAddr = [](const char* label, void* addr)
+    {
+        HMODULE mods[512];
+        DWORD needed = 0;
+        char name[MAX_PATH] = "?";
+        uintptr_t base = 0;
+        if (EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
+        {
+            for (DWORD i = 0; i < needed / sizeof(HMODULE); i++)
+            {
+                MODULEINFO mi;
+                if (GetModuleInformation(GetCurrentProcess(), mods[i], &mi, sizeof(mi)))
+                {
+                    if (addr >= mi.lpBaseOfDll && addr < (char*)mi.lpBaseOfDll + mi.SizeOfImage)
+                    {
+                        GetModuleFileNameA(mods[i], name, sizeof(name));
+                        base = (uintptr_t)mi.lpBaseOfDll;
+                        break;
+                    }
+                }
+            }
+        }
+        char symBuf[sizeof(SYMBOL_INFO) + 512] = {};
+        SYMBOL_INFO* sym = (SYMBOL_INFO*)symBuf;
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 511;
+        DWORD64 disp = 0;
+        const char* symName = "?";
+        if (SymFromAddr(GetCurrentProcess(), (DWORD64)addr, &disp, sym))
+            symName = sym->Name;
+        IMAGEHLP_LINE64 line = {sizeof(IMAGEHLP_LINE64)};
+        DWORD lineDisp = 0;
+        char lineBuf[64] = "";
+        if (SymGetLineFromAddr64(GetCurrentProcess(), (DWORD64)addr, &lineDisp, &line))
+            snprintf(lineBuf, sizeof(lineBuf), " [%s:%lu]", strrchr(line.FileName, '\\') ? strrchr(line.FileName, '\\') + 1 : line.FileName, line.LineNumber);
+        fprintf(
+            stderr,
+            "[CRASH] %s %p = %s+0x%llx %s+0x%llx%s\n",
+            label,
+            addr,
+            name,
+            (unsigned long long)((uintptr_t)addr - base),
+            symName,
+            (unsigned long long)disp,
+            lineBuf
+        );
+    };
+    fprintf(
+        stderr,
+        "[CRASH] access violation %s address %p\n",
+        info->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
+        (void*)info->ExceptionRecord->ExceptionInformation[1]
+    );
+    printAddr("instruction", (void*)info->ContextRecord->Rip);
+    void* stack[32];
+    USHORT frames = CaptureStackBackTrace(0, 32, stack, nullptr);
+    for (USHORT i = 0; i < frames; i++)
+        printAddr("frame", stack[i]);
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 int main(int argc, const char** argv)
 {
+#if SLANG_WINDOWS_FAMILY
+    AddVectoredExceptionHandler(1, crashProbe);
+#endif
     // Store path to the executable.
     rhi::testing::exePath() = argv[0];
 

@@ -216,7 +216,8 @@
 | `drawIndexed`         | :x: | :x:  | yes   | yes   | yes    | yes   | yes  |
 | `drawIndirect`        | :x: | :x:  | yes   | yes   | yes    | yes   | yes  |
 | `drawIndexedIndirect` | :x: | :x:  | yes   | yes   | yes    | yes   | yes  |
-| `drawMeshTasks`       | :x: | :x:  | :x:   | yes   | yes    | :x:   | :x:  |
+| `drawMeshTasks`         | :x: | :x:  | :x:   | yes   | yes    | yes   | :x:  |
+| `drawMeshTasksIndirect` | :x: | :x:  | :x:   | yes   | yes    | yes   | :x:  |
 
 ## `IComputePassEncoder` interface
 

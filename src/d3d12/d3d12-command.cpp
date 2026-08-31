@@ -95,6 +95,7 @@ public:
     void cmdDrawIndirect(const commands::DrawIndirect& cmd);
     void cmdDrawIndexedIndirect(const commands::DrawIndexedIndirect& cmd);
     void cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd);
+    void cmdDrawMeshTasksIndirect(const commands::DrawMeshTasksIndirect& cmd);
     void cmdBeginComputePass(const commands::BeginComputePass& cmd);
     void cmdEndComputePass(const commands::EndComputePass& cmd);
     void cmdSetComputeState(const commands::SetComputeState& cmd);
@@ -126,6 +127,7 @@ public:
     };
 
     void setBindings(BindingDataImpl* bindingData, BindMode bindMode);
+    void requireBindingStates(BindingDataImpl* bindingData);
 
     void requireBufferState(BufferImpl* buffer, ResourceState state);
     void requireTextureState(TextureImpl* texture, SubresourceRange subresourceRange, ResourceState state);
@@ -915,6 +917,11 @@ void CommandRecorder::cmdSetRenderState(const commands::SetRenderState& cmd)
         m_bindingData = static_cast<BindingDataImpl*>(cmd.bindingData);
         setBindings(m_bindingData, BindMode::Graphics);
     }
+    else if (m_bindingData)
+    {
+        // Reused binding data still needs hazard barriers (e.g. UAV) between draws.
+        requireBindingStates(m_bindingData);
+    }
 
     // TODO support setting sample positions
 #if 0
@@ -1101,6 +1108,26 @@ void CommandRecorder::cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd)
     m_cmdList6->DispatchMesh(cmd.x, cmd.y, cmd.z);
 }
 
+void CommandRecorder::cmdDrawMeshTasksIndirect(const commands::DrawMeshTasksIndirect& cmd)
+{
+    if (!m_renderStateValid)
+        return;
+
+    BufferImpl* argBuffer = checked_cast<BufferImpl*>(cmd.argBuffer.buffer);
+
+    requireBufferState(argBuffer, ResourceState::IndirectArgument);
+    commitBarriers();
+
+    m_cmdList->ExecuteIndirect(
+        m_device->drawMeshTasksIndirectCmdSignature,
+        1,
+        argBuffer->m_resource,
+        cmd.argBuffer.offset,
+        nullptr,
+        0
+    );
+}
+
 void CommandRecorder::cmdBeginComputePass(const commands::BeginComputePass& cmd)
 {
     m_computePassActive = true;
@@ -1130,6 +1157,11 @@ void CommandRecorder::cmdSetComputeState(const commands::SetComputeState& cmd)
     {
         m_bindingData = static_cast<BindingDataImpl*>(cmd.bindingData);
         setBindings(m_bindingData, BindMode::Compute);
+    }
+    else if (m_bindingData)
+    {
+        // Reused binding data still needs hazard barriers (e.g. UAV) between dispatches.
+        requireBindingStates(m_bindingData);
     }
 
     commitBarriers();
@@ -1198,6 +1230,11 @@ void CommandRecorder::cmdSetRayTracingState(const commands::SetRayTracingState& 
     {
         m_bindingData = static_cast<BindingDataImpl*>(cmd.bindingData);
         setBindings(m_bindingData, BindMode::RayTracing);
+    }
+    else if (m_bindingData)
+    {
+        // Reused binding data still needs hazard barriers (e.g. UAV) between dispatches.
+        requireBindingStates(m_bindingData);
     }
 
     if (updateShaderTable)
@@ -1698,9 +1735,8 @@ void CommandRecorder::cmdExecuteCallback(const commands::ExecuteCallback& cmd)
     m_bindingData = nullptr;
 }
 
-void CommandRecorder::setBindings(BindingDataImpl* bindingData, BindMode bindMode)
+void CommandRecorder::requireBindingStates(BindingDataImpl* bindingData)
 {
-    // First, we transition all resources to the required states.
     for (uint32_t i = 0; i < bindingData->bufferStateCount; ++i)
     {
         const auto& bufferState = bindingData->bufferStates[i];
@@ -1715,6 +1751,12 @@ void CommandRecorder::setBindings(BindingDataImpl* bindingData, BindMode bindMod
             textureState.state
         );
     }
+}
+
+void CommandRecorder::setBindings(BindingDataImpl* bindingData, BindMode bindMode)
+{
+    // First, we transition all resources to the required states.
+    requireBindingStates(bindingData);
 
     // We need barriers to be committed before setting root parameters.
     commitBarriers();

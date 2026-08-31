@@ -281,6 +281,7 @@ protected:
     x(vkCmdInsertDebugUtilsLabelEXT) \
     x(vkSetDebugUtilsObjectNameEXT) \
     x(vkCmdDrawMeshTasksEXT) \
+    x(vkCmdDrawMeshTasksIndirectEXT) \
     x(vkConvertCooperativeVectorMatrixNV) \
     x(vkCmdConvertCooperativeVectorMatrixNV) \
     x(vkGetDescriptorSetLayoutSupport) \

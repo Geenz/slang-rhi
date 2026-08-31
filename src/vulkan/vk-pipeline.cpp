@@ -52,155 +52,35 @@ struct PipelineCacheBinaryHeader
 static_assert(sizeof(PipelineCacheHeader) == 12);
 static_assert(sizeof(PipelineCacheBinaryHeader) == 44);
 
-// Generate a stable ray tracing pipeline key from the inputs owned by slang-rhi. This is used only when
-// vkGetPipelineKeyKHR returns an unusable all-zero key. Keep the version and hashed fields in sync with
-// RayTracingPipelineDesc and the Vulkan ray tracing pipeline creation code.
-static Result getRayTracingPipelineFallbackKey(
-    ShaderProgramImpl* program,
-    const RayTracingPipelineDesc& desc,
-    SHA1::Digest& outDigest
-)
+// Hash the identity of a shader program (SPIR-V modules, entry point names, stages).
+static void hashProgramIdentity(SHA1& sha1, ShaderProgramImpl* program)
 {
-    // Unknown extension structures cannot be hashed safely.
-    if (desc.next)
-        return SLANG_E_NOT_AVAILABLE;
-
-    SHA1 sha1;
-    static constexpr char kKeyTag[] = "slang-rhi-vulkan-ray-tracing-pipeline";
-    static constexpr uint32_t kKeyVersion = 1;
-    sha1.update(kKeyTag, sizeof(kKeyTag));
-    sha1.update(kKeyVersion);
-
-    auto updateNullableString = [&](const char* value)
+    for (const auto& module : program->m_modules)
     {
-        const uint64_t size = value ? strlen(value) : UINT64_MAX;
-        sha1.update(size);
-        if (value)
-        {
-            sha1.update(value, size);
-        }
-    };
-
-    const uint32_t moduleCount = (uint32_t)program->m_modules.size();
-    if (moduleCount != program->m_stageCreateInfos.size())
-        return SLANG_FAIL;
-    sha1.update(moduleCount);
-    for (uint32_t i = 0; i < moduleCount; ++i)
-    {
-        const ShaderProgramImpl::Module& module = program->m_modules[i];
-        const VkPipelineShaderStageCreateInfo& stage = program->m_stageCreateInfos[i];
-        if (!module.code || stage.pNext)
-            return SLANG_E_NOT_AVAILABLE;
-
-        sha1.update(stage.flags);
-        sha1.update(stage.stage);
-        updateNullableString(module.entryPointName.c_str());
-
-        const uint64_t codeSize = module.code->getBufferSize();
-        sha1.update(codeSize);
-        sha1.update(module.code->getBufferPointer(), codeSize);
-
-        const VkSpecializationInfo* specialization = stage.pSpecializationInfo;
-        const uint8_t hasSpecialization = specialization != nullptr;
-        sha1.update(hasSpecialization);
-        if (specialization)
-        {
-            sha1.update(specialization->mapEntryCount);
-            for (uint32_t j = 0; j < specialization->mapEntryCount; ++j)
-            {
-                const VkSpecializationMapEntry& entry = specialization->pMapEntries[j];
-                sha1.update(entry.constantID);
-                const uint64_t offset = entry.offset;
-                const uint64_t size = entry.size;
-                sha1.update(offset);
-                sha1.update(size);
-            }
-            const uint64_t dataSize = specialization->dataSize;
-            sha1.update(dataSize);
-            sha1.update(specialization->pData, dataSize);
-        }
+        sha1.update(module.code->getBufferPointer(), module.code->getBufferSize());
+        sha1.update(module.entryPointName.data(), module.entryPointName.size());
     }
-
-    sha1.update(desc.hitGroupCount);
-    for (uint32_t i = 0; i < desc.hitGroupCount; ++i)
+    for (const auto& stage : program->m_stageCreateInfos)
     {
-        const HitGroupDesc& hitGroup = desc.hitGroups[i];
-        updateNullableString(hitGroup.hitGroupName);
-        updateNullableString(hitGroup.closestHitEntryPoint);
-        updateNullableString(hitGroup.anyHitEntryPoint);
-        updateNullableString(hitGroup.intersectionEntryPoint);
+        sha1.update(&stage.stage, sizeof(stage.stage));
     }
-    sha1.update(desc.maxRecursion);
-    sha1.update(desc.maxRayPayloadSize);
-    sha1.update(desc.maxAttributeSizeInBytes);
-    sha1.update(desc.flags);
-
-    outDigest = sha1.getDigest();
-    return SLANG_OK;
 }
 
-static bool isAllZeroPipelineKey(const VkPipelineBinaryKeyKHR& key)
+// Keys are derived app-side from device + pipeline identity: NVIDIA drivers (observed on 610.47)
+// corrupt the caller's stack in vkGetPipelineKeyKHR, so that entry point must not be used.
+Result getPipelineCacheKey(DeviceImpl* device, const SHA1& pipelineIdentity, ISlangBlob** outBlob)
 {
-    if (key.keySize == 0)
-        return true;
-    for (uint32_t i = 0; i < key.keySize; ++i)
-    {
-        if (key.key[i] != 0)
-            return false;
-    }
-    return true;
-}
-
-// Create a pipeline cache key based on the device and pipeline create info.
-// The key is a SHA1 hash that includes the adapter LUID, global pipeline key, and the pipeline create info key.
-template<typename GetFallbackPipelineKey>
-Result getPipelineCacheKey(
-    DeviceImpl* device,
-    void* createInfo,
-    GetFallbackPipelineKey getFallbackPipelineKey,
-    ISlangBlob** outBlob
-)
-{
-    auto& api = device->m_api;
-
-    SHA1 sha1;
-    // Hash adapter LUID.
+    SHA1 sha1(pipelineIdentity);
     {
         const AdapterLUID& luid = device->getInfo().adapterLUID;
         sha1.update(luid.luid, sizeof(luid.luid));
     }
-    // Hash global key.
     {
-        VkPipelineBinaryKeyKHR pipelineKey = {VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
-        SLANG_VK_RETURN_ON_FAIL_REPORT(api.vkGetPipelineKeyKHR(device->m_device, nullptr, &pipelineKey), device);
-        sha1.update(pipelineKey.key, pipelineKey.keySize);
-    }
-    // Hash pipeline key.
-    {
-        VkPipelineCreateInfoKHR pipelineCreateInfo = {VK_STRUCTURE_TYPE_PIPELINE_CREATE_INFO_KHR};
-        pipelineCreateInfo.pNext = createInfo;
-        VkPipelineBinaryKeyKHR pipelineKey = {VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
-        SLANG_VK_RETURN_ON_FAIL_REPORT(
-            api.vkGetPipelineKeyKHR(device->m_device, &pipelineCreateInfo, &pipelineKey),
-            device
-        );
-        if (isAllZeroPipelineKey(pipelineKey))
-        {
-            SHA1::Digest fallbackPipelineKey;
-            if (SLANG_FAILED(getFallbackPipelineKey(fallbackPipelineKey)))
-            {
-                device->printWarning(
-                    "vkGetPipelineKeyKHR returned an all-zero pipeline key and no usable application fallback key is "
-                    "available, disabling caching for this pipeline."
-                );
-                return SLANG_E_NOT_AVAILABLE;
-            }
-            sha1.update(fallbackPipelineKey.data(), fallbackPipelineKey.size());
-        }
-        else
-        {
-            sha1.update(pipelineKey.key, pipelineKey.keySize);
-        }
+        const VkPhysicalDeviceProperties& props = device->m_api.m_deviceProperties;
+        sha1.update(&props.vendorID, sizeof(props.vendorID));
+        sha1.update(&props.deviceID, sizeof(props.deviceID));
+        sha1.update(&props.driverVersion, sizeof(props.driverVersion));
+        sha1.update(props.pipelineCacheUUID, sizeof(props.pipelineCacheUUID));
     }
     SHA1::Digest digest = sha1.getDigest();
     ComPtr<ISlangBlob> blob = OwnedBlob::create(digest.data(), digest.size());
@@ -282,6 +162,9 @@ Result serializePipelineBinaries(DeviceImpl* device, VkPipeline pipeline, ISlang
             ),
             device
         );
+
+        if (binaryKey.keySize > sizeof(PipelineCacheBinaryHeader::key))
+            return SLANG_FAIL;
 
         PipelineCacheBinaryHeader* binaryHeader = (PipelineCacheBinaryHeader*)dataPtr;
         std::memset(binaryHeader->key, 0, sizeof(PipelineCacheBinaryHeader::key));
@@ -409,21 +292,16 @@ Result deserializePipelineBinaries(DeviceImpl* device, ISlangBlob* blob, short_v
     return SLANG_OK;
 }
 
-struct NoFallbackPipelineKey
-{
-    Result operator()(SHA1::Digest&) const { return SLANG_E_NOT_AVAILABLE; }
-};
-
-template<typename VkPipelineCreateInfo, typename GetFallbackPipelineKey = NoFallbackPipelineKey>
+template<typename VkPipelineCreateInfo>
 Result createPipelineWithCache(
     DeviceImpl* device,
     VkPipelineCreateInfo* createInfo,
+    const SHA1& pipelineIdentity,
     VkResult (*createPipelineFunc)(DeviceImpl* device, VkPipelineCreateInfo* createInfo, VkPipeline* outPipeline),
     VkPipeline* outPipeline,
     bool& outCached,
     size_t& outCacheSize,
-    ComPtr<ISlangBlob>& outCacheKey,
-    GetFallbackPipelineKey getFallbackPipelineKey = {}
+    ComPtr<ISlangBlob>& outCacheKey
 )
 {
     auto& api = device->m_api;
@@ -444,7 +322,7 @@ Result createPipelineWithCache(
     VkPipeline pipeline = VK_NULL_HANDLE;
 
     // Create pipeline cache key.
-    if (SLANG_FAILED(getPipelineCacheKey(device, createInfo, getFallbackPipelineKey, pipelineCacheKey.writeRef())))
+    if (SLANG_FAILED(getPipelineCacheKey(device, pipelineIdentity, pipelineCacheKey.writeRef())))
     {
         device->printWarning("Failed to get pipeline cache key, disabling pipeline cache.");
         return createPipelineFunc(device, createInfo, outPipeline);
@@ -769,6 +647,58 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
     createInfo.basePipelineHandle = VK_NULL_HANDLE;
     createInfo.pDynamicState = &dynamicStateInfo;
 
+    SHA1 pipelineIdentity;
+    hashProgramIdentity(pipelineIdentity, program);
+    // Field-wise: struct padding bytes are indeterminate and must not reach the hash.
+    auto hashValue = [&](const auto& value) { pipelineIdentity.update(&value, sizeof(value)); };
+    hashValue(desc.primitiveTopology);
+    for (uint32_t i = 0; i < desc.targetCount; i++)
+    {
+        const ColorTargetDesc& target = desc.targets[i];
+        hashValue(target.format);
+        hashValue(target.color);
+        hashValue(target.alpha);
+        hashValue(target.enableBlend);
+        hashValue(target.logicOp);
+        hashValue(target.writeMask);
+    }
+    const DepthStencilDesc& ds = desc.depthStencil;
+    hashValue(ds.format);
+    hashValue(ds.depthTestEnable);
+    hashValue(ds.depthWriteEnable);
+    hashValue(ds.depthFunc);
+    hashValue(ds.stencilEnable);
+    hashValue(ds.stencilReadMask);
+    hashValue(ds.stencilWriteMask);
+    hashValue(ds.frontFace);
+    hashValue(ds.backFace);
+    hashValue(ds.stencilRef);
+    const RasterizerDesc& rs = desc.rasterizer;
+    hashValue(rs.fillMode);
+    hashValue(rs.cullMode);
+    hashValue(rs.frontFace);
+    hashValue(rs.depthBias);
+    hashValue(rs.depthBiasClamp);
+    hashValue(rs.slopeScaledDepthBias);
+    hashValue(rs.depthClipEnable);
+    hashValue(rs.scissorEnable);
+    hashValue(rs.multisampleEnable);
+    hashValue(rs.antialiasedLineEnable);
+    hashValue(rs.enableConservativeRasterization);
+    hashValue(rs.forcedSampleCount);
+    const MultisampleDesc& ms = desc.multisample;
+    hashValue(ms.sampleCount);
+    hashValue(ms.sampleMask);
+    hashValue(ms.alphaToCoverageEnable);
+    hashValue(ms.alphaToOneEnable);
+    if (inputLayout)
+    {
+        const auto& attributeDescs = inputLayout->m_attributeDescs;
+        const auto& streamDescs = inputLayout->m_streamDescs;
+        pipelineIdentity.update(attributeDescs.data(), attributeDescs.size() * sizeof(attributeDescs[0]));
+        pipelineIdentity.update(streamDescs.data(), streamDescs.size() * sizeof(streamDescs[0]));
+    }
+
     VkPipeline vkPipeline = VK_NULL_HANDLE;
     ComPtr<ISlangBlob> cacheKey;
     bool cached = false;
@@ -777,6 +707,7 @@ Result DeviceImpl::createRenderPipeline2(const RenderPipelineDesc& desc, IRender
         createPipelineWithCache<VkGraphicsPipelineCreateInfo>(
             this,
             &createInfo,
+            pipelineIdentity,
             [](DeviceImpl* device, VkGraphicsPipelineCreateInfo* createInfo2, VkPipeline* pipeline) -> VkResult
             {
                 return device->m_api
@@ -846,6 +777,9 @@ Result DeviceImpl::createComputePipeline2(const ComputePipelineDesc& desc, IComp
     createInfo.stage = program->m_stageCreateInfos[0];
     createInfo.layout = program->m_rootShaderObjectLayout->m_pipelineLayout;
 
+    SHA1 pipelineIdentity;
+    hashProgramIdentity(pipelineIdentity, program);
+
     VkPipeline vkPipeline = VK_NULL_HANDLE;
     ComPtr<ISlangBlob> cacheKey;
     bool cached = false;
@@ -854,6 +788,7 @@ Result DeviceImpl::createComputePipeline2(const ComputePipelineDesc& desc, IComp
         createPipelineWithCache<VkComputePipelineCreateInfo>(
             this,
             &createInfo,
+            pipelineIdentity,
             [](DeviceImpl* device, VkComputePipelineCreateInfo* createInfo2, VkPipeline* pipeline) -> VkResult
             {
                 return device->m_api
@@ -1036,6 +971,26 @@ Result DeviceImpl::createRayTracingPipeline2(const RayTracingPipelineDesc& desc,
     createInfo.basePipelineHandle = VK_NULL_HANDLE;
     createInfo.basePipelineIndex = 0;
 
+    SHA1 pipelineIdentity;
+    hashProgramIdentity(pipelineIdentity, program);
+    auto hashString = [&](const char* str)
+    {
+        if (str)
+            pipelineIdentity.update(str, strlen(str));
+        pipelineIdentity.update("|", 1);
+    };
+    for (uint32_t i = 0; i < desc.hitGroupCount; i++)
+    {
+        hashString(desc.hitGroups[i].hitGroupName);
+        hashString(desc.hitGroups[i].closestHitEntryPoint);
+        hashString(desc.hitGroups[i].anyHitEntryPoint);
+        hashString(desc.hitGroups[i].intersectionEntryPoint);
+    }
+    pipelineIdentity.update(&desc.maxRecursion, sizeof(desc.maxRecursion));
+    pipelineIdentity.update(&desc.maxRayPayloadSize, sizeof(desc.maxRayPayloadSize));
+    pipelineIdentity.update(&desc.maxAttributeSizeInBytes, sizeof(desc.maxAttributeSizeInBytes));
+    pipelineIdentity.update(&desc.flags, sizeof(desc.flags));
+
     VkPipeline vkPipeline = VK_NULL_HANDLE;
     ComPtr<ISlangBlob> cacheKey;
     bool cached = false;
@@ -1044,6 +999,7 @@ Result DeviceImpl::createRayTracingPipeline2(const RayTracingPipelineDesc& desc,
         createPipelineWithCache<VkRayTracingPipelineCreateInfoKHR>(
             this,
             &createInfo,
+            pipelineIdentity,
             [](DeviceImpl* device, VkRayTracingPipelineCreateInfoKHR* createInfo2, VkPipeline* pipeline) -> VkResult
             {
                 return device->m_api.vkCreateRayTracingPipelinesKHR(
@@ -1059,11 +1015,7 @@ Result DeviceImpl::createRayTracingPipeline2(const RayTracingPipelineDesc& desc,
             &vkPipeline,
             cached,
             cacheSize,
-            cacheKey,
-            [program, &desc](SHA1::Digest& outDigest)
-            {
-                return getRayTracingPipelineFallbackKey(program, desc, outDigest);
-            }
+            cacheKey
         )
     );
 
