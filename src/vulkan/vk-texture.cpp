@@ -167,10 +167,11 @@ TextureImpl::View TextureImpl::getView(
         createInfo.viewType = isRenderTarget ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_3D;
         break;
     case TextureType::TextureCube:
-        createInfo.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+        // Cube faces are bound as 2D arrays when used as render targets; a cube-typed view requires layerCount 6.
+        createInfo.viewType = isRenderTarget ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE;
         break;
     case TextureType::TextureCubeArray:
-        createInfo.viewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+        createInfo.viewType = isRenderTarget ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
         break;
     }
 
