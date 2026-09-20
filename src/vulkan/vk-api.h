@@ -12,6 +12,7 @@
 #define VK_USE_PLATFORM_ANDROID_KHR 1
 #else
 #define VK_USE_PLATFORM_XLIB_KHR 1
+#define VK_USE_PLATFORM_WAYLAND_KHR 1
 #endif
 #endif
 
@@ -54,6 +55,7 @@ protected:
     x(vkGetInstanceProcAddr) \
     x(vkCreateInstance) \
     x(vkEnumerateInstanceLayerProperties) \
+    x(vkEnumerateInstanceExtensionProperties) \
     x(vkEnumerateDeviceExtensionProperties) \
     x(vkDestroyInstance) \
     /* */
@@ -210,6 +212,7 @@ protected:
     #else
         #   define VK_API_INSTANCE_PLATFORM_KHR_PROCS(x)          \
             x(vkCreateXlibSurfaceKHR) \
+            x(vkCreateWaylandSurfaceKHR) \
             /* */
     #endif
 #else

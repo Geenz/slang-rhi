@@ -138,6 +138,22 @@ Result SurfaceImpl::init(DeviceImpl* device, WindowHandle windowHandle)
         );
         break;
     }
+    case WindowHandleType::WaylandSurface:
+    {
+        if (!api.vkCreateWaylandSurfaceKHR)
+        {
+            return SLANG_E_INVALID_HANDLE;
+        }
+        VkWaylandSurfaceCreateInfoKHR surfaceCreateInfo = {};
+        surfaceCreateInfo.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
+        surfaceCreateInfo.display = (wl_display*)windowHandle.handleValues[0];
+        surfaceCreateInfo.surface = (wl_surface*)windowHandle.handleValues[1];
+        SLANG_VK_RETURN_ON_FAIL_REPORT(
+            api.vkCreateWaylandSurfaceKHR(api.m_instance, &surfaceCreateInfo, nullptr, &m_surface),
+            m_device
+        );
+        break;
+    }
 #endif
 
 #endif

@@ -2162,6 +2162,7 @@ enum class WindowHandleType
     NSWindow,
     UIView,
     XlibWindow,
+    WaylandSurface,
     AndroidWindow,
 #else
     WGPUCanvas,
@@ -2205,6 +2206,14 @@ struct WindowHandle
         handle.type = WindowHandleType::XlibWindow;
         handle.handleValues[0] = (uint64_t)(xdisplay);
         handle.handleValues[1] = xwindow;
+        return handle;
+    }
+    static WindowHandle fromWaylandSurface(void* wlDisplay, void* wlSurface)
+    {
+        WindowHandle handle = {};
+        handle.type = WindowHandleType::WaylandSurface;
+        handle.handleValues[0] = (uint64_t)(intptr_t)(wlDisplay);
+        handle.handleValues[1] = (uint64_t)(intptr_t)(wlSurface);
         return handle;
     }
     static WindowHandle fromAndroidWindow(void* window)

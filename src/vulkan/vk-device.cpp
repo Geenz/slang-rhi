@@ -376,6 +376,32 @@ Result DeviceImpl::initVulkanInstance(
         instanceExtensions.push_back(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
 #else
         instanceExtensions.push_back(VK_KHR_XLIB_SURFACE_EXTENSION_NAME);
+        // VK_KHR_wayland_surface is not always advertised, so only request it if available.
+        {
+            uint32_t availableExtensionCount = 0;
+            m_api.vkEnumerateInstanceExtensionProperties(nullptr, &availableExtensionCount, nullptr);
+            std::vector<VkExtensionProperties> availableExtensions(availableExtensionCount);
+            if (availableExtensionCount > 0)
+            {
+                m_api.vkEnumerateInstanceExtensionProperties(
+                    nullptr,
+                    &availableExtensionCount,
+                    availableExtensions.data()
+                );
+            }
+            for (const auto& availableExtension : availableExtensions)
+            {
+                if (strncmp(
+                        availableExtension.extensionName,
+                        VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME,
+                        sizeof(availableExtension.extensionName)
+                    ) == 0)
+                {
+                    instanceExtensions.push_back(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME);
+                    break;
+                }
+            }
+        }
 #endif
 #endif
 
