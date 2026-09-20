@@ -84,6 +84,7 @@ Result TransientBufferHeap::allocatePageLocked(Size size, Page** outPage)
     desc.memoryType = m_desc.memoryType;
     desc.usage = m_desc.usage;
     desc.defaultState = m_desc.defaultState;
+    desc.label = "rhi-transient-page";
 
     ComPtr<IBuffer> buffer;
     SLANG_RETURN_ON_FAIL(m_device->createBuffer(desc, nullptr, buffer.writeRef()));

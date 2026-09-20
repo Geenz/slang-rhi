@@ -606,12 +606,9 @@ void CommandRecorder::cmdBeginRenderPass(const commands::BeginRenderPass& cmd)
 
         // Transition state
         requireTextureState(view->m_texture, effectiveRange, ResourceState::RenderTarget);
+        // Must match resolveImageLayout (COLOR_ATTACHMENT_OPTIMAL) below, not TRANSFER_DST_OPTIMAL.
         if (resolveView)
-            requireTextureState(
-                resolveView->m_texture,
-                resolveView->m_desc.subresourceRange,
-                ResourceState::ResolveDestination
-            );
+            requireTextureState(resolveView->m_texture, resolveView->m_desc.subresourceRange, ResourceState::RenderTarget);
 
         // Determine render area
         const TextureDesc& textureDesc = view->m_texture->m_desc;
@@ -1695,8 +1692,8 @@ void CommandRecorder::setBindings(BindingDataImpl* bindingData, VkPipelineBindPo
             0,
             bindingData->descriptorSetCount,
             bindingData->descriptorSets,
-            0,
-            nullptr
+            bindingData->dynamicOffsetCount,
+            bindingData->dynamicOffsets
         );
     }
 }
@@ -2002,20 +1999,30 @@ void CommandQueueImpl::retireCommandBuffer(CommandBufferImpl* commandBuffer)
 
 void CommandQueueImpl::retireCommandBuffers()
 {
-    std::list<RefPtr<CommandBufferImpl>> commandBuffers = std::move(m_commandBuffersInFlight);
-    m_commandBuffersInFlight.clear();
-
     uint64_t lastFinishedID = updateLastFinishedID();
-    for (const auto& commandBuffer : commandBuffers)
+
+    // Splice finished buffers out under m_mutex but retire them outside it:
+    // retireCommandBuffer() takes m_mutex itself and std::mutex is not recursive.
+    std::list<RefPtr<CommandBufferImpl>> retired;
     {
-        if (commandBuffer->m_submissionID <= lastFinishedID)
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto it = m_commandBuffersInFlight.begin(); it != m_commandBuffersInFlight.end();)
         {
-            retireCommandBuffer(commandBuffer);
+            if ((*it)->m_submissionID <= lastFinishedID)
+            {
+                auto finished = it++;
+                retired.splice(retired.end(), m_commandBuffersInFlight, finished);
+            }
+            else
+            {
+                ++it;
+            }
         }
-        else
-        {
-            m_commandBuffersInFlight.push_back(commandBuffer);
-        }
+    }
+
+    for (const auto& commandBuffer : retired)
+    {
+        retireCommandBuffer(commandBuffer);
     }
 
     // The internal device queue shares this VkQueue. Polling it here releases
@@ -2066,6 +2073,10 @@ Result CommandQueueImpl::createCommandEncoder(const CommandEncoderDesc& desc, IC
 
 Result CommandQueueImpl::submit(const SubmitDesc& desc)
 {
+    // Held through vkQueueSubmit: VkQueue is externally synchronized, and the tracking
+    // semaphore must be signaled with strictly increasing values.
+    std::unique_lock<std::mutex> lock(m_mutex);
+
     // Increment last submitted ID which is used to track command buffer completion.
     ++m_lastSubmittedID;
 
@@ -2160,6 +2171,8 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
 
     SLANG_VK_RETURN_ON_FAIL_REPORT(m_api.vkQueueSubmit(m_queue, 1, &submitInfo, m_surfaceSync.fence), m_device);
     m_surfaceSync.fence = VK_NULL_HANDLE;
+
+    lock.unlock();
 
     retireCommandBuffers();
 

@@ -601,6 +601,7 @@ Result ShaderObjectLayoutImpl::_init(const Builder* builder)
     m_subObjectCount = builder->m_subObjectCount;
     m_subObjectRanges = builder->m_subObjectRanges;
     m_totalOrdinaryDataSize = builder->m_totalOrdinaryDataSize;
+    m_ordinaryDataBufferIsDynamic = builder->m_ordinaryDataBufferIsDynamic;
 
     m_containerType = builder->m_containerType;
 
@@ -930,6 +931,23 @@ void RootShaderObjectLayoutImpl::Builder::addGlobalParams(slang::VariableLayoutR
     // for global-scope parameters of uniform/ordinary type.
     //
     _addDescriptorRangesAsValue(globalsLayout->getTypeLayout(), offset);
+
+    // `bindAsRoot` writes the global-scope ordinary-data buffer to set 0, binding 0 every draw;
+    // dynamic leaves the rest of the set constant, so the set stays reusable.
+    if (m_totalOrdinaryDataSize != 0 && !m_descriptorSetBuildInfos.empty() &&
+        m_device->m_api.m_deviceProperties.limits.maxDescriptorSetUniformBuffersDynamic > 0)
+    {
+        for (VkDescriptorSetLayoutBinding& vkBinding : m_descriptorSetBuildInfos[0].vkBindings)
+        {
+            if (vkBinding.binding == 0 && vkBinding.descriptorCount == 1 &&
+                vkBinding.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
+            {
+                vkBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+                m_ordinaryDataBufferIsDynamic = true;
+                break;
+            }
+        }
+    }
 }
 
 void RootShaderObjectLayoutImpl::Builder::addEntryPoint(EntryPointLayout* entryPointLayout)

@@ -230,6 +230,7 @@ Result StagingHeap::allocPage(size_t size, StagingHeap::Page** outPage)
     bufferDesc.defaultState = ResourceState::General;
     bufferDesc.memoryType = m_memoryType;
     bufferDesc.size = size;
+    bufferDesc.label = "rhi-staging-page";
 
     // Attempt to create buffer.
     SLANG_RETURN_ON_FAIL(m_device->createBuffer(bufferDesc, nullptr, bufferPtr.writeRef()));

@@ -167,6 +167,7 @@ ShaderTableImpl::PipelineData* ShaderTableImpl::getPipelineData(RayTracingPipeli
     BufferDesc bufferDesc = {};
     bufferDesc.memoryType = MemoryType::DeviceLocal;
     bufferDesc.usage = BufferUsage::ShaderTable | BufferUsage::CopyDestination;
+    bufferDesc.label = "rhi-shader-table";
     bufferDesc.defaultState = ResourceState::General;
 
     // Vulkan does not guarantee that the buffer's base device address satisfies

@@ -177,6 +177,10 @@ public:
     uint32_t m_totalBindingCount = 0;
     uint32_t m_totalOrdinaryDataSize = 0;
 
+    /// Set only for a root layout: its ordinary-data buffer occupies set 0, binding 0 as
+    /// VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, so a per-draw re-upload only moves a dynamic offset.
+    bool m_ordinaryDataBufferIsDynamic = false;
+
     static Result createForElementType(
         DeviceImpl* device,
         slang::ISession* session,
@@ -311,6 +315,8 @@ protected:
         uint32_t m_childPushConstantRangeCount = 0;
 
         uint32_t m_totalOrdinaryDataSize = 0;
+
+        bool m_ordinaryDataBufferIsDynamic = false;
 
         uint32_t findOrAddDescriptorSet(uint32_t space);
 

@@ -557,14 +557,20 @@ Result SurfaceImpl::present()
     m_currentFrameIndex = (m_currentFrameIndex + 1) % m_frameData.size();
     VkSemaphore renderFinishedSemaphore = m_frameData[m_currentTextureIndex].renderFinishedSemaphore;
 
-    // If no submit has taken place yet, then we need to submit a dummy command buffer to transition the texture to the
-    // correct state.
-    if (m_device->m_queue->m_surfaceSync.fence != VK_NULL_HANDLE)
+    // m_isSwapchainInitialState means no barrier has touched this image yet, so it is still
+    // UNDEFINED regardless of submit count; submit a dummy command buffer to transition it
+    // (this also covers the original no-submit-at-all case).
+    if (m_textures[m_currentTextureIndex]->m_isSwapchainInitialState ||
+        m_device->m_queue->m_surfaceSync.fence != VK_NULL_HANDLE)
     {
         ICommandQueue* queue = m_device->m_queue.get();
         ComPtr<ICommandEncoder> encoder;
         SLANG_RETURN_ON_FAIL(queue->createCommandEncoder(encoder.writeRef()));
-        encoder->setTextureState(m_textures[m_currentTextureIndex], ResourceState::General);
+        // State tracking seeds swapchain textures at Present, so a direct transition to Present is a
+        // no-op and skips the barrier while the image is still UNDEFINED; routing through
+        // CopyDestination first forces a real barrier instead (oldLayout comes from m_isSwapchainInitialState).
+        encoder->setTextureState(m_textures[m_currentTextureIndex], ResourceState::CopyDestination);
+        encoder->setTextureState(m_textures[m_currentTextureIndex], ResourceState::Present);
         SLANG_RETURN_ON_FAIL(queue->submit(encoder->finish()));
     }
 

@@ -13,6 +13,47 @@
 
 namespace rhi::vk {
 
+inline uint64_t hashCombine(uint64_t hash, uint64_t value)
+{
+    return hash ^ (value + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
+}
+
+/// Fingerprint of everything an object contributes to a descriptor set, excluding its own ordinary
+/// data. Sub-objects are folded in by identity and composite version instead.
+static uint64_t hashBindingState(const ShaderObject* object)
+{
+    uint64_t hash = object->m_slots.size();
+    for (const ResourceSlot& slot : object->m_slots)
+    {
+        hash = hashCombine(hash, uint64_t(slot.type));
+        hash = hashCombine(hash, uint64_t(uintptr_t(slot.resource.get())));
+        hash = hashCombine(hash, uint64_t(uintptr_t(slot.resource2.get())));
+        hash = hashCombine(hash, uint64_t(slot.format));
+        hash = hashCombine(hash, uint64_t(slot.bufferRange.offset));
+        hash = hashCombine(hash, uint64_t(slot.bufferRange.size));
+    }
+    for (const RefPtr<ShaderObject>& subObject : object->m_objects)
+    {
+        hash = hashCombine(hash, uint64_t(uintptr_t(subObject.get())));
+        hash = hashCombine(hash, subObject ? subObject->getCompositeVersion() : 0);
+    }
+    return hash;
+}
+
+/// Excludes the root's and the entry points' ordinary data: the former reaches the shader through a
+/// dynamic offset and the latter through push constants, both of which are rebuilt on every draw.
+static uint64_t computeRootBindingKey(RootShaderObject* rootObject)
+{
+    uint64_t hash = hashBindingState(rootObject);
+    for (const RefPtr<ShaderObject>& entryPoint : rootObject->m_entryPoints)
+    {
+        hash = hashCombine(hash, uint64_t(uintptr_t(entryPoint.get())));
+        if (entryPoint)
+            hash = hashCombine(hash, hashBindingState(entryPoint));
+    }
+    return hash;
+}
+
 inline void writeDescriptor(DeviceImpl* device, const VkWriteDescriptorSet& write)
 {
     device->m_api.vkUpdateDescriptorSets(device->m_device, 1, &write, 0, nullptr);
@@ -50,145 +91,103 @@ inline void writePlainBufferDescriptor(
     writeDescriptor(device, write);
 }
 
-inline void writeTexelBufferDescriptor(
+/// Write a whole binding range in one call: `count` descriptors starting at `binding`, array element 0.
+inline void writeImageDescriptors(
     DeviceImpl* device,
     VkDescriptorSet descriptorSet,
     uint32_t binding,
-    uint32_t index,
     VkDescriptorType descriptorType,
-    BufferImpl* buffer,
-    Format format,
-    BufferRange range
+    const VkDescriptorImageInfo* imageInfos,
+    uint32_t count
 )
 {
-    VkBufferView bufferView = buffer ? buffer->getView(format, range) : VK_NULL_HANDLE;
-
-    VkWriteDescriptorSet write = {};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = descriptorSet;
-    write.dstBinding = binding;
-    write.dstArrayElement = index;
-    write.descriptorCount = 1;
-    write.descriptorType = descriptorType;
-    write.pTexelBufferView = &bufferView;
-    writeDescriptor(device, write);
-}
-
-inline void writeTextureSamplerDescriptor(
-    DeviceImpl* device,
-    VkDescriptorSet descriptorSet,
-    uint32_t binding,
-    uint32_t index,
-    TextureViewImpl* textureView,
-    SamplerImpl* sampler
-)
-{
-    VkDescriptorImageInfo imageInfo = {};
-    if (textureView && sampler)
-    {
-        imageInfo.imageView = textureView->getView().imageView;
-        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        imageInfo.sampler = sampler->m_sampler;
-    }
-
-    VkWriteDescriptorSet write = {};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = descriptorSet;
-    write.dstBinding = binding;
-    write.dstArrayElement = index;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &imageInfo;
-
-    writeDescriptor(device, write);
-}
-
-inline void writeAccelerationStructureDescriptor(
-    DeviceImpl* device,
-    VkDescriptorSet descriptorSet,
-    uint32_t binding,
-    uint32_t index,
-    AccelerationStructureImpl* as
-)
-{
-    // The Vulkan spec states: If the nullDescriptor feature is not enabled, each element of
-    // pAccelerationStructures must not be VK_NULL_HANDLE
-    if (!as && !device->m_api.m_extendedFeatures.robustness2Features.nullDescriptor)
-    {
-        SLANG_RHI_ASSERT_FAILURE("nullDescriptor feature is not available on the device");
+    if (count == 0)
         return;
-    }
+
+    VkWriteDescriptorSet write = {};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = descriptorSet;
+    write.dstBinding = binding;
+    write.dstArrayElement = 0;
+    write.descriptorCount = count;
+    write.descriptorType = descriptorType;
+    write.pImageInfo = imageInfos;
+
+    writeDescriptor(device, write);
+}
+
+inline void writeBufferDescriptors(
+    DeviceImpl* device,
+    VkDescriptorSet descriptorSet,
+    uint32_t binding,
+    VkDescriptorType descriptorType,
+    const VkDescriptorBufferInfo* bufferInfos,
+    uint32_t count
+)
+{
+    if (count == 0)
+        return;
+
+    VkWriteDescriptorSet write = {};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = descriptorSet;
+    write.dstBinding = binding;
+    write.dstArrayElement = 0;
+    write.descriptorCount = count;
+    write.descriptorType = descriptorType;
+    write.pBufferInfo = bufferInfos;
+
+    writeDescriptor(device, write);
+}
+
+inline void writeTexelBufferDescriptors(
+    DeviceImpl* device,
+    VkDescriptorSet descriptorSet,
+    uint32_t binding,
+    VkDescriptorType descriptorType,
+    const VkBufferView* bufferViews,
+    uint32_t count
+)
+{
+    if (count == 0)
+        return;
+
+    VkWriteDescriptorSet write = {};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = descriptorSet;
+    write.dstBinding = binding;
+    write.dstArrayElement = 0;
+    write.descriptorCount = count;
+    write.descriptorType = descriptorType;
+    write.pTexelBufferView = bufferViews;
+
+    writeDescriptor(device, write);
+}
+
+inline void writeAccelerationStructureDescriptors(
+    DeviceImpl* device,
+    VkDescriptorSet descriptorSet,
+    uint32_t binding,
+    const VkAccelerationStructureKHR* accelerationStructures,
+    uint32_t count
+)
+{
+    if (count == 0)
+        return;
 
     VkWriteDescriptorSetAccelerationStructureKHR writeAS = {};
     writeAS.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
-    writeAS.accelerationStructureCount = 1;
-    static const VkAccelerationStructureKHR nullHandle = VK_NULL_HANDLE;
-    writeAS.pAccelerationStructures = as ? &as->m_vkHandle : &nullHandle;
+    writeAS.accelerationStructureCount = count;
+    writeAS.pAccelerationStructures = accelerationStructures;
 
     VkWriteDescriptorSet write = {};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     write.dstSet = descriptorSet;
     write.dstBinding = binding;
-    write.dstArrayElement = index;
-    write.descriptorCount = 1;
+    write.dstArrayElement = 0;
+    write.descriptorCount = count;
     write.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     write.pNext = &writeAS;
-    writeDescriptor(device, write);
-}
-
-inline void writeTextureDescriptor(
-    DeviceImpl* device,
-    VkDescriptorSet descriptorSet,
-    uint32_t binding,
-    uint32_t index,
-    VkDescriptorType descriptorType,
-    TextureViewImpl* textureView
-)
-{
-    VkDescriptorImageInfo imageInfo = {};
-    if (textureView)
-    {
-        imageInfo.imageView = textureView->getView().imageView;
-        imageInfo.imageLayout = descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                    ? VK_IMAGE_LAYOUT_GENERAL
-                                    : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    }
-    imageInfo.sampler = 0;
-
-    VkWriteDescriptorSet write = {};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = descriptorSet;
-    write.dstBinding = binding;
-    write.dstArrayElement = index;
-    write.descriptorCount = 1;
-    write.descriptorType = descriptorType;
-    write.pImageInfo = &imageInfo;
-
-    writeDescriptor(device, write);
-}
-
-inline void writeSamplerDescriptor(
-    DeviceImpl* device,
-    VkDescriptorSet descriptorSet,
-    uint32_t binding,
-    uint32_t index,
-    SamplerImpl* sampler
-)
-{
-    VkDescriptorImageInfo imageInfo = {};
-    imageInfo.imageView = 0;
-    imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    imageInfo.sampler = sampler ? sampler->m_sampler : device->m_defaultSampler;
-
-    VkWriteDescriptorSet write = {};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = descriptorSet;
-    write.dstBinding = binding;
-    write.dstArrayElement = index;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    write.pImageInfo = &imageInfo;
-
     writeDescriptor(device, write);
 }
 
@@ -235,40 +234,18 @@ Result BindingDataBuilder::bindAsRoot(
     BindingDataImpl*& outBindingData
 )
 {
-    // Create a new set of binding data to populate.
-    // TODO: In the future we should lookup the cache for existing
-    // binding data and reuse that if possible.
     m_bindingData = m_allocator->allocate<BindingDataImpl>();
     m_bindingCache->bindingData.push_back(m_bindingData);
 
-    // TODO(shaderobject): we should count number of buffers/textures in the layout and allocate appropriately
-    // For now we use a fixed starting capacity and grow as needed.
-    m_bindingData->bufferStateCapacity = 1024;
-    m_bindingData->bufferStates =
-        m_allocator->allocate<BindingDataImpl::BufferState>(m_bindingData->bufferStateCapacity);
-    m_bindingData->bufferStateCount = 0;
-    m_bindingData->textureStateCapacity = 1024;
-    m_bindingData->textureStates =
-        m_allocator->allocate<BindingDataImpl::TextureState>(m_bindingData->textureStateCapacity);
-    m_bindingData->textureStateCount = 0;
-
     m_bindingData->pipelineLayout = specializedLayout->m_pipelineLayout;
-
-    uint32_t totalDescriptorSetCount = specializedLayout->getTotalDescriptorSetCount();
-    if (m_device->m_bindlessDescriptorSet)
-    {
-        // The bindless descriptor set is always the last descriptor set in the pipeline layout.
-        // We need to add one more descriptor set to the count to account for it.
-        totalDescriptorSetCount++;
-    }
-    m_bindingData->descriptorSets = m_allocator->allocate<VkDescriptorSet>(totalDescriptorSetCount);
-    m_bindingData->descriptorSetCount = 0;
+    m_bindingData->dynamicOffsetCount = 0;
 
     m_pushConstantRanges = specializedLayout->getAllPushConstantRanges();
 
     m_bindingData->pushConstantRanges = m_allocator->allocate<VkPushConstantRange>(m_pushConstantRanges.size());
     m_bindingData->pushConstantData = m_allocator->allocate<void*>(m_pushConstantRanges.size());
     m_bindingData->pushConstantCount = 0;
+    m_pushConstantSources.clear();
 
     // Allocate entry point data storage for ray tracing SBT.
     size_t entryPointCount = specializedLayout->m_entryPoints.size();
@@ -286,6 +263,55 @@ Result BindingDataBuilder::bindAsRoot(
     {
         m_bindingData->entryPointData = nullptr;
     }
+
+    // Uploaded before the cache lookup: a dynamic descriptor leaves the rest of the set unchanged,
+    // so only the offset varies between draws.
+    const uint32_t ordinaryDataSize = specializedLayout->getTotalOrdinaryDataSize();
+    const bool dynamicOrdinaryData = specializedLayout->m_ordinaryDataBufferIsDynamic;
+    TransientBufferArena::Allocation ordinaryData = {};
+    if (ordinaryDataSize != 0 && dynamicOrdinaryData)
+    {
+        SLANG_RETURN_ON_FAIL(m_constantBufferArena->allocate(ordinaryDataSize, &ordinaryData));
+        SLANG_RETURN_ON_FAIL(
+            shaderObject->writeOrdinaryData(ordinaryData.mappedData, ordinaryDataSize, specializedLayout)
+        );
+        m_bindingData->dynamicOffsets[0] = uint32_t(ordinaryData.offset);
+        m_bindingData->dynamicOffsetCount = 1;
+    }
+
+    BufferImpl* ordinaryDataBuffer = checked_cast<BufferImpl*>(ordinaryData.buffer);
+    VkBuffer ordinaryDataVkBuffer = ordinaryDataBuffer ? ordinaryDataBuffer->m_buffer.m_buffer : VK_NULL_HANDLE;
+
+    // A static ordinary-data descriptor moves on every re-upload, and ray tracing entry point data
+    // lives outside the descriptor sets; neither can be replayed.
+    const bool cacheable = dynamicOrdinaryData && !m_bindingData->entryPointData;
+    const uint64_t rootKey = cacheable ? computeRootBindingKey(shaderObject) : 0;
+    if (cacheable && reuseRootBinding(shaderObject, specializedLayout, rootKey, ordinaryDataVkBuffer))
+    {
+        outBindingData = m_bindingData;
+        return SLANG_OK;
+    }
+
+    // TODO(shaderobject): we should count number of buffers/textures in the layout and allocate appropriately
+    // For now we use a fixed starting capacity and grow as needed.
+    m_bindingData->bufferStateCapacity = 1024;
+    m_bindingData->bufferStates =
+        m_allocator->allocate<BindingDataImpl::BufferState>(m_bindingData->bufferStateCapacity);
+    m_bindingData->bufferStateCount = 0;
+    m_bindingData->textureStateCapacity = 1024;
+    m_bindingData->textureStates =
+        m_allocator->allocate<BindingDataImpl::TextureState>(m_bindingData->textureStateCapacity);
+    m_bindingData->textureStateCount = 0;
+
+    uint32_t totalDescriptorSetCount = specializedLayout->getTotalDescriptorSetCount();
+    if (m_device->m_bindlessDescriptorSet)
+    {
+        // The bindless descriptor set is always the last descriptor set in the pipeline layout.
+        // We need to add one more descriptor set to the count to account for it.
+        totalDescriptorSetCount++;
+    }
+    m_bindingData->descriptorSets = m_allocator->allocate<VkDescriptorSet>(totalDescriptorSetCount);
+    m_bindingData->descriptorSetCount = 0;
 
     BindingOffset offset = {};
 
@@ -305,8 +331,25 @@ Result BindingDataBuilder::bindAsRoot(
 
     SLANG_RETURN_ON_FAIL(allocateDescriptorSets(shaderObject, offset, specializedLayout));
 
-    BindingOffset ordinaryDataBufferOffset = offset;
-    SLANG_RETURN_ON_FAIL(bindOrdinaryDataBufferIfNeeded(shaderObject, ordinaryDataBufferOffset, specializedLayout));
+    if (ordinaryDataSize != 0 && dynamicOrdinaryData)
+    {
+        // Base offset zero: the allocation is reached by the dynamic offset instead, so the same
+        // descriptor stays valid for every later allocation on this page.
+        writePlainBufferDescriptor(
+            m_device,
+            m_bindingData->descriptorSets[offset.bindingSet],
+            offset.binding,
+            0,
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+            ordinaryDataBuffer,
+            {0, ordinaryDataSize}
+        );
+    }
+    else
+    {
+        BindingOffset ordinaryDataBufferOffset = offset;
+        SLANG_RETURN_ON_FAIL(bindOrdinaryDataBufferIfNeeded(shaderObject, ordinaryDataBufferOffset, specializedLayout));
+    }
 
     SLANG_RETURN_ON_FAIL(bindAsValue(shaderObject, offset, specializedLayout));
 
@@ -329,6 +372,11 @@ Result BindingDataBuilder::bindAsRoot(
     {
         m_bindingData->descriptorSets[m_bindingData->descriptorSetCount++] =
             m_device->m_bindlessDescriptorSet->m_descriptorSet;
+    }
+
+    if (cacheable)
+    {
+        storeRootBinding(shaderObject, specializedLayout, rootKey, ordinaryDataVkBuffer);
     }
 
     outBindingData = m_bindingData;
@@ -391,6 +439,7 @@ Result BindingDataBuilder::bindAsPushConstantBuffer(
             pushConstantRange.size,
             specializedLayout
         ));
+        m_pushConstantSources.push_back({pushConstantRange, shaderObject, specializedLayout});
     }
 
     // Resources and nested parameter blocks in the push-constant element type still
@@ -475,44 +524,80 @@ Result BindingDataBuilder::bindAsValue(
             ResourceState requiredState = bindingRangeInfo.bindingType == slang::BindingType::Texture
                                               ? ResourceState::ShaderResource
                                               : ResourceState::UnorderedAccess;
+            VkImageLayout imageLayout = descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                            ? VK_IMAGE_LAYOUT_GENERAL
+                                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            m_imageInfos.resize(count);
             for (uint32_t i = 0; i < count; ++i)
             {
                 const ResourceSlot& slot = shaderObject->m_slots[slotIndex + i];
                 TextureViewImpl* textureView = checked_cast<TextureViewImpl*>(slot.resource.get());
-                writeTextureDescriptor(device, descriptorSet, binding, i, descriptorType, textureView);
+                VkDescriptorImageInfo& imageInfo = m_imageInfos[i];
+                imageInfo = {};
                 if (textureView)
                 {
+                    imageInfo.imageView = textureView->getView().imageView;
+                    imageInfo.imageLayout = imageLayout;
                     writeTextureState(this, textureView, requiredState);
                 }
             }
+            writeImageDescriptors(device, descriptorSet, binding, descriptorType, m_imageInfos.data(), count);
             break;
         }
         case slang::BindingType::CombinedTextureSampler:
         {
             VkDescriptorSet descriptorSet = m_bindingData->descriptorSets[rangeOffset.bindingSet];
             ResourceState requiredState = ResourceState::ShaderResource;
+            m_imageInfos.resize(count);
             for (uint32_t i = 0; i < count; ++i)
             {
                 const ResourceSlot& slot = shaderObject->m_slots[slotIndex + i];
                 TextureViewImpl* textureView = checked_cast<TextureViewImpl*>(slot.resource.get());
                 SamplerImpl* sampler = checked_cast<SamplerImpl*>(slot.resource2.get());
-                writeTextureSamplerDescriptor(device, descriptorSet, binding, i, textureView, sampler);
+                VkDescriptorImageInfo& imageInfo = m_imageInfos[i];
+                imageInfo = {};
+                if (textureView && sampler)
+                {
+                    imageInfo.imageView = textureView->getView().imageView;
+                    imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    imageInfo.sampler = sampler->m_sampler;
+                }
                 if (textureView)
                 {
                     writeTextureState(this, textureView, requiredState);
                 }
             }
+            writeImageDescriptors(
+                device,
+                descriptorSet,
+                binding,
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                m_imageInfos.data(),
+                count
+            );
             break;
         }
         case slang::BindingType::Sampler:
         {
             VkDescriptorSet descriptorSet = m_bindingData->descriptorSets[rangeOffset.bindingSet];
+            m_imageInfos.resize(count);
             for (uint32_t i = 0; i < count; ++i)
             {
                 const ResourceSlot& slot = shaderObject->m_slots[slotIndex + i];
                 SamplerImpl* sampler = checked_cast<SamplerImpl*>(slot.resource.get());
-                writeSamplerDescriptor(device, descriptorSet, binding, i, sampler);
+                VkDescriptorImageInfo& imageInfo = m_imageInfos[i];
+                imageInfo = {};
+                imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                imageInfo.sampler = sampler ? sampler->m_sampler : device->m_defaultSampler;
             }
+            writeImageDescriptors(
+                device,
+                descriptorSet,
+                binding,
+                VK_DESCRIPTOR_TYPE_SAMPLER,
+                m_imageInfos.data(),
+                count
+            );
             break;
         }
         case slang::BindingType::RawBuffer:
@@ -524,16 +609,23 @@ Result BindingDataBuilder::bindAsValue(
             ResourceState requiredState = bindingRangeInfo.bindingType == slang::BindingType::RawBuffer
                                               ? ResourceState::ShaderResource
                                               : ResourceState::UnorderedAccess;
+            m_bufferInfos.resize(count);
             for (uint32_t i = 0; i < count; ++i)
             {
                 const ResourceSlot& slot = shaderObject->m_slots[slotIndex + i];
                 BufferImpl* buffer = checked_cast<BufferImpl*>(slot.resource.get());
-                writePlainBufferDescriptor(device, descriptorSet, binding, i, descriptorType, buffer, slot.bufferRange);
+                VkDescriptorBufferInfo& bufferInfo = m_bufferInfos[i];
+                bufferInfo = {};
+                bufferInfo.range = VK_WHOLE_SIZE;
                 if (buffer)
                 {
+                    bufferInfo.buffer = buffer->m_buffer.m_buffer;
+                    bufferInfo.offset = slot.bufferRange.offset;
+                    bufferInfo.range = slot.bufferRange.size;
                     writeBufferState(this, buffer, requiredState);
                 }
             }
+            writeBufferDescriptors(device, descriptorSet, binding, descriptorType, m_bufferInfos.data(), count);
             break;
         }
         case slang::BindingType::TypedBuffer:
@@ -546,40 +638,48 @@ Result BindingDataBuilder::bindAsValue(
             ResourceState requiredState = bindingRangeInfo.bindingType == slang::BindingType::TypedBuffer
                                               ? ResourceState::ShaderResource
                                               : ResourceState::UnorderedAccess;
+            m_bufferViews.resize(count);
             for (uint32_t i = 0; i < count; ++i)
             {
                 const ResourceSlot& slot = shaderObject->m_slots[slotIndex + i];
                 BufferImpl* buffer = checked_cast<BufferImpl*>(slot.resource.get());
-                writeTexelBufferDescriptor(
-                    device,
-                    descriptorSet,
-                    binding,
-                    i,
-                    descriptorType,
-                    buffer,
-                    slot.format,
-                    slot.bufferRange
-                );
+                m_bufferViews[i] = buffer ? buffer->getView(slot.format, slot.bufferRange) : VK_NULL_HANDLE;
                 if (buffer)
                 {
                     writeBufferState(this, buffer, requiredState);
                 }
             }
+            writeTexelBufferDescriptors(device, descriptorSet, binding, descriptorType, m_bufferViews.data(), count);
             break;
         }
         case slang::BindingType::RayTracingAccelerationStructure:
         {
             VkDescriptorSet descriptorSet = m_bindingData->descriptorSets[rangeOffset.bindingSet];
+            m_accelerationStructures.resize(count);
             for (uint32_t i = 0; i < count; ++i)
             {
                 const ResourceSlot& slot = shaderObject->m_slots[slotIndex + i];
                 AccelerationStructureImpl* as = checked_cast<AccelerationStructureImpl*>(slot.resource.get());
-                writeAccelerationStructureDescriptor(device, descriptorSet, binding, i, as);
+                // The Vulkan spec states: If the nullDescriptor feature is not enabled, each
+                // element of pAccelerationStructures must not be VK_NULL_HANDLE
+                if (!as && !device->m_api.m_extendedFeatures.robustness2Features.nullDescriptor)
+                {
+                    SLANG_RHI_ASSERT_FAILURE("nullDescriptor feature is not available on the device");
+                    return SLANG_FAIL;
+                }
+                m_accelerationStructures[i] = as ? as->m_vkHandle : VK_NULL_HANDLE;
                 if (as)
                 {
                     writeBufferState(this, as->m_buffer, ResourceState::AccelerationStructureRead);
                 }
             }
+            writeAccelerationStructureDescriptors(
+                device,
+                descriptorSet,
+                binding,
+                m_accelerationStructures.data(),
+                count
+            );
             break;
         }
 
@@ -720,6 +820,169 @@ Result BindingDataBuilder::allocateDescriptorSets(
     return SLANG_OK;
 }
 
+bool BindingDataBuilder::reuseRootBinding(
+    ShaderObject* shaderObject,
+    ShaderObjectLayoutImpl* specializedLayout,
+    uint64_t key,
+    VkBuffer ordinaryDataBuffer
+)
+{
+    auto it = m_bindingCache->rootBindings.find(shaderObject);
+    if (it == m_bindingCache->rootBindings.end())
+        return false;
+
+    const RootBindingCacheEntry& entry = it->second;
+    if (entry.layout != specializedLayout || entry.key != key || entry.ordinaryDataBuffer != ordinaryDataBuffer)
+        return false;
+
+    // The cached arrays are arena memory that outlives every draw in this command buffer, and a
+    // replay only reads them, so they are shared rather than copied.
+    m_bindingData->descriptorSets = entry.descriptorSets;
+    m_bindingData->descriptorSetCount = entry.descriptorSetCount;
+    m_bindingData->bufferStates = entry.bufferStates;
+    m_bindingData->bufferStateCount = entry.bufferStateCount;
+    m_bindingData->bufferStateCapacity = entry.bufferStateCount;
+    m_bindingData->textureStates = entry.textureStates;
+    m_bindingData->textureStateCount = entry.textureStateCount;
+    m_bindingData->textureStateCapacity = entry.textureStateCount;
+
+    // Push constants carry per-draw ordinary data, so they are re-uploaded from their sources.
+    for (uint32_t i = 0; i < entry.pushConstantCount; ++i)
+    {
+        const PushConstantSource& source = entry.pushConstants[i];
+        const uint32_t index = m_bindingData->pushConstantCount++;
+        m_bindingData->pushConstantRanges[index] = source.range;
+        m_bindingData->pushConstantData[index] = m_allocator->allocate(source.range.size);
+        if (SLANG_FAILED(
+                source.object->writeOrdinaryData(m_bindingData->pushConstantData[index], source.range.size, source.layout)
+            ))
+        {
+            m_bindingData->pushConstantCount = 0;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void BindingDataBuilder::storeRootBinding(
+    ShaderObject* shaderObject,
+    ShaderObjectLayoutImpl* specializedLayout,
+    uint64_t key,
+    VkBuffer ordinaryDataBuffer
+)
+{
+    RootBindingCacheEntry entry = {};
+    entry.layout = specializedLayout;
+    entry.key = key;
+    entry.ordinaryDataBuffer = ordinaryDataBuffer;
+    entry.descriptorSets = m_bindingData->descriptorSets;
+    entry.descriptorSetCount = m_bindingData->descriptorSetCount;
+    entry.bufferStates = m_bindingData->bufferStates;
+    entry.bufferStateCount = m_bindingData->bufferStateCount;
+    entry.textureStates = m_bindingData->textureStates;
+    entry.textureStateCount = m_bindingData->textureStateCount;
+
+    entry.pushConstantCount = (uint32_t)m_pushConstantSources.size();
+    if (entry.pushConstantCount)
+    {
+        entry.pushConstants = m_allocator->allocate<PushConstantSource>(entry.pushConstantCount);
+        std::memcpy(
+            entry.pushConstants,
+            m_pushConstantSources.data(),
+            entry.pushConstantCount * sizeof(PushConstantSource)
+        );
+    }
+
+    m_bindingCache->rootBindings[shaderObject] = entry;
+}
+
+bool BindingDataBuilder::reuseParameterBlock(
+    ShaderObject* shaderObject,
+    ShaderObjectLayoutImpl* specializedLayout,
+    uint64_t version
+)
+{
+    for (const ParameterBlockCacheEntry& entry : m_bindingCache->parameterBlocks)
+    {
+        if (entry.object != shaderObject || entry.layout != specializedLayout || entry.version != version)
+            continue;
+
+        for (uint32_t i = 0; i < entry.descriptorSetCount; ++i)
+            m_bindingData->descriptorSets[m_bindingData->descriptorSetCount++] = entry.descriptorSets[i];
+
+        // The bindings are reused, but the resource states they require still have to be
+        // declared for this draw so the recorder emits the same barriers as a fresh build.
+        for (uint32_t i = 0; i < entry.bufferStateCount; ++i)
+            writeBufferState(this, entry.bufferStates[i].buffer, entry.bufferStates[i].state);
+        for (uint32_t i = 0; i < entry.textureStateCount; ++i)
+            writeTextureState(this, entry.textureStates[i].textureView, entry.textureStates[i].state);
+
+        return true;
+    }
+    return false;
+}
+
+void BindingDataBuilder::storeParameterBlock(
+    ShaderObject* shaderObject,
+    ShaderObjectLayoutImpl* specializedLayout,
+    uint64_t version,
+    uint32_t firstDescriptorSet,
+    uint32_t firstBufferState,
+    uint32_t firstTextureState
+)
+{
+    ParameterBlockCacheEntry entry = {};
+    entry.object = shaderObject;
+    entry.layout = specializedLayout;
+    entry.version = version;
+
+    entry.descriptorSetCount = m_bindingData->descriptorSetCount - firstDescriptorSet;
+    if (entry.descriptorSetCount)
+    {
+        entry.descriptorSets = m_allocator->allocate<VkDescriptorSet>(entry.descriptorSetCount);
+        std::memcpy(
+            entry.descriptorSets,
+            m_bindingData->descriptorSets + firstDescriptorSet,
+            entry.descriptorSetCount * sizeof(VkDescriptorSet)
+        );
+    }
+
+    entry.bufferStateCount = m_bindingData->bufferStateCount - firstBufferState;
+    if (entry.bufferStateCount)
+    {
+        entry.bufferStates = m_allocator->allocate<BindingDataImpl::BufferState>(entry.bufferStateCount);
+        std::memcpy(
+            entry.bufferStates,
+            m_bindingData->bufferStates + firstBufferState,
+            entry.bufferStateCount * sizeof(BindingDataImpl::BufferState)
+        );
+    }
+
+    entry.textureStateCount = m_bindingData->textureStateCount - firstTextureState;
+    if (entry.textureStateCount)
+    {
+        entry.textureStates = m_allocator->allocate<BindingDataImpl::TextureState>(entry.textureStateCount);
+        std::memcpy(
+            entry.textureStates,
+            m_bindingData->textureStates + firstTextureState,
+            entry.textureStateCount * sizeof(BindingDataImpl::TextureState)
+        );
+    }
+
+    // A new version supersedes the old one; the stale sets stay allocated until the
+    // command buffer resets its descriptor pools, and earlier binding data still uses them.
+    for (ParameterBlockCacheEntry& existing : m_bindingCache->parameterBlocks)
+    {
+        if (existing.object == shaderObject && existing.layout == specializedLayout)
+        {
+            existing = entry;
+            return;
+        }
+    }
+    m_bindingCache->parameterBlocks.push_back(entry);
+}
+
 Result BindingDataBuilder::bindAsParameterBlock(
     ShaderObject* shaderObject,
     const BindingOffset& inOffset,
@@ -735,6 +998,17 @@ Result BindingDataBuilder::bindAsParameterBlock(
     offset.bindingSet = m_bindingData->descriptorSetCount;
     offset.binding = 0;
 
+    // A parameter block's sets depend only on its contents, so an unchanged block can reuse
+    // the sets built for it earlier in this command buffer instead of rewriting every descriptor.
+    const uint64_t version = shaderObject->getCompositeVersion();
+    if (reuseParameterBlock(shaderObject, specializedLayout, version))
+        return SLANG_OK;
+
+    const uint32_t firstDescriptorSet = m_bindingData->descriptorSetCount;
+    const uint32_t firstBufferState = m_bindingData->bufferStateCount;
+    const uint32_t firstTextureState = m_bindingData->textureStateCount;
+    const uint32_t pushConstantCount = m_bindingData->pushConstantCount;
+
     // Note: Interface-type binding handling has been simplified
     // now that pending data layout APIs have been removed.
 
@@ -746,6 +1020,20 @@ Result BindingDataBuilder::bindAsParameterBlock(
 
     SLANG_RHI_ASSERT(offset.bindingSet < m_bindingData->descriptorSetCount);
     SLANG_RETURN_ON_FAIL(bindAsConstantBuffer(shaderObject, offset, specializedLayout));
+
+    // Push constants live in the binding data, not in the descriptor sets, so a block
+    // that emitted any cannot be replayed from the cache alone.
+    if (m_bindingData->pushConstantCount == pushConstantCount)
+    {
+        storeParameterBlock(
+            shaderObject,
+            specializedLayout,
+            version,
+            firstDescriptorSet,
+            firstBufferState,
+            firstTextureState
+        );
+    }
 
     return SLANG_OK;
 }
