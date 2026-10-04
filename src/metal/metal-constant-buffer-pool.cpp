@@ -67,7 +67,6 @@ Result ConstantBufferPool::createPage(size_t size, Page& outPage)
 
     outPage.size = size;
     outPage.buffer = checked_cast<BufferImpl*>(buffer.get());
-    outPage.buffer->breakStrongReferenceToDevice();
     outPage.mappedData = static_cast<uint8_t*>(outPage.buffer->m_buffer->contents());
     return SLANG_OK;
 }

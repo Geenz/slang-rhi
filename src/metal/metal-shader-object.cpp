@@ -307,11 +307,8 @@ Result BindingDataBuilder::bindAsRootFlat(
         if (argBuffer)
         {
             SLANG_RETURN_ON_FAIL(setBuffer(m_bindingData, ab.bindingDataRegister, argBuffer, argOffset));
-            // writeArgumentBuffer already pins this arg buffer for the CB via the
-            // BindingCache (BufferImpl RefPtr), but the raw pointer just written
-            // into binding data is the queue-cached object once stored above; pin
-            // it here too so the CB lifetime is self-covering regardless of cache
-            // eviction. RetainPtr retains (mirrors the cache store at :283/:291).
+            // The queue cache can drop this arg buffer before the deferred finish() encode reads the raw pointer
+            // written above, so the command buffer retains it too.
             if (m_trackedArgBuffers)
                 m_trackedArgBuffers->push_back(NS::RetainPtr(argBuffer));
         }

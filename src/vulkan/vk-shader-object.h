@@ -31,7 +31,7 @@ struct BindingDataBuilder
     DescriptorSetAllocator* m_descriptorSetAllocator;
     CommandQueueImpl* m_queue;
     /// The command buffer's retain set. bindAsValue pins every resource it writes into a descriptor.
-    std::set<RefPtr<RefObject>>* m_trackedObjects;
+    std::set<InternalRefPtr<RefObject>>* m_trackedObjects;
 
     // TODO remove
     std::span<const VkPushConstantRange> m_pushConstantRanges;
@@ -254,7 +254,7 @@ public:
     CommandQueueImpl* m_queue = nullptr;
     RefPtr<ShaderObjectLayoutImpl> m_layout;
     VulkanDescriptorSet m_descriptorSet = {};
-    std::vector<RefPtr<Resource>> m_resources;
+    std::vector<InternalRefPtr<Resource>> m_resources;
     std::vector<BindingDataImpl::BufferState> m_bufferStates;
     std::vector<BindingDataImpl::TextureState> m_textureStates;
     uint64_t m_lastUsedID = 0;

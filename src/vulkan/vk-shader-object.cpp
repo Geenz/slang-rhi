@@ -41,7 +41,7 @@ static uint64_t hashSlots(const ShaderObject* object)
 static uint64_t hashBindingState(const ShaderObject* object)
 {
     uint64_t hash = hashSlots(object);
-    for (const RefPtr<ShaderObject>& subObject : object->m_objects)
+    for (const InternalRefPtr<ShaderObject>& subObject : object->m_objects)
     {
         hash = hashCombine(hash, uint64_t(uintptr_t(subObject.get())));
         hash = hashCombine(hash, subObject ? subObject->getCompositeVersion() : 0);
@@ -54,7 +54,7 @@ static uint64_t hashBindingState(const ShaderObject* object)
 static uint64_t computeRootBindingKey(RootShaderObject* rootObject)
 {
     uint64_t hash = hashBindingState(rootObject);
-    for (const RefPtr<ShaderObject>& entryPoint : rootObject->m_entryPoints)
+    for (const InternalRefPtr<ShaderObject>& entryPoint : rootObject->m_entryPoints)
     {
         hash = hashCombine(hash, uint64_t(uintptr_t(entryPoint.get())));
         if (entryPoint)
@@ -1237,7 +1237,7 @@ Result BindingDataBuilder::bindSharedParameterBlock(
 
         writeCachedBlock(this, entry.get());
 
-        m_trackedObjects->insert(RefPtr<RefObject>(entry.get()));
+        m_trackedObjects->insert(entry.get());
         outHandled = true;
         return SLANG_OK;
     }
@@ -1264,7 +1264,7 @@ Result BindingDataBuilder::bindSharedParameterBlock(
     created->m_queue = m_queue;
     created->m_layout = specializedLayout;
     created->m_descriptorSet = descriptorSet;
-    m_trackedObjects->insert(RefPtr<RefObject>(created.get()));
+    m_trackedObjects->insert(created.get());
 
     const uint32_t firstBufferState = m_bindingData->bufferStateCount;
     const uint32_t firstTextureState = m_bindingData->textureStateCount;

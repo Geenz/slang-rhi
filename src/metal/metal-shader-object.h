@@ -39,18 +39,9 @@ struct BindingDataBuilder
     /// may call getBindingData() concurrently on encoders sharing a queue.
     std::mutex* m_argCacheMutex = nullptr;
 
-    /// The command buffer's tracked-objects set (CommandBuffer::m_trackedObjects).
-    /// BindingDataImpl stores RAW MTL::Buffer*/MTL::Texture* pointers that are only
-    /// dereferenced at CommandEncoderImpl::finish() (deferred encode). The shader
-    /// object's ResourceSlot RefPtr is the only thing keeping those alive at record
-    /// time — and slots are freely rebound between dispatches (this engine reuses one
-    /// mutable shader object per pass), so a rebind or a last-reference release on
-    /// another thread between record and finish leaves a dangling pointer that
-    /// crashes objc_retain inside the encoder (AGX setBuffers_impl). Every resource
-    /// resolved into binding data must therefore be retained here for the command
-    /// buffer's lifetime; the set dedups, so repeated binds of the same resource
-    /// across dispatches cost one node.
-    std::set<RefPtr<RefObject>>* m_trackedObjects = nullptr;
+    /// Binding data holds raw MTL pointers dereferenced only at finish() and slots rebind freely, so every
+    /// resolved resource is retained here (CommandBuffer::m_trackedObjects) for the command buffer's lifetime.
+    std::set<InternalRefPtr<RefObject>>* m_trackedObjects = nullptr;
 
     /// The command buffer's tracked argument buffers (CommandBufferImpl::m_trackedArgBuffers).
     /// m_trackedObjects pins slot CONTENTS but not the cached argument buffer OBJECT
