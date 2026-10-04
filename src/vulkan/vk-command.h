@@ -28,6 +28,14 @@ public:
     uint64_t m_lastFinishedID = 0;
 
     std::mutex m_mutex;
+
+    // Shared parameter-block sets. The mutex is a leaf: never held while releasing a CachedParameterBlock.
+    std::mutex m_parameterBlockCacheMutex;
+    DescriptorSetAllocator m_parameterBlockSetAllocator;
+    std::unordered_map<uint64_t, RefPtr<CachedParameterBlock>> m_parameterBlockSets;
+    std::unordered_map<ShaderObject*, ParameterBlockContent> m_parameterBlockContents;
+    uint64_t m_nextParameterBlockSweepID = 0;
+
     std::list<RefPtr<CommandBufferImpl>> m_commandBuffersPool;
     std::list<RefPtr<CommandBufferImpl>> m_commandBuffersInFlight;
 
@@ -59,6 +67,9 @@ public:
 
     /// Delete deferred resources that are no longer in use by the GPU.
     void executeDeferredDeletes();
+
+    /// Drop shared parameter-block sets not used within the retention window.
+    void evictParameterBlockSets(uint64_t lastFinishedID);
 
     // ICommandQueue implementation
     virtual SLANG_NO_THROW Result SLANG_MCALL createCommandEncoder(

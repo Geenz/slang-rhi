@@ -181,6 +181,12 @@ public:
     /// VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, so a per-draw re-upload only moves a dynamic offset.
     bool m_ordinaryDataBufferIsDynamic = false;
 
+    /// One own set holding only this object's resources, so the set can outlive a command buffer.
+    bool m_ownSetIsShareable = false;
+
+    /// Hash of the own set's bindings and binding ranges; equal values bind interchangeably.
+    uint64_t m_ownSetIdentity = 0;
+
     static Result createForElementType(
         DeviceImpl* device,
         slang::ISession* session,

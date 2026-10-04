@@ -6,10 +6,13 @@
 #include "vk-acceleration-structure.h"
 #include "vk-shader-object-layout.h"
 #include "vk-bindless-descriptor-set.h"
+#include "vk-command.h"
 
 #include "../state-tracking.h"
 
 #include <string>
+#include <tracy/Tracy.hpp> // TEMP-TRACY
+#include <tracy/TracyC.h> // TEMP-TRACY
 
 namespace rhi::vk {
 
@@ -18,9 +21,7 @@ inline uint64_t hashCombine(uint64_t hash, uint64_t value)
     return hash ^ (value + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
 }
 
-/// Fingerprint of everything an object contributes to a descriptor set, excluding its own ordinary
-/// data. Sub-objects are folded in by identity and composite version instead.
-static uint64_t hashBindingState(const ShaderObject* object)
+static uint64_t hashSlots(const ShaderObject* object)
 {
     uint64_t hash = object->m_slots.size();
     for (const ResourceSlot& slot : object->m_slots)
@@ -32,6 +33,14 @@ static uint64_t hashBindingState(const ShaderObject* object)
         hash = hashCombine(hash, uint64_t(slot.bufferRange.offset));
         hash = hashCombine(hash, uint64_t(slot.bufferRange.size));
     }
+    return hash;
+}
+
+/// Fingerprint of everything an object contributes to a descriptor set, excluding its own ordinary
+/// data. Sub-objects are folded in by identity and composite version instead.
+static uint64_t hashBindingState(const ShaderObject* object)
+{
+    uint64_t hash = hashSlots(object);
     for (const RefPtr<ShaderObject>& subObject : object->m_objects)
     {
         hash = hashCombine(hash, uint64_t(uintptr_t(subObject.get())));
@@ -56,6 +65,7 @@ static uint64_t computeRootBindingKey(RootShaderObject* rootObject)
 
 inline void writeDescriptor(DeviceImpl* device, const VkWriteDescriptorSet& write)
 {
+    ZoneScopedN("rhi.descWrite"); // TEMP-TRACY
     device->m_api.vkUpdateDescriptorSets(device->m_device, 1, &write, 0, nullptr);
 }
 
@@ -227,6 +237,37 @@ inline void writeTextureState(BindingDataBuilder* builder, TextureViewImpl* text
     bindingData->textureStates[bindingData->textureStateCount++] = {textureView, state};
 }
 
+inline void writeCachedBlock(BindingDataBuilder* builder, CachedParameterBlock* block)
+{
+    BindingDataImpl* bindingData = builder->m_bindingData;
+
+    if (bindingData->cachedBlockCount >= bindingData->cachedBlockCapacity)
+    {
+        uint32_t newCapacity = 16;
+
+        if (bindingData->cachedBlockCapacity != 0)
+        {
+            newCapacity = bindingData->cachedBlockCapacity * 2;
+        }
+
+        CachedParameterBlock** newBlocks = builder->m_allocator->allocate<CachedParameterBlock*>(newCapacity);
+
+        if (bindingData->cachedBlockCount != 0)
+        {
+            std::memcpy(
+                newBlocks,
+                bindingData->cachedBlocks,
+                bindingData->cachedBlockCount * sizeof(CachedParameterBlock*)
+            );
+        }
+
+        bindingData->cachedBlocks = newBlocks;
+        bindingData->cachedBlockCapacity = newCapacity;
+    }
+
+    bindingData->cachedBlocks[bindingData->cachedBlockCount++] = block;
+}
+
 
 Result BindingDataBuilder::bindAsRoot(
     RootShaderObject* shaderObject,
@@ -292,6 +333,7 @@ Result BindingDataBuilder::bindAsRoot(
         return SLANG_OK;
     }
 
+    ZoneNamedN(rhiZoneRootBuild, "rhi.root.build", true); // TEMP-TRACY
     // TODO(shaderobject): we should count number of buffers/textures in the layout and allocate appropriately
     // For now we use a fixed starting capacity and grow as needed.
     m_bindingData->bufferStateCapacity = 1024;
@@ -302,6 +344,9 @@ Result BindingDataBuilder::bindAsRoot(
     m_bindingData->textureStates =
         m_allocator->allocate<BindingDataImpl::TextureState>(m_bindingData->textureStateCapacity);
     m_bindingData->textureStateCount = 0;
+    m_bindingData->cachedBlocks = nullptr;
+    m_bindingData->cachedBlockCapacity = 0;
+    m_bindingData->cachedBlockCount = 0;
 
     uint32_t totalDescriptorSetCount = specializedLayout->getTotalDescriptorSetCount();
     if (m_device->m_bindlessDescriptorSet)
@@ -539,6 +584,7 @@ Result BindingDataBuilder::bindAsValue(
                     imageInfo.imageView = textureView->getView().imageView;
                     imageInfo.imageLayout = imageLayout;
                     writeTextureState(this, textureView, requiredState);
+                    m_trackedObjects->insert(slot.resource);
                 }
             }
             writeImageDescriptors(device, descriptorSet, binding, descriptorType, m_imageInfos.data(), count);
@@ -565,6 +611,12 @@ Result BindingDataBuilder::bindAsValue(
                 if (textureView)
                 {
                     writeTextureState(this, textureView, requiredState);
+                    m_trackedObjects->insert(slot.resource);
+                }
+
+                if (sampler)
+                {
+                    m_trackedObjects->insert(slot.resource2);
                 }
             }
             writeImageDescriptors(
@@ -589,6 +641,11 @@ Result BindingDataBuilder::bindAsValue(
                 imageInfo = {};
                 imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
                 imageInfo.sampler = sampler ? sampler->m_sampler : device->m_defaultSampler;
+
+                if (sampler)
+                {
+                    m_trackedObjects->insert(slot.resource);
+                }
             }
             writeImageDescriptors(
                 device,
@@ -623,6 +680,7 @@ Result BindingDataBuilder::bindAsValue(
                     bufferInfo.offset = slot.bufferRange.offset;
                     bufferInfo.range = slot.bufferRange.size;
                     writeBufferState(this, buffer, requiredState);
+                    m_trackedObjects->insert(slot.resource);
                 }
             }
             writeBufferDescriptors(device, descriptorSet, binding, descriptorType, m_bufferInfos.data(), count);
@@ -647,6 +705,7 @@ Result BindingDataBuilder::bindAsValue(
                 if (buffer)
                 {
                     writeBufferState(this, buffer, requiredState);
+                    m_trackedObjects->insert(slot.resource);
                 }
             }
             writeTexelBufferDescriptors(device, descriptorSet, binding, descriptorType, m_bufferViews.data(), count);
@@ -671,6 +730,7 @@ Result BindingDataBuilder::bindAsValue(
                 if (as)
                 {
                     writeBufferState(this, as->m_buffer, ResourceState::AccelerationStructureRead);
+                    m_trackedObjects->insert(slot.resource);
                 }
             }
             writeAccelerationStructureDescriptors(
@@ -827,6 +887,7 @@ bool BindingDataBuilder::reuseRootBinding(
     VkBuffer ordinaryDataBuffer
 )
 {
+    ZoneScopedN("rhi.root.reuse"); // TEMP-TRACY
     auto it = m_bindingCache->rootBindings.find(shaderObject);
     if (it == m_bindingCache->rootBindings.end())
         return false;
@@ -845,6 +906,9 @@ bool BindingDataBuilder::reuseRootBinding(
     m_bindingData->textureStates = entry.textureStates;
     m_bindingData->textureStateCount = entry.textureStateCount;
     m_bindingData->textureStateCapacity = entry.textureStateCount;
+    m_bindingData->cachedBlocks = entry.cachedBlocks;
+    m_bindingData->cachedBlockCount = entry.cachedBlockCount;
+    m_bindingData->cachedBlockCapacity = entry.cachedBlockCount;
 
     // Push constants carry per-draw ordinary data, so they are re-uploaded from their sources.
     for (uint32_t i = 0; i < entry.pushConstantCount; ++i)
@@ -882,6 +946,8 @@ void BindingDataBuilder::storeRootBinding(
     entry.bufferStateCount = m_bindingData->bufferStateCount;
     entry.textureStates = m_bindingData->textureStates;
     entry.textureStateCount = m_bindingData->textureStateCount;
+    entry.cachedBlocks = m_bindingData->cachedBlocks;
+    entry.cachedBlockCount = m_bindingData->cachedBlockCount;
 
     entry.pushConstantCount = (uint32_t)m_pushConstantSources.size();
     if (entry.pushConstantCount)
@@ -903,6 +969,7 @@ bool BindingDataBuilder::reuseParameterBlock(
     uint64_t version
 )
 {
+    ZoneScopedN("rhi.pb.reuse"); // TEMP-TRACY
     for (const ParameterBlockCacheEntry& entry : m_bindingCache->parameterBlocks)
     {
         if (entry.object != shaderObject || entry.layout != specializedLayout || entry.version != version)
@@ -918,6 +985,11 @@ bool BindingDataBuilder::reuseParameterBlock(
         for (uint32_t i = 0; i < entry.textureStateCount; ++i)
             writeTextureState(this, entry.textureStates[i].textureView, entry.textureStates[i].state);
 
+        for (uint32_t i = 0; i < entry.cachedBlockCount; ++i)
+        {
+            writeCachedBlock(this, entry.cachedBlocks[i]);
+        }
+
         return true;
     }
     return false;
@@ -929,7 +1001,8 @@ void BindingDataBuilder::storeParameterBlock(
     uint64_t version,
     uint32_t firstDescriptorSet,
     uint32_t firstBufferState,
-    uint32_t firstTextureState
+    uint32_t firstTextureState,
+    uint32_t firstCachedBlock
 )
 {
     ParameterBlockCacheEntry entry = {};
@@ -970,6 +1043,17 @@ void BindingDataBuilder::storeParameterBlock(
         );
     }
 
+    entry.cachedBlockCount = m_bindingData->cachedBlockCount - firstCachedBlock;
+    if (entry.cachedBlockCount)
+    {
+        entry.cachedBlocks = m_allocator->allocate<CachedParameterBlock*>(entry.cachedBlockCount);
+        std::memcpy(
+            entry.cachedBlocks,
+            m_bindingData->cachedBlocks + firstCachedBlock,
+            entry.cachedBlockCount * sizeof(CachedParameterBlock*)
+        );
+    }
+
     // A new version supersedes the old one; the stale sets stay allocated until the
     // command buffer resets its descriptor pools, and earlier binding data still uses them.
     for (ParameterBlockCacheEntry& existing : m_bindingCache->parameterBlocks)
@@ -981,6 +1065,18 @@ void BindingDataBuilder::storeParameterBlock(
         }
     }
     m_bindingCache->parameterBlocks.push_back(entry);
+}
+
+CachedParameterBlock::~CachedParameterBlock()
+{
+    if (m_descriptorSet.handle != VK_NULL_HANDLE)
+    {
+        ZoneScopedN("rhi.pbq.free"); // TEMP-TRACY
+        TracyCZoneN(rhiPbqFreeLockWait, "rhi.pbq.lockWait", 1); // TEMP-TRACY
+        std::lock_guard<std::mutex> lock(m_queue->m_parameterBlockCacheMutex);
+        TracyCZoneEnd(rhiPbqFreeLockWait); // TEMP-TRACY
+        m_queue->m_parameterBlockSetAllocator.free(m_descriptorSet);
+    }
 }
 
 Result BindingDataBuilder::bindAsParameterBlock(
@@ -1007,6 +1103,29 @@ Result BindingDataBuilder::bindAsParameterBlock(
     const uint32_t firstDescriptorSet = m_bindingData->descriptorSetCount;
     const uint32_t firstBufferState = m_bindingData->bufferStateCount;
     const uint32_t firstTextureState = m_bindingData->textureStateCount;
+    const uint32_t firstCachedBlock = m_bindingData->cachedBlockCount;
+
+    if (specializedLayout->m_ownSetIsShareable && m_queue)
+    {
+        bool handled = false;
+        SLANG_RETURN_ON_FAIL(bindSharedParameterBlock(shaderObject, offset, specializedLayout, handled));
+
+        if (handled)
+        {
+            storeParameterBlock(
+                shaderObject,
+                specializedLayout,
+                version,
+                firstDescriptorSet,
+                firstBufferState,
+                firstTextureState,
+                firstCachedBlock
+            );
+            return SLANG_OK;
+        }
+    }
+
+    ZoneNamedN(rhiZonePbBuild, "rhi.pb.build", true); // TEMP-TRACY
     const uint32_t pushConstantCount = m_bindingData->pushConstantCount;
 
     // Note: Interface-type binding handling has been simplified
@@ -1031,10 +1150,167 @@ Result BindingDataBuilder::bindAsParameterBlock(
             version,
             firstDescriptorSet,
             firstBufferState,
-            firstTextureState
+            firstTextureState,
+            firstCachedBlock
         );
     }
 
+    return SLANG_OK;
+}
+
+Result BindingDataBuilder::bindSharedParameterBlock(
+    ShaderObject* shaderObject,
+    const BindingOffset& offset,
+    ShaderObjectLayoutImpl* specializedLayout,
+    bool& outHandled
+)
+{
+    outHandled = false;
+    const uint64_t stamp = m_queue->m_lastSubmittedID;
+    uint64_t contentHash = 0;
+    bool haveContentHash = false;
+    size_t key = 0;
+    RefPtr<CachedParameterBlock> entry;
+
+    {
+        TracyCZoneN(rhiPbqLookupLockWait, "rhi.pbq.lockWait", 1); // TEMP-TRACY
+        std::lock_guard<std::mutex> lock(m_queue->m_parameterBlockCacheMutex);
+        TracyCZoneEnd(rhiPbqLookupLockWait); // TEMP-TRACY
+
+        auto contentIt = m_queue->m_parameterBlockContents.find(shaderObject);
+
+        if (contentIt != m_queue->m_parameterBlockContents.end())
+        {
+            ParameterBlockContent& content = contentIt->second;
+
+            if (content.uid == shaderObject->m_uid && content.version == shaderObject->m_version)
+            {
+                contentHash = content.contentHash;
+                haveContentHash = true;
+                content.lastUsedID = stamp;
+
+                key = specializedLayout->m_ownSetIdentity;
+                hash_combine(key, contentHash);
+                auto setIt = m_queue->m_parameterBlockSets.find(uint64_t(key));
+
+                if (setIt != m_queue->m_parameterBlockSets.end())
+                {
+                    entry = setIt->second;
+                    entry->m_lastUsedID = stamp;
+                }
+            }
+        }
+    }
+
+    if (!haveContentHash)
+    {
+        {
+            ZoneNamedN(rhiZonePbqHash, "rhi.pbq.hash", true); // TEMP-TRACY
+            contentHash = hashSlots(shaderObject);
+        }
+
+        key = specializedLayout->m_ownSetIdentity;
+        hash_combine(key, contentHash);
+
+        {
+            TracyCZoneN(rhiPbqStoreLockWait, "rhi.pbq.lockWait", 1); // TEMP-TRACY
+            std::lock_guard<std::mutex> lock(m_queue->m_parameterBlockCacheMutex);
+            TracyCZoneEnd(rhiPbqStoreLockWait); // TEMP-TRACY
+
+            ParameterBlockContent& content = m_queue->m_parameterBlockContents[shaderObject];
+            content = {shaderObject->m_uid, shaderObject->m_version, contentHash, stamp};
+
+            auto setIt = m_queue->m_parameterBlockSets.find(uint64_t(key));
+
+            if (setIt != m_queue->m_parameterBlockSets.end())
+            {
+                entry = setIt->second;
+                entry->m_lastUsedID = stamp;
+            }
+        }
+    }
+
+    if (entry)
+    {
+        ZoneNamedN(rhiZonePbqHit, "rhi.pbq.hit", true); // TEMP-TRACY
+        m_bindingData->descriptorSets[m_bindingData->descriptorSetCount++] = entry->m_descriptorSet.handle;
+
+        writeCachedBlock(this, entry.get());
+
+        m_trackedObjects->insert(RefPtr<RefObject>(entry.get()));
+        outHandled = true;
+        return SLANG_OK;
+    }
+
+    ZoneNamedN(rhiZonePbqMiss, "rhi.pbq.miss", true); // TEMP-TRACY
+    VulkanDescriptorSet descriptorSet = {};
+
+    {
+        TracyCZoneN(rhiPbqAllocLockWait, "rhi.pbq.lockWait", 1); // TEMP-TRACY
+        std::lock_guard<std::mutex> lock(m_queue->m_parameterBlockCacheMutex);
+        TracyCZoneEnd(rhiPbqAllocLockWait); // TEMP-TRACY
+
+        descriptorSet = m_queue->m_parameterBlockSetAllocator.allocate(
+            specializedLayout->getOwnDescriptorSets()[0].descriptorSetLayout
+        );
+    }
+
+    if (descriptorSet.handle == VK_NULL_HANDLE)
+    {
+        return SLANG_OK;
+    }
+
+    RefPtr<CachedParameterBlock> created = new CachedParameterBlock();
+    created->m_queue = m_queue;
+    created->m_layout = specializedLayout;
+    created->m_descriptorSet = descriptorSet;
+    m_trackedObjects->insert(RefPtr<RefObject>(created.get()));
+
+    const uint32_t firstBufferState = m_bindingData->bufferStateCount;
+    const uint32_t firstTextureState = m_bindingData->textureStateCount;
+    m_bindingData->descriptorSets[m_bindingData->descriptorSetCount++] = descriptorSet.handle;
+    SLANG_RETURN_ON_FAIL(bindAsConstantBuffer(shaderObject, offset, specializedLayout));
+
+    created->m_bufferStates.assign(
+        m_bindingData->bufferStates + firstBufferState,
+        m_bindingData->bufferStates + m_bindingData->bufferStateCount
+    );
+    created->m_textureStates.assign(
+        m_bindingData->textureStates + firstTextureState,
+        m_bindingData->textureStates + m_bindingData->textureStateCount
+    );
+
+    m_bindingData->bufferStateCount = firstBufferState;
+    m_bindingData->textureStateCount = firstTextureState;
+    writeCachedBlock(this, created.get());
+
+    for (const ResourceSlot& slot : shaderObject->m_slots)
+    {
+        if (slot.resource)
+        {
+            created->m_resources.push_back(slot.resource);
+        }
+
+        if (slot.resource2)
+        {
+            created->m_resources.push_back(slot.resource2);
+        }
+    }
+
+    RefPtr<CachedParameterBlock> replaced;
+
+    {
+        TracyCZoneN(rhiPbqPublishLockWait, "rhi.pbq.lockWait", 1); // TEMP-TRACY
+        std::lock_guard<std::mutex> lock(m_queue->m_parameterBlockCacheMutex);
+        TracyCZoneEnd(rhiPbqPublishLockWait); // TEMP-TRACY
+
+        RefPtr<CachedParameterBlock>& cached = m_queue->m_parameterBlockSets[uint64_t(key)];
+        replaced = cached;
+        cached = created;
+        created->m_lastUsedID = stamp;
+    }
+
+    outHandled = true;
     return SLANG_OK;
 }
 

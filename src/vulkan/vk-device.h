@@ -104,6 +104,8 @@ public:
         ShaderObjectLayout** outLayout
     ) override;
 
+    void customizeShaderObject(ShaderObject* shaderObject) override;
+
     virtual SLANG_NO_THROW Result SLANG_MCALL createShaderTable(
         const ShaderTableDesc& desc,
         IShaderTable** outShaderTable
@@ -286,6 +288,8 @@ public:
     RefPtr<BindlessDescriptorSet> m_bindlessDescriptorSet;
 
     VkSampler m_defaultSampler;
+
+    std::atomic<uint32_t> m_nextShaderObjectUid{1};
 
 #if SLANG_RHI_ENABLE_AFTERMATH
     /// Aftermath crash dumper (null if Aftermath is not enabled).

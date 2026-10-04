@@ -8,6 +8,8 @@
 #include "shader-object.h"
 
 #include <unordered_map>
+#include <tracy/Tracy.hpp> // TEMP-TRACY
+#include <tracy/TracyC.h> // TEMP-TRACY
 
 namespace rhi {
 
@@ -96,7 +98,9 @@ public:
 
     Result resolve()
     {
+        TracyCZoneN(rhiLockWaitCtx, "rhi.resolve.lockWait", 1); // TEMP-TRACY
         std::lock_guard<std::mutex> resolutionLock(m_device->m_pipelineResolutionMutex);
+        TracyCZoneEnd(rhiLockWaitCtx); // TEMP-TRACY
 
         if (m_device->m_pipelineCompilationMode == PipelineCompilationMode::Serial ||
             m_device->getInfo().deviceType == DeviceType::CPU)
@@ -473,6 +477,7 @@ private:
 
 Result resolvePipelines(Device* device, CommandList* commandList)
 {
+    ZoneScopedN("rhi.resolvePipelines"); // TEMP-TRACY
     PipelineResolver resolver(device, commandList);
     return resolver.resolve();
 }

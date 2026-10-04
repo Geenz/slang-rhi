@@ -605,6 +605,44 @@ Result ShaderObjectLayoutImpl::_init(const Builder* builder)
 
     m_containerType = builder->m_containerType;
 
+    m_ownSetIsShareable = m_descriptorSetInfos.size() == 1 && m_totalOrdinaryDataSize == 0;
+
+    for (const SubObjectRangeInfo& subObjectRange : m_subObjectRanges)
+    {
+        slang::BindingType subObjectBindingType = m_bindingRanges[subObjectRange.bindingRangeIndex].bindingType;
+
+        if (subObjectBindingType == slang::BindingType::ConstantBuffer ||
+            subObjectBindingType == slang::BindingType::ParameterBlock ||
+            subObjectBindingType == slang::BindingType::PushConstant)
+        {
+            m_ownSetIsShareable = false;
+        }
+    }
+
+    if (m_ownSetIsShareable)
+    {
+        size_t identity = 0;
+
+        for (const VkDescriptorSetLayoutBinding& vkBinding : m_descriptorSetInfos[0].vkBindings)
+        {
+            hash_combine(identity, vkBinding.binding);
+            hash_combine(identity, (uint32_t)vkBinding.descriptorType);
+            hash_combine(identity, vkBinding.descriptorCount);
+            hash_combine(identity, (uint32_t)vkBinding.stageFlags);
+        }
+
+        for (const BindingRangeInfo& bindingRange : m_bindingRanges)
+        {
+            hash_combine(identity, (uint32_t)bindingRange.bindingType);
+            hash_combine(identity, bindingRange.count);
+            hash_combine(identity, bindingRange.slotIndex);
+            hash_combine(identity, bindingRange.bindingOffset);
+            hash_combine(identity, bindingRange.setOffset);
+        }
+
+        m_ownSetIdentity = identity;
+    }
+
     // Create VkDescriptorSetLayout for all descriptor sets.
     for (auto& descriptorSetInfo : m_descriptorSetInfos)
     {

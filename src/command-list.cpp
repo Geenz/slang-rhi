@@ -1,5 +1,6 @@
 #include "command-list.h"
 #include "rhi-shared.h"
+#include <tracy/Tracy.hpp> // TEMP-TRACY
 
 namespace rhi {
 
@@ -109,6 +110,7 @@ void CommandList::write(commands::EndRenderPass&& cmd)
 
 void CommandList::write(commands::SetRenderState&& cmd)
 {
+    ZoneScopedN("rhi.cmdlist.SetRenderState"); // TEMP-TRACY
     // Resources are already retained in the CommandEncoder
     // for (uint32_t i = 0; i < cmd.state.vertexBufferCount; ++i)
     //     retainResource<Buffer>(cmd.state.vertexBuffers[i].buffer);
@@ -148,6 +150,7 @@ void CommandList::write(commands::DrawMeshTasks&& cmd)
 
 void CommandList::write(commands::DrawMeshTasksIndirect&& cmd)
 {
+    ZoneScopedN("rhi.cmdlist.DrawMeshTasksIndirect"); // TEMP-TRACY
     retainResource<Buffer>(cmd.argBuffer.buffer);
     writeCommand(std::move(cmd));
 }

@@ -46,6 +46,13 @@ public:
             return;
         }
 
+        // An untracked buffer is in its default state and needs no entry until it leaves it.
+        if (state == buffer->m_desc.defaultState && state != ResourceState::UnorderedAccess &&
+            m_bufferStates.find(buffer) == m_bufferStates.end())
+        {
+            return;
+        }
+
         BufferState* bufferState = getBufferState(buffer);
         if (state != bufferState->state || state == ResourceState::UnorderedAccess)
         {
@@ -58,6 +65,13 @@ public:
     {
         // Cannot change state of upload/readback buffers.
         if (texture->m_desc.memoryType != MemoryType::DeviceLocal)
+        {
+            return;
+        }
+
+        // An untracked texture is in its default state and needs no entry until it leaves it.
+        if (state == texture->m_desc.defaultState && state != ResourceState::UnorderedAccess &&
+            m_textureStates.find(texture) == m_textureStates.end())
         {
             return;
         }

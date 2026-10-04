@@ -6,6 +6,7 @@
 
 #include "core/short_vector.h"
 
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -28,6 +29,9 @@ struct BindingDataBuilder
     BindingDataImpl* m_bindingData;
     TransientBufferArena* m_constantBufferArena;
     DescriptorSetAllocator* m_descriptorSetAllocator;
+    CommandQueueImpl* m_queue;
+    /// The command buffer's retain set. bindAsValue pins every resource it writes into a descriptor.
+    std::set<RefPtr<RefObject>>* m_trackedObjects;
 
     // TODO remove
     std::span<const VkPushConstantRange> m_pushConstantRanges;
@@ -98,6 +102,15 @@ struct BindingDataBuilder
         ShaderObjectLayoutImpl* specializedLayout
     );
 
+    /// Bind an eligible parameter block through the queue's shared set cache.
+    /// Sets outHandled to false when the caller must build the block itself.
+    Result bindSharedParameterBlock(
+        ShaderObject* shaderObject,
+        const BindingOffset& offset,
+        ShaderObjectLayoutImpl* specializedLayout,
+        bool& outHandled
+    );
+
     /// Replay a cached parameter block, if one was built for this object/layout/version
     /// earlier in the current command buffer. Returns false if the caller must build it.
     bool reuseParameterBlock(ShaderObject* shaderObject, ShaderObjectLayoutImpl* specializedLayout, uint64_t version);
@@ -109,7 +122,8 @@ struct BindingDataBuilder
         uint64_t version,
         uint32_t firstDescriptorSet,
         uint32_t firstBufferState,
-        uint32_t firstTextureState
+        uint32_t firstTextureState,
+        uint32_t firstCachedBlock
     );
 
     /// Replay a root shader object's descriptor sets, resource states and push constants from an
@@ -167,6 +181,10 @@ public:
     TextureState* textureStates;
     uint32_t textureStateCapacity;
     uint32_t textureStateCount;
+    /// Queue-cached parameter blocks this binding uses; their states are required from the block itself.
+    CachedParameterBlock** cachedBlocks;
+    uint32_t cachedBlockCapacity;
+    uint32_t cachedBlockCount;
 
     /// Pipeline layout.
     VkPipelineLayout pipelineLayout;
@@ -204,6 +222,8 @@ struct ParameterBlockCacheEntry
     uint32_t bufferStateCount;
     BindingDataImpl::TextureState* textureStates;
     uint32_t textureStateCount;
+    CachedParameterBlock** cachedBlocks;
+    uint32_t cachedBlockCount;
 };
 
 /// Everything a root shader object contributed to its binding data, replayable while nothing but
@@ -220,8 +240,35 @@ struct RootBindingCacheEntry
     uint32_t bufferStateCount;
     BindingDataImpl::TextureState* textureStates;
     uint32_t textureStateCount;
+    CachedParameterBlock** cachedBlocks;
+    uint32_t cachedBlockCount;
     PushConstantSource* pushConstants;
     uint32_t pushConstantCount;
+};
+
+/// A parameter block's descriptor set shared across command buffers and frames.
+/// Each command buffer that binds it holds a reference until that command buffer retires.
+class CachedParameterBlock : public RefObject
+{
+public:
+    CommandQueueImpl* m_queue = nullptr;
+    RefPtr<ShaderObjectLayoutImpl> m_layout;
+    VulkanDescriptorSet m_descriptorSet = {};
+    std::vector<RefPtr<Resource>> m_resources;
+    std::vector<BindingDataImpl::BufferState> m_bufferStates;
+    std::vector<BindingDataImpl::TextureState> m_textureStates;
+    uint64_t m_lastUsedID = 0;
+
+    ~CachedParameterBlock();
+};
+
+/// A shader object's slot-content hash at one version, so an unchanged block is not rehashed.
+struct ParameterBlockContent
+{
+    uint32_t uid;
+    uint32_t version;
+    uint64_t contentHash;
+    uint64_t lastUsedID;
 };
 
 struct BindingCache

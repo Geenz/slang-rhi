@@ -15,6 +15,9 @@
 #include "../strings.h"
 
 #include "core/static_vector.h"
+#include <algorithm>
+#include <tracy/Tracy.hpp> // TEMP-TRACY
+#include <tracy/TracyC.h> // TEMP-TRACY
 
 namespace rhi::vk {
 
@@ -46,6 +49,7 @@ public:
     bool m_preparedRenderStateValid = false;
     RenderState m_preparedRenderState;
     BindingDataImpl* m_preparedRenderBindingData = nullptr;
+    std::vector<CachedParameterBlock*> m_renderPassCachedBlocks;
 
     bool m_computePassActive = false;
     bool m_computeStateValid = false;
@@ -122,7 +126,7 @@ public:
 
     void setBindings(BindingDataImpl* bindingData, VkPipelineBindPoint bindPoint);
 
-    void requireBindingStates(BindingDataImpl* bindingData);
+    void requireBindingStates(BindingDataImpl* bindingData, bool oncePerRenderPass = false);
     void requireBufferState(BufferImpl* buffer, ResourceState state);
     void requireTextureState(TextureImpl* texture, SubresourceRange subresourceRange, ResourceState state);
     void commitBarriers();
@@ -137,6 +141,7 @@ public:
 
 Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
 {
+    ZoneScopedN("rhi.record"); // TEMP-TRACY
     m_cmdBuffer = commandBuffer->m_commandBuffer;
 
 #if SLANG_RHI_ENABLE_AFTERMATH
@@ -149,7 +154,10 @@ Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
 
     VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    { // TEMP-TRACY
+    ZoneNamedN(rhiZoneVkBegin, "rhi.vkBegin", true); // TEMP-TRACY
     SLANG_VK_RETURN_ON_FAIL_REPORT(m_api.vkBeginCommandBuffer(m_cmdBuffer, &beginInfo), m_device);
+    } // TEMP-TRACY
 
     CommandList& commandList = commandBuffer->m_commandList;
 
@@ -162,6 +170,8 @@ Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
         //
         if (slot->id == CommandID::BeginRenderPass)
         {
+            ZoneNamedN(rhiZonePrepRenderPass, "rhi.record.prepRenderPass", true); // TEMP-TRACY
+            m_renderPassCachedBlocks.clear();
             for (auto subCmdSlot = slot->next; subCmdSlot; subCmdSlot = subCmdSlot->next)
             {
                 if (subCmdSlot->id == CommandID::SetRenderState)
@@ -190,11 +200,17 @@ Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
     }
 
     // Transition all resources back to their default states.
+    { // TEMP-TRACY
+    ZoneNamedN(rhiZoneDefaultStates, "rhi.record.defaultStates", true); // TEMP-TRACY
     m_stateTracking.requireDefaultStates();
     commitBarriers();
     m_stateTracking.clear();
+    } // TEMP-TRACY
 
+    { // TEMP-TRACY
+    ZoneNamedN(rhiZoneVkEnd, "rhi.vkEnd", true); // TEMP-TRACY
     SLANG_VK_RETURN_ON_FAIL_REPORT(m_api.vkEndCommandBuffer(m_cmdBuffer), m_device);
+    } // TEMP-TRACY
 
     return SLANG_OK;
 }
@@ -745,7 +761,7 @@ void CommandRecorder::prepareSetRenderState(const commands::SetRenderState& cmd)
     if (updateBindings)
     {
         m_preparedRenderBindingData = static_cast<BindingDataImpl*>(cmd.bindingData);
-        requireBindingStates(m_preparedRenderBindingData);
+        requireBindingStates(m_preparedRenderBindingData, true);
     }
 
     if (updateVertexBuffers)
@@ -772,6 +788,7 @@ void CommandRecorder::prepareSetRenderState(const commands::SetRenderState& cmd)
 
 void CommandRecorder::cmdSetRenderState(const commands::SetRenderState& cmd)
 {
+    ZoneScopedN("rhi.cmdSetRenderState"); // TEMP-TRACY
     if (!m_renderPassActive)
         return;
 
@@ -1026,6 +1043,7 @@ void CommandRecorder::cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd)
 
 void CommandRecorder::cmdDrawMeshTasksIndirect(const commands::DrawMeshTasksIndirect& cmd)
 {
+    ZoneScopedN("rhi.cmdDrawMeshTasksIndirect"); // TEMP-TRACY
     if (!m_renderStateValid)
         return;
 
@@ -1667,6 +1685,7 @@ void CommandRecorder::cmdExecuteCallback(const commands::ExecuteCallback& cmd)
 
 void CommandRecorder::setBindings(BindingDataImpl* bindingData, VkPipelineBindPoint bindPoint)
 {
+    ZoneScopedN("rhi.setBindings"); // TEMP-TRACY
     // Set push constants.
     for (uint32_t i = 0; i < bindingData->pushConstantCount; ++i)
     {
@@ -1698,8 +1717,9 @@ void CommandRecorder::setBindings(BindingDataImpl* bindingData, VkPipelineBindPo
     }
 }
 
-void CommandRecorder::requireBindingStates(BindingDataImpl* bindingData)
+void CommandRecorder::requireBindingStates(BindingDataImpl* bindingData, bool oncePerRenderPass)
 {
+    ZoneScopedN("rhi.requireBindingStates"); // TEMP-TRACY
     for (uint32_t i = 0; i < bindingData->bufferStateCount; ++i)
     {
         const auto& bufferState = bindingData->bufferStates[i];
@@ -1713,6 +1733,37 @@ void CommandRecorder::requireBindingStates(BindingDataImpl* bindingData)
             textureState.textureView->m_desc.subresourceRange,
             textureState.state
         );
+    }
+
+    for (uint32_t i = 0; i < bindingData->cachedBlockCount; ++i)
+    {
+        CachedParameterBlock* block = bindingData->cachedBlocks[i];
+
+        if (oncePerRenderPass)
+        {
+            // Barriers for a render pass are all committed before it begins, so one require per block suffices.
+            if (std::find(m_renderPassCachedBlocks.begin(), m_renderPassCachedBlocks.end(), block) !=
+                m_renderPassCachedBlocks.end())
+            {
+                continue;
+            }
+
+            m_renderPassCachedBlocks.push_back(block);
+        }
+
+        for (const BindingDataImpl::BufferState& bufferState : block->m_bufferStates)
+        {
+            requireBufferState(bufferState.buffer, bufferState.state);
+        }
+
+        for (const BindingDataImpl::TextureState& textureState : block->m_textureStates)
+        {
+            requireTextureState(
+                textureState.textureView->m_texture,
+                textureState.textureView->m_desc.subresourceRange,
+                textureState.state
+            );
+        }
     }
 }
 
@@ -1728,6 +1779,7 @@ void CommandRecorder::requireTextureState(TextureImpl* texture, SubresourceRange
 
 void CommandRecorder::commitBarriers()
 {
+    ZoneScopedN("rhi.commitBarriers"); // TEMP-TRACY
     if (testing::gDebugDisableStateTracking)
         return;
 
@@ -1935,6 +1987,7 @@ void CommandQueueImpl::init(VkQueue queue, uint32_t queueFamilyIndex)
     constantBufferHeapDesc.alignment = constantBufferAlignment;
     constantBufferHeapDesc.allocationGranularity = constantBufferAlignment;
     m_constantBufferHeap.initialize(device, constantBufferHeapDesc);
+    m_parameterBlockSetAllocator.init(&m_api);
 
     {
         VkSemaphoreTypeCreateInfo timelineCreateInfo = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
@@ -1953,6 +2006,18 @@ void CommandQueueImpl::shutdown()
     m_commandBuffersInFlight.clear();
     // Release all command buffers in order to release all resources they may hold.
     m_commandBuffersPool.clear();
+    // Released before the heap and deferred deletes so the sets' pinned resources defer-delete normally.
+    {
+        std::unordered_map<uint64_t, RefPtr<CachedParameterBlock>> parameterBlockSets;
+
+        {
+            std::lock_guard<std::mutex> lock(m_parameterBlockCacheMutex);
+            parameterBlockSets.swap(m_parameterBlockSets);
+            m_parameterBlockContents.clear();
+        }
+    }
+
+    m_parameterBlockSetAllocator.close();
     // Release the shared constant-buffer pages while deferred deletion is still available.
     m_constantBufferHeap.release();
     // Execute remaining deferred deletes.
@@ -2032,6 +2097,8 @@ void CommandQueueImpl::retireCommandBuffers()
     // Delete deferred resources that are no longer in use by the GPU.
     executeDeferredDeletes();
 
+    evictParameterBlockSets(lastFinishedID);
+
     // Flush all device heaps
     getDevice<DeviceImpl>()->flushHeaps();
 }
@@ -2054,6 +2121,53 @@ void CommandQueueImpl::executeDeferredDeletes()
         // GPU is done with this resource - delete it.
         delete m_deferredDeleteQueue.front().resource;
         m_deferredDeleteQueue.pop();
+    }
+}
+
+// rhi has no frame unit, so retention counts submits.
+static const uint64_t kParameterBlockSetRetainSubmits = 64;
+
+void CommandQueueImpl::evictParameterBlockSets(uint64_t lastFinishedID)
+{
+    ZoneScopedN("rhi.pbq.sweep"); // TEMP-TRACY
+    std::vector<RefPtr<CachedParameterBlock>> evicted;
+
+    {
+        TracyCZoneN(rhiPbqSweepLockWait, "rhi.pbq.lockWait", 1); // TEMP-TRACY
+        std::lock_guard<std::mutex> lock(m_parameterBlockCacheMutex);
+        TracyCZoneEnd(rhiPbqSweepLockWait); // TEMP-TRACY
+
+        if (lastFinishedID < m_nextParameterBlockSweepID)
+        {
+            return;
+        }
+
+        m_nextParameterBlockSweepID = lastFinishedID + kParameterBlockSetRetainSubmits;
+
+        for (auto it = m_parameterBlockSets.begin(); it != m_parameterBlockSets.end();)
+        {
+            if (it->second->m_lastUsedID + kParameterBlockSetRetainSubmits <= lastFinishedID)
+            {
+                evicted.push_back(std::move(it->second));
+                it = m_parameterBlockSets.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+
+        for (auto it = m_parameterBlockContents.begin(); it != m_parameterBlockContents.end();)
+        {
+            if (it->second.lastUsedID + kParameterBlockSetRetainSubmits <= lastFinishedID)
+            {
+                it = m_parameterBlockContents.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
     }
 }
 
@@ -2258,13 +2372,15 @@ Result CommandEncoderImpl::init()
 
 Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingData*& outBindingData)
 {
-    rootObject->trackResources(m_commandBuffer->m_trackedObjects);
+    ZoneScopedN("rhi.getBindingData"); // TEMP-TRACY
     BindingDataBuilder builder;
     builder.m_device = getDevice<DeviceImpl>();
     builder.m_allocator = &m_commandBuffer->m_allocator;
     builder.m_bindingCache = &m_commandBuffer->m_bindingCache;
     builder.m_constantBufferArena = &m_commandBuffer->m_constantBufferArena;
     builder.m_descriptorSetAllocator = &m_commandBuffer->m_descriptorSetAllocator;
+    builder.m_queue = m_queue;
+    builder.m_trackedObjects = &m_commandBuffer->m_trackedObjects;
     ShaderObjectLayout* specializedLayout = nullptr;
     SLANG_RETURN_ON_FAIL(rootObject->getSpecializedLayout(specializedLayout));
     return builder.bindAsRoot(

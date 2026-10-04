@@ -2586,6 +2586,11 @@ Result DeviceImpl::createRootShaderObjectLayout(
     return SLANG_FAIL;
 }
 
+void DeviceImpl::customizeShaderObject(ShaderObject* shaderObject)
+{
+    shaderObject->m_uid = m_nextShaderObjectUid.fetch_add(1);
+}
+
 Result DeviceImpl::createShaderTable(const ShaderTableDesc& desc, IShaderTable** outShaderTable)
 {
     RefPtr<ShaderTableImpl> result = new ShaderTableImpl(this, desc);
