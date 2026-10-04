@@ -416,8 +416,8 @@ Result DeviceImpl::initialize(const DeviceDesc& desc, BackendImpl* backend)
 
     // Process chained descs
     const D3D12DeviceExtendedDesc* extendedDesc = nullptr;
-    for (const DescStructHeader* header = static_cast<const DescStructHeader*>(desc.next); header;
-         header = header->next)
+    for (const ChainedStructHeader* header = static_cast<const ChainedStructHeader*>(desc.next); header;
+         header = static_cast<const ChainedStructHeader*>(header->next))
     {
         switch (header->type)
         {
@@ -987,6 +987,10 @@ Result DeviceImpl::initialize(const DeviceDesc& desc, BackendImpl* backend)
             {
                 addFeature(Feature::RayQuery);
             }
+            if (options.RaytracingTier >= D3D12_RAYTRACING_TIER_1_2)
+            {
+                addFeature(Feature::OpacityMicromap);
+            }
         }
     }
     {
@@ -1257,7 +1261,6 @@ Result DeviceImpl::initialize(const DeviceDesc& desc, BackendImpl* backend)
     // Create queue.
     m_queue = new CommandQueueImpl(this, QueueType::Graphics);
     SLANG_RETURN_ON_FAIL(m_queue->init(0));
-    m_queue->setInternalReferenceCount(1);
 
     // Retrieve timestamp frequency.
     m_queue->m_d3dQueue->GetTimestampFrequency(&m_info.timestampFrequency);
@@ -1289,7 +1292,7 @@ Result DeviceImpl::getQueue(QueueType type, ICommandQueue** outQueue)
     {
         return SLANG_E_INVALID_ARG;
     }
-    returnComPtr(outQueue, m_queue);
+    returnComPtrCopy(outQueue, m_queue);
     return SLANG_OK;
 }
 
@@ -1679,8 +1682,7 @@ Result DeviceImpl::createSampler(const SamplerDesc& desc, ISampler** outSampler)
 
 Result DeviceImpl::createTextureView(ITexture* texture, const TextureViewDesc& desc, ITextureView** outView)
 {
-    RefPtr<TextureViewImpl> view = new TextureViewImpl(this, desc);
-    view->m_texture = checked_cast<TextureImpl*>(texture);
+    RefPtr<TextureViewImpl> view = new TextureViewImpl(checked_cast<TextureImpl*>(texture), desc);
     if (view->m_desc.format == Format::Undefined)
         view->m_desc.format = view->m_texture->m_desc.format;
     view->m_desc.subresourceRange = view->m_texture->resolveSubresourceRange(desc.subresourceRange);
@@ -1838,7 +1840,7 @@ Result DeviceImpl::createShaderObjectLayout(
 {
     RefPtr<ShaderObjectLayoutImpl> layout;
     SLANG_RETURN_ON_FAIL(ShaderObjectLayoutImpl::createForElementType(this, session, typeLayout, layout.writeRef()));
-    returnRefPtrMove(outLayout, layout);
+    returnRefPtr(outLayout, layout);
     return SLANG_OK;
 }
 
@@ -2057,7 +2059,7 @@ Result DeviceImpl::getAccelerationStructureSizes(
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuildInfo = {};
 
 #if SLANG_RHI_ENABLE_NVAPI
-    if (m_nvapiEnabled)
+    if (m_nvapiEnabled && !usesOpacityMicromaps(desc))
     {
         AccelerationStructureBuildDescConverterNVAPI converter;
         SLANG_RETURN_ON_FAIL(converter.convert(desc, m_debugCallback));
@@ -2083,6 +2085,19 @@ Result DeviceImpl::getAccelerationStructureSizes(
     outSizes->scratchSize = prebuildInfo.ScratchDataSizeInBytes;
     outSizes->updateScratchSize = prebuildInfo.UpdateScratchDataSizeInBytes;
 
+    return SLANG_OK;
+}
+
+Result DeviceImpl::getMicromapSizes(const MicromapBuildDesc& desc, MicromapSizes* outSizes)
+{
+    if (!hasFeature(Feature::OpacityMicromap) || !m_device5)
+        return SLANG_E_NOT_AVAILABLE;
+    MicromapBuildDescConverter converter;
+    SLANG_RETURN_ON_FAIL(converter.convert(desc));
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
+    m_device5->GetRaytracingAccelerationStructurePrebuildInfo(&converter.desc, &info);
+    outSizes->micromapSize = info.ResultDataMaxSizeInBytes;
+    outSizes->scratchSize = info.ScratchDataSizeInBytes;
     return SLANG_OK;
 }
 
@@ -2124,7 +2139,9 @@ Result DeviceImpl::createAccelerationStructure(
     bufferDesc.memoryType = MemoryType::DeviceLocal;
     bufferDesc.usage = BufferUsage::AccelerationStructure;
     bufferDesc.defaultState = ResourceState::AccelerationStructureRead;
-    SLANG_RETURN_ON_FAIL(createBuffer(bufferDesc, nullptr, (IBuffer**)result->m_buffer.writeRef()));
+    RefPtr<BufferImpl> buffer;
+    SLANG_RETURN_ON_FAIL(createBuffer(bufferDesc, nullptr, (IBuffer**)buffer.writeRef()));
+    result->m_buffer = buffer;
     result->m_descriptor = m_cpuCbvSrvUavHeap->allocate();
     if (!result->m_descriptor)
         return SLANG_FAIL;
@@ -2135,6 +2152,23 @@ Result DeviceImpl::createAccelerationStructure(
     srvDesc.RaytracingAccelerationStructure.Location = result->m_buffer->getDeviceAddress();
     m_device->CreateShaderResourceView(nullptr, &srvDesc, result->m_descriptor.cpuHandle);
     returnComPtr(outAccelerationStructure, result);
+    return SLANG_OK;
+}
+
+Result DeviceImpl::createMicromap(const MicromapDesc& desc, IMicromap** outMicromap)
+{
+    if (!hasFeature(Feature::OpacityMicromap))
+        return SLANG_E_NOT_AVAILABLE;
+    RefPtr<MicromapImpl> result = new MicromapImpl(this, desc);
+    BufferDesc bufferDesc = {};
+    bufferDesc.size = desc.size;
+    bufferDesc.memoryType = MemoryType::DeviceLocal;
+    bufferDesc.usage = BufferUsage::AccelerationStructure | BufferUsage::MicromapStorage;
+    bufferDesc.defaultState = ResourceState::MicromapRead;
+    RefPtr<BufferImpl> buffer;
+    SLANG_RETURN_ON_FAIL(createBuffer(bufferDesc, nullptr, (IBuffer**)buffer.writeRef()));
+    result->m_buffer = buffer;
+    returnComPtr(outMicromap, result);
     return SLANG_OK;
 }
 
@@ -2272,6 +2306,13 @@ DeviceImpl::~DeviceImpl()
     }
 #endif
 
+    // Wait and release command-owned allocations while their heaps and device are still valid.
+    if (m_queue)
+    {
+        m_queue->waitAndReleaseCommandBuffers();
+    }
+
+    m_shaderCache.free();
     m_shaderObjectLayoutCache = decltype(m_shaderObjectLayoutCache)();
 
     m_uploadHeap.release();
@@ -2309,7 +2350,6 @@ void DeviceImpl::deferDelete(Resource* resource)
 {
     SLANG_RHI_ASSERT(m_queue != nullptr);
     m_queue->deferDelete(resource);
-    resource->breakStrongReferenceToDevice();
 }
 
 } // namespace rhi::d3d12

@@ -178,7 +178,7 @@ Result Device::getSpecializedProgram(
     auto it = program->m_specializedPrograms.find(key);
     if (it != program->m_specializedPrograms.end())
     {
-        returnRefPtr(outSpecializedProgram, it->second);
+        returnRefPtrCopy(outSpecializedProgram, it->second);
         return SLANG_OK;
     }
     else
@@ -186,8 +186,6 @@ Result Device::getSpecializedProgram(
         RefPtr<ShaderProgram> specializedProgram;
         SLANG_RETURN_ON_FAIL(specializeProgram(program, specializationArgs, specializedProgram.writeRef()));
         program->m_specializedPrograms[key] = specializedProgram;
-        // Program is owned by the cache (which is owned by the device).
-        specializedProgram->breakStrongReferenceToDevice();
         returnRefPtr(outSpecializedProgram, specializedProgram);
         return SLANG_OK;
     }
@@ -315,10 +313,6 @@ Result Device::getConcretePipeline(
     {
         // Cache the specialized pipeline for later use.
         m_shaderCache.addSpecializedPipeline(pipelineKey, concretePipeline);
-        // Pipeline is owned by the cache.
-        concretePipeline->breakStrongReferenceToDevice();
-        // Program is owned by the specialized pipeline (which is owned by the cache).
-        concretePipeline->m_program->breakStrongReferenceToDevice();
     }
     else
     {
@@ -853,6 +847,13 @@ Result Device::getAccelerationStructureSizes(
     return SLANG_E_NOT_AVAILABLE;
 }
 
+Result Device::getMicromapSizes(const MicromapBuildDesc& desc, MicromapSizes* outSizes)
+{
+    SLANG_UNUSED(desc);
+    SLANG_UNUSED(outSizes);
+    return SLANG_E_NOT_AVAILABLE;
+}
+
 Result Device::getClusterOperationSizes(const ClusterOperationParams& params, ClusterOperationSizes* outSizes)
 {
     SLANG_UNUSED(params);
@@ -867,6 +868,13 @@ Result Device::createAccelerationStructure(
 {
     SLANG_UNUSED(desc);
     SLANG_UNUSED(outAccelerationStructure);
+    return SLANG_E_NOT_AVAILABLE;
+}
+
+Result Device::createMicromap(const MicromapDesc& desc, IMicromap** outMicromap)
+{
+    SLANG_UNUSED(desc);
+    SLANG_UNUSED(outMicromap);
     return SLANG_E_NOT_AVAILABLE;
 }
 

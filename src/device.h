@@ -133,7 +133,7 @@ protected:
 
     std::mutex m_mutex;
     std::unordered_map<ComponentKey, ShaderComponentID, ComponentKeyHasher> componentIds;
-    std::unordered_map<PipelineKey, RefPtr<Pipeline>, PipelineKeyHasher> specializedPipelines;
+    std::unordered_map<PipelineKey, InternalRefPtr<Pipeline>, PipelineKeyHasher> specializedPipelines;
 };
 
 class NullDebugCallback : public IDebugCallback
@@ -260,6 +260,11 @@ public:
         AccelerationStructureSizes* outSizes
     ) override;
 
+    virtual SLANG_NO_THROW Result SLANG_MCALL getMicromapSizes(
+        const MicromapBuildDesc& desc,
+        MicromapSizes* outSizes
+    ) override;
+
     // Provides a default implementation that returns SLANG_E_NOT_AVAILABLE for platforms
     // without cluster acceleration support.
     virtual SLANG_NO_THROW Result SLANG_MCALL getClusterOperationSizes(
@@ -272,6 +277,11 @@ public:
     virtual SLANG_NO_THROW Result SLANG_MCALL createAccelerationStructure(
         const AccelerationStructureDesc& desc,
         IAccelerationStructure** outAccelerationStructure
+    ) override;
+
+    virtual SLANG_NO_THROW Result SLANG_MCALL createMicromap(
+        const MicromapDesc& desc,
+        IMicromap** outMicromap
     ) override;
 
     // Provides a default implementation that returns SLANG_E_NOT_AVAILABLE for platforms

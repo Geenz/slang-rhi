@@ -29,11 +29,11 @@ public:
 
     Context m_ctx;
     std::string m_adapterName;
-    RefPtr<CommandQueueImpl> m_queue;
+    InternalRefPtr<CommandQueueImpl> m_queue;
     ClearEngine m_clearEngine;
     bool m_ownsContext = false;
-    RefPtr<HeapImpl> m_deviceMemHeap;
-    RefPtr<HeapImpl> m_hostMemHeap;
+    InternalRefPtr<HeapImpl> m_deviceMemHeap;
+    InternalRefPtr<HeapImpl> m_hostMemHeap;
 
 public:
     using Device::readBuffer;
@@ -167,6 +167,11 @@ public:
         AccelerationStructureSizes* outSizes
     ) override;
 
+    virtual SLANG_NO_THROW Result SLANG_MCALL getMicromapSizes(
+        const MicromapBuildDesc& desc,
+        MicromapSizes* outSizes
+    ) override;
+
     virtual SLANG_NO_THROW Result SLANG_MCALL getClusterOperationSizes(
         const ClusterOperationParams& params,
         ClusterOperationSizes* outSizes
@@ -175,6 +180,11 @@ public:
     virtual SLANG_NO_THROW Result SLANG_MCALL createAccelerationStructure(
         const AccelerationStructureDesc& desc,
         IAccelerationStructure** outAccelerationStructure
+    ) override;
+
+    virtual SLANG_NO_THROW Result SLANG_MCALL createMicromap(
+        const MicromapDesc& desc,
+        IMicromap** outMicromap
     ) override;
 
     virtual SLANG_NO_THROW Result SLANG_MCALL getCooperativeVectorProperties(

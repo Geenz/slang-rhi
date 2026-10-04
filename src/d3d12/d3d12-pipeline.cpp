@@ -623,6 +623,8 @@ Result DeviceImpl::createRayTracingPipeline2(const RayTracingPipelineDesc& desc,
         pipelineConfig.Flags |= D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_TRIANGLES;
     if (is_set(desc.flags, RayTracingPipelineFlags::SkipProcedurals))
         pipelineConfig.Flags |= D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_PROCEDURAL_PRIMITIVES;
+    if (is_set(desc.flags, RayTracingPipelineFlags::EnableOpacityMicromaps))
+        pipelineConfig.Flags |= D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS;
 
     D3D12_STATE_SUBOBJECT pipelineConfigSubobject = {};
     pipelineConfigSubobject.Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1;
@@ -743,11 +745,11 @@ Result DeviceImpl::createRayTracingPipeline2(const RayTracingPipelineDesc& desc,
                 params.version = NVAPI_D3D12_SET_CREATE_PIPELINE_STATE_OPTIONS_PARAMS_VER;
 
                 if (is_set(desc.flags, RayTracingPipelineFlags::EnableLinearSweptSpheres))
-                    params.flags = NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_LSS_SUPPORT;
+                    params.flags |= NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_LSS_SUPPORT;
                 if (is_set(desc.flags, RayTracingPipelineFlags::EnableSpheres))
-                    params.flags = NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_SPHERE_SUPPORT;
+                    params.flags |= NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_SPHERE_SUPPORT;
                 if (is_set(desc.flags, RayTracingPipelineFlags::EnableClusters))
-                    params.flags = NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_CLUSTER_SUPPORT;
+                    params.flags |= NVAPI_D3D12_PIPELINE_CREATION_STATE_FLAGS_ENABLE_CLUSTER_SUPPORT;
 
                 resetPipelineStateOptions = true;
                 SLANG_RHI_NVAPI_RETURN_ON_FAIL(NvAPI_D3D12_SetCreatePipelineStateOptions(m_device5, &params));

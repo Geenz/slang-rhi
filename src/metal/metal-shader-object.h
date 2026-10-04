@@ -172,7 +172,7 @@ struct BindingDataImpl : BindingData
 
 struct BindingCache
 {
-    std::vector<RefPtr<BufferImpl>> buffers;
+    std::vector<InternalRefPtr<BufferImpl>> buffers;
 
     void reset() { buffers.clear(); }
 };

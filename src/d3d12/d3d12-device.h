@@ -51,7 +51,7 @@ public:
 
     ComPtr<D3D12MA::Allocator> m_allocator;
 
-    RefPtr<CommandQueueImpl> m_queue;
+    InternalRefPtr<CommandQueueImpl> m_queue;
 
     RefPtr<CPUDescriptorHeap> m_cpuCbvSrvUavHeap;
     RefPtr<CPUDescriptorHeap> m_cpuRtvHeap;
@@ -209,6 +209,11 @@ public:
         AccelerationStructureSizes* outSizes
     ) override;
 
+    virtual SLANG_NO_THROW Result SLANG_MCALL getMicromapSizes(
+        const MicromapBuildDesc& desc,
+        MicromapSizes* outSizes
+    ) override;
+
     virtual SLANG_NO_THROW Result SLANG_MCALL getClusterOperationSizes(
         const ClusterOperationParams& params,
         ClusterOperationSizes* outSizes
@@ -217,6 +222,11 @@ public:
     virtual SLANG_NO_THROW Result SLANG_MCALL createAccelerationStructure(
         const AccelerationStructureDesc& desc,
         IAccelerationStructure** outAccelerationStructure
+    ) override;
+
+    virtual SLANG_NO_THROW Result SLANG_MCALL createMicromap(
+        const MicromapDesc& desc,
+        IMicromap** outMicromap
     ) override;
 
     virtual SLANG_NO_THROW Result SLANG_MCALL getCooperativeVectorProperties(

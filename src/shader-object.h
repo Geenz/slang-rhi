@@ -7,6 +7,7 @@
 #include "core/block-allocator.h"
 
 #include "reference.h"
+#include "device-child.h"
 
 #include <unordered_map>
 
@@ -34,8 +35,8 @@ struct ShaderObjectID
 struct ResourceSlot
 {
     BindingType type = BindingType::Undefined;
-    RefPtr<Resource> resource;
-    RefPtr<Resource> resource2;
+    InternalRefPtr<Resource> resource;
+    InternalRefPtr<Resource> resource2;
     Format format = Format::Undefined;
     union
     {
@@ -120,9 +121,8 @@ public:
     };
 
 protected:
-    // We always use a weak reference to the `IDevice` object here.
-    // `ShaderObject` implementations will make sure to hold a strong reference to `IDevice`
-    // while a `ShaderObjectLayout` may still be used.
+    // Borrowed device pointer. Externally held shader objects/programs pin the device;
+    // device-owned caches and internal dependencies are cleared during device teardown.
     Device* m_device;
     slang::TypeLayoutReflection* m_elementTypeLayout = nullptr;
     ShaderComponentID m_componentID = 0;
@@ -212,7 +212,7 @@ using ShaderObjectSetBindingHook = void (*)(
     slang::BindingType bindingType
 );
 
-class ShaderObject : public IShaderObject, public ComObject
+class ShaderObject : public IShaderObject, public DeviceChild
 {
     SLANG_RHI_DECLARE_BLOCK_ALLOCATED(ShaderObject, 4 * 1024)
 
@@ -221,9 +221,11 @@ public:
     IShaderObject* getInterface(const Guid& guid);
 
 public:
-    // A strong reference to `IDevice` to make sure the weak device reference in
-    // `ShaderObjectLayout`s are valid whenever they might be used.
-    BreakableReference<Device> m_device;
+    explicit ShaderObject(Device* device);
+
+    // Retain the program that owns reflection used by this object and its descendants.
+    // Returning an entry point/subobject must not leave its layout dangling when the root dies.
+    InternalRefPtr<ShaderProgram> m_shaderProgram;
 
     // The shader object layout used to create this shader object.
     RefPtr<ShaderObjectLayout> m_layout;
@@ -233,7 +235,7 @@ public:
 
     short_vector<ResourceSlot> m_slots;
     short_vector<uint8_t> m_data;
-    short_vector<RefPtr<ShaderObject>> m_objects;
+    short_vector<InternalRefPtr<ShaderObject>> m_objects;
     short_vector<RefPtr<ExtendedShaderObjectTypeListObject>> m_userProvidedSpecializationArgs;
 
     // Specialization args for a StructuredBuffer object.
@@ -256,9 +258,6 @@ public:
     // Descriptor handle values set via setDescriptorHandle(), keyed by bindingRangeIndex.
     // Used by Metal's writeArgumentBuffer to write gpuResourceIDs into argument buffers.
     std::unordered_map<uint64_t, uint64_t> m_descriptorHandles;  // (bindingRange << 32 | arrayIdx) → handle.value
-
-public:
-    void breakStrongReferenceToDevice() { m_device.breakStrongReference(); }
 
 public:
     ShaderComponentID getComponentID() { return m_shaderObjectType.componentID; }
@@ -294,9 +293,14 @@ public:
     virtual SLANG_NO_THROW bool SLANG_MCALL isFinalized() override;
 
 public:
-    static Result create(Device* device, ShaderObjectLayout* layout, ShaderObject** outShaderObject);
+    static Result create(
+        Device* device,
+        ShaderObjectLayout* layout,
+        ShaderObject** outShaderObject,
+        ShaderProgram* program = nullptr
+    );
 
-    Result init(Device* device, ShaderObjectLayout* layout);
+    Result init(ShaderObjectLayout* layout, ShaderProgram* program);
 
     virtual Result collectSpecializationArgs(ExtendedShaderObjectTypeList& args);
 
@@ -310,7 +314,7 @@ public:
         IBuffer** buffer
     );
 
-    void trackResources(std::set<RefPtr<RefObject>>& resources);
+    void trackResources(std::set<InternalRefPtr<RefObject>>& resources);
 
     /// Compute a composite version reflecting the state of this object
     /// and all sub-objects. Used for binding data caching.
@@ -348,9 +352,9 @@ class RootShaderObject : public ShaderObject
     SLANG_RHI_DECLARE_BLOCK_ALLOCATED(RootShaderObject, 4 * 1024)
 
 public:
-    RefPtr<ShaderProgram> m_shaderProgram;
+    explicit RootShaderObject(Device* device);
 
-    std::vector<RefPtr<ShaderObject>> m_entryPoints;
+    std::vector<InternalRefPtr<ShaderObject>> m_entryPoints;
 
 public:
     // IShaderObject implementation
@@ -360,7 +364,7 @@ public:
 public:
     static Result create(Device* device, ShaderProgram* program, RootShaderObject** outRootShaderObject);
 
-    Result init(Device* device, ShaderProgram* program);
+    Result init(ShaderProgram* program);
 
     bool isSpecializable() const;
 
@@ -369,7 +373,7 @@ public:
 
     virtual Result collectSpecializationArgs(ExtendedShaderObjectTypeList& args) override;
 
-    void trackResources(std::set<RefPtr<RefObject>>& resources);
+    void trackResources(std::set<InternalRefPtr<RefObject>>& resources);
 
     uint64_t getCompositeVersion() const override;
 };

@@ -161,6 +161,7 @@ public:
     void cmdSetRayTracingState(const commands::SetRayTracingState& cmd);
     void cmdDispatchRays(const commands::DispatchRays& cmd);
     void cmdBuildAccelerationStructure(const commands::BuildAccelerationStructure& cmd);
+    void cmdBuildMicromap(const commands::BuildMicromap& cmd);
     void cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd);
     void cmdQueryAccelerationStructureProperties(const commands::QueryAccelerationStructureProperties& cmd);
     void cmdExecuteClusterOperation(const commands::ExecuteClusterOperation& cmd);
@@ -1301,6 +1302,12 @@ void CommandRecorder::cmdBuildAccelerationStructure(const commands::BuildAcceler
     // TODO handle queryDescs
 }
 
+void CommandRecorder::cmdBuildMicromap(const commands::BuildMicromap& cmd)
+{
+    SLANG_UNUSED(cmd);
+    NOT_SUPPORTED(ICommandEncoder, buildMicromap);
+}
+
 void CommandRecorder::cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd)
 {
     MTL::AccelerationStructureCommandEncoder* encoder = getAccelerationStructureCommandEncoder();
@@ -1791,16 +1798,16 @@ void CommandQueueImpl::init(NS::SharedPtr<MTL::CommandQueue> commandQueue)
     m_trackingEventListener = NS::TransferPtr(MTL::SharedEventListener::alloc()->init());
 }
 
-void CommandQueueImpl::shutdown()
+void CommandQueueImpl::waitAndReleaseCommandBuffers()
 {
     waitOnHost();
-    // TODO: This will be needed if we use command buffer pooling as we do in the other backends.
-#if 0
-    // Release all command buffers in order to release all resources they may hold.
-    m_commandBuffersPool.clear();
-    // Execute remaining deferred deletes.
+    m_commandBuffersInFlight.clear();
+}
+
+void CommandQueueImpl::shutdown()
+{
+    SLANG_RHI_ASSERT(m_commandBuffersInFlight.empty());
     executeDeferredDeletes();
-#endif
     SLANG_RHI_ASSERT(m_deferredDeleteQueue.empty());
     m_commandQueue.reset();
     m_queueFence.reset();
@@ -1810,11 +1817,13 @@ void CommandQueueImpl::shutdown()
 
 void CommandQueueImpl::retireCommandBuffers()
 {
-    std::list<RefPtr<CommandBufferImpl>> commandBuffers = std::move(m_commandBuffersInFlight);
+    std::list<InternalRefPtr<CommandBufferImpl>> commandBuffers = std::move(m_commandBuffersInFlight);
     m_commandBuffersInFlight.clear();
 
-    for (const auto& commandBuffer : commandBuffers)
+    for (auto it = commandBuffers.begin(); it != commandBuffers.end();)
     {
+        auto current = it++;
+        CommandBufferImpl* commandBuffer = current->get();
         auto status = commandBuffer->m_commandBuffer->status();
         // Error diagnostic is surfaced by the `addCompletedHandler`
         // installed in `submit()` — that fires per-CB at completion
@@ -1827,7 +1836,7 @@ void CommandQueueImpl::retireCommandBuffers()
         }
         else
         {
-            m_commandBuffersInFlight.push_back(commandBuffer);
+            m_commandBuffersInFlight.splice(m_commandBuffersInFlight.end(), commandBuffers, current);
         }
     }
 
@@ -1851,6 +1860,7 @@ void CommandQueueImpl::executeDeferredDeletes()
     std::lock_guard<std::mutex> lock(m_deferredDeleteQueueMutex);
     while (!m_deferredDeleteQueue.empty() && m_deferredDeleteQueue.front().submissionID <= lastFinishedID)
     {
+        // Destructors must not enqueue deferred deletes; release child resources in deleteThis().
         delete m_deferredDeleteQueue.front().resource;
         m_deferredDeleteQueue.pop();
     }
@@ -2151,7 +2161,6 @@ Result CommandEncoderImpl::finish(const CommandBufferDesc& desc, ICommandBuffer*
     CommandRecorder recorder(device);
     SLANG_RETURN_ON_FAIL(recorder.record(m_commandBuffer));
     returnComPtr(outCommandBuffer, m_commandBuffer);
-    m_commandBuffer = nullptr;
     m_commandList = nullptr;
     return SLANG_OK;
 }

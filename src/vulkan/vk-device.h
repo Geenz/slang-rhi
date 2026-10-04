@@ -143,6 +143,11 @@ public:
         AccelerationStructureSizes* outSizes
     ) override;
 
+    virtual SLANG_NO_THROW Result SLANG_MCALL getMicromapSizes(
+        const MicromapBuildDesc& desc,
+        MicromapSizes* outSizes
+    ) override;
+
     virtual SLANG_NO_THROW Result SLANG_MCALL getClusterOperationSizes(
         const ClusterOperationParams& params,
         ClusterOperationSizes* outSizes
@@ -151,6 +156,11 @@ public:
     virtual SLANG_NO_THROW Result SLANG_MCALL createAccelerationStructure(
         const AccelerationStructureDesc& desc,
         IAccelerationStructure** outAccelerationStructure
+    ) override;
+
+    virtual SLANG_NO_THROW Result SLANG_MCALL createMicromap(
+        const MicromapDesc& desc,
+        IMicromap** outMicromap
     ) override;
 
     virtual SLANG_NO_THROW Result SLANG_MCALL getTextureAllocationInfo(
@@ -282,7 +292,7 @@ public:
     bool m_cooperativeMatrixPropertiesInitialized = false;
     std::vector<CooperativeMatrixDesc> m_cooperativeMatrixFixedProperties;
     std::vector<CooperativeMatrixFlexibleProperty> m_cooperativeMatrixFlexibleProperties;
-    RefPtr<CommandQueueImpl> m_queue;
+    InternalRefPtr<CommandQueueImpl> m_queue;
 
     DescriptorSetAllocator descriptorSetAllocator;
     RefPtr<BindlessDescriptorSet> m_bindlessDescriptorSet;

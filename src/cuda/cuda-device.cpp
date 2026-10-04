@@ -46,6 +46,12 @@ DeviceImpl::~DeviceImpl()
     {
         SLANG_CUDA_CTX_SCOPE(this);
 
+        // Wait and release command-owned allocations while their heaps and device are still valid.
+        if (m_queue)
+        {
+            m_queue->waitAndReleaseCommandBuffers();
+        }
+
         m_shaderCache.free();
         m_uploadHeap.release();
         m_readbackHeap.release();
@@ -281,6 +287,7 @@ Result DeviceImpl::initialize(const DeviceDesc& desc, BackendImpl* backend)
     {
         addFeature(Feature::AccelerationStructure);
         addFeature(Feature::RayTracing);
+        addFeature(Feature::OpacityMicromap);
         uint32_t optixVersion = m_ctx.optixContext->getOptixVersion();
         m_info.optixVersion = optixVersion;
         if (optixVersion >= 80100)
@@ -339,7 +346,6 @@ Result DeviceImpl::initialize(const DeviceDesc& desc, BackendImpl* backend)
 
     m_queue = new CommandQueueImpl(this, QueueType::Graphics);
     SLANG_RETURN_ON_FAIL(m_queue->init());
-    m_queue->setInternalReferenceCount(1);
 
     // Create 2 heaps. On CUDA both Upload and ReadBack just use host memory,
     // so we only need one for DeviceLocal and one for Upload/ReadBack.
@@ -350,13 +356,11 @@ Result DeviceImpl::initialize(const DeviceDesc& desc, BackendImpl* backend)
     heapDesc.label = "Device upload heap";
     SLANG_RETURN_ON_FAIL(createHeap(heapDesc, heapPtr.writeRef()));
     m_hostMemHeap = checked_cast<HeapImpl*>(heapPtr.get());
-    m_hostMemHeap->breakStrongReferenceToDevice();
 
     heapDesc.memoryType = MemoryType::DeviceLocal;
     heapDesc.label = "Device local heap";
     SLANG_RETURN_ON_FAIL(createHeap(heapDesc, heapPtr.writeRef()));
     m_deviceMemHeap = checked_cast<HeapImpl*>(heapPtr.get());
-    m_deviceMemHeap->breakStrongReferenceToDevice();
 
     // Register heaps with the base Device class for reporting
     m_globalHeaps.push_back(m_hostMemHeap);
@@ -373,7 +377,6 @@ void DeviceImpl::deferDelete(Resource* resource)
 {
     SLANG_RHI_ASSERT(m_queue != nullptr);
     m_queue->deferDelete(resource);
-    resource->breakStrongReferenceToDevice();
 }
 
 Result DeviceImpl::getNativeDeviceHandles(DeviceNativeHandles* outHandles)
@@ -423,7 +426,7 @@ Result DeviceImpl::createShaderObjectLayout(
 {
     RefPtr<ShaderObjectLayoutImpl> cudaLayout;
     cudaLayout = new ShaderObjectLayoutImpl(this, session, typeLayout);
-    returnRefPtrMove(outLayout, cudaLayout);
+    returnRefPtr(outLayout, cudaLayout);
     return SLANG_OK;
 }
 
@@ -476,7 +479,7 @@ Result DeviceImpl::getQueue(QueueType type, ICommandQueue** outQueue)
     {
         return SLANG_E_INVALID_ARG;
     }
-    returnComPtr(outQueue, m_queue);
+    returnComPtrCopy(outQueue, m_queue);
     return SLANG_OK;
 }
 
@@ -554,6 +557,13 @@ Result DeviceImpl::getAccelerationStructureSizes(
     return m_ctx.optixContext->getAccelerationStructureSizes(desc, outSizes);
 }
 
+Result DeviceImpl::getMicromapSizes(const MicromapBuildDesc& desc, MicromapSizes* outSizes)
+{
+    if (!m_ctx.optixContext)
+        return SLANG_E_NOT_AVAILABLE;
+    return m_ctx.optixContext->getMicromapSizes(desc, outSizes);
+}
+
 Result DeviceImpl::getClusterOperationSizes(const ClusterOperationParams& params, ClusterOperationSizes* outSizes)
 {
     if (!m_ctx.optixContext)
@@ -577,6 +587,16 @@ Result DeviceImpl::createAccelerationStructure(
     SLANG_CUDA_RETURN_ON_FAIL_REPORT(cuMemAlloc(&result->m_propertyBuffer, 8), this);
     result->m_handle = 0;
     returnComPtr(outAccelerationStructure, result);
+    return SLANG_OK;
+}
+
+Result DeviceImpl::createMicromap(const MicromapDesc& desc, IMicromap** outMicromap)
+{
+    if (!m_ctx.optixContext)
+        return SLANG_E_NOT_AVAILABLE;
+    RefPtr<MicromapImpl> result = new MicromapImpl(this, desc);
+    SLANG_CUDA_RETURN_ON_FAIL_REPORT(cuMemAlloc(&result->m_buffer, desc.size), this);
+    returnComPtr(outMicromap, result);
     return SLANG_OK;
 }
 

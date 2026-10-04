@@ -106,6 +106,7 @@ public:
     void cmdSetRayTracingState(const commands::SetRayTracingState& cmd);
     void cmdDispatchRays(const commands::DispatchRays& cmd);
     void cmdBuildAccelerationStructure(const commands::BuildAccelerationStructure& cmd);
+    void cmdBuildMicromap(const commands::BuildMicromap& cmd);
     void cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd);
     void cmdQueryAccelerationStructureProperties(const commands::QueryAccelerationStructureProperties& cmd);
     void cmdExecuteClusterOperation(const commands::ExecuteClusterOperation& cmd);
@@ -1360,6 +1361,23 @@ void CommandRecorder::cmdBuildAccelerationStructure(const commands::BuildAcceler
                     ResourceState::AccelerationStructureBuildInput
                 );
             }
+            if (const auto* ommDesc = findStructInChain<AccelerationStructureOpacityMicromapDesc>(input.triangles.next))
+            {
+                if (ommDesc->link.micromap)
+                {
+                    requireBufferState(
+                        checked_cast<MicromapImpl*>(ommDesc->link.micromap)->m_buffer,
+                        ResourceState::MicromapRead
+                    );
+                }
+                if (ommDesc->link.indexBuffer)
+                {
+                    requireBufferState(
+                        checked_cast<BufferImpl*>(ommDesc->link.indexBuffer.buffer),
+                        ResourceState::AccelerationStructureBuildInput
+                    );
+                }
+            }
             break;
         case AccelerationStructureBuildInputType::ProceduralPrimitives:
             for (uint32_t i = 0; i < input.proceduralPrimitives.aabbBufferCount; ++i)
@@ -1432,7 +1450,7 @@ void CommandRecorder::cmdBuildAccelerationStructure(const commands::BuildAcceler
     commitBarriers();
 
 #if SLANG_RHI_ENABLE_NVAPI
-    if (m_device->m_nvapiEnabled)
+    if (m_device->m_nvapiEnabled && !usesOpacityMicromaps(cmd.desc))
     {
         NVAPI_D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC_EX desc = {};
         desc.destAccelerationStructureData = dst->getDeviceAddress();
@@ -1474,6 +1492,26 @@ void CommandRecorder::cmdBuildAccelerationStructure(const commands::BuildAcceler
     }
 
     copyAccelerationStructureQueryResults(cmd.propertyQueryCount, cmd.queryDescs, 1);
+}
+
+void CommandRecorder::cmdBuildMicromap(const commands::BuildMicromap& cmd)
+{
+    MicromapImpl* dst = checked_cast<MicromapImpl*>(cmd.dst);
+    BufferImpl* scratch = checked_cast<BufferImpl*>(cmd.scratchBuffer.buffer);
+    requireBufferState(dst->m_buffer, ResourceState::MicromapWrite);
+    requireBufferState(scratch, ResourceState::UnorderedAccess);
+    requireBufferState(checked_cast<BufferImpl*>(cmd.desc.dataBuffer.buffer), ResourceState::MicromapBuildInput);
+    requireBufferState(checked_cast<BufferImpl*>(cmd.desc.descriptorBuffer.buffer), ResourceState::MicromapBuildInput);
+
+    MicromapBuildDescConverter converter;
+    if (SLANG_FAILED(converter.convert(cmd.desc)))
+        return;
+    commitBarriers();
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc = {};
+    buildDesc.DestAccelerationStructureData = dst->getDeviceAddress();
+    buildDesc.ScratchAccelerationStructureData = cmd.scratchBuffer.getDeviceAddress();
+    buildDesc.Inputs = converter.desc;
+    m_cmdList4->BuildRaytracingAccelerationStructure(&buildDesc, 0, nullptr);
 }
 
 void CommandRecorder::cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd)
@@ -1847,8 +1885,12 @@ void CommandRecorder::commitBarriers()
         }
         else if ((bufferBarrier.stateBefore == ResourceState::AccelerationStructureWrite &&
                   bufferBarrier.stateAfter == ResourceState::AccelerationStructureRead) ||
-                 (bufferBarrier.stateAfter == ResourceState::AccelerationStructureRead &&
-                  bufferBarrier.stateBefore == ResourceState::AccelerationStructureWrite) ||
+                 (bufferBarrier.stateBefore == ResourceState::AccelerationStructureRead &&
+                  bufferBarrier.stateAfter == ResourceState::AccelerationStructureWrite) ||
+                 (bufferBarrier.stateBefore == ResourceState::MicromapWrite &&
+                  bufferBarrier.stateAfter == ResourceState::MicromapRead) ||
+                 (bufferBarrier.stateBefore == ResourceState::MicromapRead &&
+                  bufferBarrier.stateAfter == ResourceState::MicromapWrite) ||
                  ((stateAfter & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) != 0))
         {
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -2019,7 +2061,7 @@ Result CommandQueueImpl::init(uint32_t queueIndex)
     return SLANG_OK;
 }
 
-void CommandQueueImpl::shutdown()
+void CommandQueueImpl::waitAndReleaseCommandBuffers()
 {
     waitOnHost();
     // A failed device wait may leave command buffers in the in-flight list. Destroy them before
@@ -2027,6 +2069,11 @@ void CommandQueueImpl::shutdown()
     m_commandBuffersInFlight.clear();
     // Release all command buffers in order to release all resources they may hold.
     m_commandBuffersPool.clear();
+}
+
+void CommandQueueImpl::shutdown()
+{
+    SLANG_RHI_ASSERT(m_commandBuffersInFlight.empty() && m_commandBuffersPool.empty());
     // Release the shared constant-buffer pages while deferred deletion is still available.
     m_constantBufferHeap.release();
     // Execute remaining deferred deletes.
@@ -2055,7 +2102,6 @@ Result CommandQueueImpl::getOrCreateCommandBuffer(CommandBufferImpl** outCommand
     {
         commandBuffer = m_commandBuffersPool.front();
         m_commandBuffersPool.pop_front();
-        commandBuffer->setInternalReferenceCount(0);
     }
     returnRefPtr(outCommandBuffer, commandBuffer);
     return SLANG_OK;
@@ -2067,25 +2113,28 @@ void CommandQueueImpl::retireCommandBuffer(CommandBufferImpl* commandBuffer)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_commandBuffersPool.push_back(commandBuffer);
-        commandBuffer->setInternalReferenceCount(1);
     }
 }
 
 void CommandQueueImpl::retireCommandBuffers()
 {
-    std::list<RefPtr<CommandBufferImpl>> commandBuffers = std::move(m_commandBuffersInFlight);
+    std::list<InternalRefPtr<CommandBufferImpl>> commandBuffers = std::move(m_commandBuffersInFlight);
     m_commandBuffersInFlight.clear();
 
     uint64_t lastFinishedID = updateLastFinishedID();
-    for (const auto& commandBuffer : commandBuffers)
+    while (!commandBuffers.empty())
     {
+        auto current = commandBuffers.begin();
+        CommandBufferImpl* commandBuffer = current->get();
         if (commandBuffer->m_submissionID <= lastFinishedID)
         {
-            retireCommandBuffer(commandBuffer);
+            commandBuffer->reset();
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_commandBuffersPool.splice(m_commandBuffersPool.end(), commandBuffers, current);
         }
         else
         {
-            m_commandBuffersInFlight.push_back(commandBuffer);
+            m_commandBuffersInFlight.splice(m_commandBuffersInFlight.end(), commandBuffers, current);
         }
     }
 
@@ -2111,7 +2160,7 @@ void CommandQueueImpl::executeDeferredDeletes()
     std::lock_guard<std::mutex> lock(m_deferredDeleteQueueMutex);
     while (!m_deferredDeleteQueue.empty() && m_deferredDeleteQueue.front().submissionID <= lastFinishedID)
     {
-        // GPU is done with this resource - delete it.
+        // Destructors must not enqueue deferred deletes; release child resources in deleteThis().
         delete m_deferredDeleteQueue.front().resource;
         m_deferredDeleteQueue.pop();
     }
@@ -2302,7 +2351,6 @@ Result CommandEncoderImpl::finish(const CommandBufferDesc& desc, ICommandBuffer*
     CommandRecorder recorder(getDevice<DeviceImpl>());
     SLANG_RETURN_ON_FAIL(recorder.record(m_commandBuffer));
     returnComPtr(outCommandBuffer, m_commandBuffer);
-    m_commandBuffer = nullptr;
     m_commandList = nullptr;
     return SLANG_OK;
 }

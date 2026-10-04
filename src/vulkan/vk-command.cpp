@@ -109,6 +109,7 @@ public:
     void cmdSetRayTracingState(const commands::SetRayTracingState& cmd);
     void cmdDispatchRays(const commands::DispatchRays& cmd);
     void cmdBuildAccelerationStructure(const commands::BuildAccelerationStructure& cmd);
+    void cmdBuildMicromap(const commands::BuildMicromap& cmd);
     void cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd);
     void cmdQueryAccelerationStructureProperties(const commands::QueryAccelerationStructureProperties& cmd);
     void cmdExecuteClusterOperation(const commands::ExecuteClusterOperation& cmd);
@@ -1348,6 +1349,19 @@ void CommandRecorder::cmdBuildAccelerationStructure(const commands::BuildAcceler
                     ResourceState::AccelerationStructureBuildInput
                 );
             }
+            if (const auto* ommDesc = findStructInChain<AccelerationStructureOpacityMicromapDesc>(input.triangles.next))
+            {
+                if (ommDesc->link.micromap)
+                    requireBufferState(
+                        checked_cast<MicromapImpl*>(ommDesc->link.micromap)->m_buffer,
+                        ResourceState::MicromapRead
+                    );
+                if (ommDesc->link.indexBuffer)
+                    requireBufferState(
+                        checked_cast<BufferImpl*>(ommDesc->link.indexBuffer.buffer),
+                        ResourceState::AccelerationStructureBuildInput
+                    );
+            }
             break;
         case AccelerationStructureBuildInputType::ProceduralPrimitives:
             for (uint32_t i = 0; i < input.proceduralPrimitives.aabbBufferCount; ++i)
@@ -1436,6 +1450,24 @@ void CommandRecorder::cmdBuildAccelerationStructure(const commands::BuildAcceler
     {
         queryAccelerationStructureProperties(1, &cmd.dst, cmd.propertyQueryCount, cmd.queryDescs);
     }
+}
+
+void CommandRecorder::cmdBuildMicromap(const commands::BuildMicromap& cmd)
+{
+    if (!m_device->m_api.vkCmdBuildMicromapsEXT)
+        return;
+    MicromapImpl* dst = checked_cast<MicromapImpl*>(cmd.dst);
+    requireBufferState(dst->m_buffer, ResourceState::MicromapWrite);
+    requireBufferState(checked_cast<BufferImpl*>(cmd.scratchBuffer.buffer), ResourceState::UnorderedAccess);
+    requireBufferState(checked_cast<BufferImpl*>(cmd.desc.dataBuffer.buffer), ResourceState::MicromapBuildInput);
+    requireBufferState(checked_cast<BufferImpl*>(cmd.desc.descriptorBuffer.buffer), ResourceState::MicromapBuildInput);
+    MicromapBuildDescConverter converter;
+    if (SLANG_FAILED(converter.convert(cmd.desc)))
+        return;
+    commitBarriers();
+    converter.buildInfo.dstMicromap = dst->m_vkHandle;
+    converter.buildInfo.scratchData.deviceAddress = cmd.scratchBuffer.getDeviceAddress();
+    m_device->m_api.vkCmdBuildMicromapsEXT(m_cmdBuffer, 1, &converter.buildInfo);
 }
 
 void CommandRecorder::cmdCopyAccelerationStructure(const commands::CopyAccelerationStructure& cmd)
@@ -1998,7 +2030,7 @@ void CommandQueueImpl::init(VkQueue queue, uint32_t queueFamilyIndex)
     }
 }
 
-void CommandQueueImpl::shutdown()
+void CommandQueueImpl::waitAndReleaseCommandBuffers()
 {
     waitOnHost();
     // A failed device wait may leave command buffers in the in-flight list. Destroy them before
@@ -2016,13 +2048,17 @@ void CommandQueueImpl::shutdown()
             m_parameterBlockContents.clear();
         }
     }
+}
 
-    m_parameterBlockSetAllocator.close();
+void CommandQueueImpl::shutdown()
+{
+    SLANG_RHI_ASSERT(m_commandBuffersInFlight.empty() && m_commandBuffersPool.empty());
     // Release the shared constant-buffer pages while deferred deletion is still available.
     m_constantBufferHeap.release();
     // Execute remaining deferred deletes.
     executeDeferredDeletes();
     SLANG_RHI_ASSERT(m_deferredDeleteQueue.empty());
+    m_parameterBlockSetAllocator.close();
     m_api.vkDestroySemaphore(m_api.m_device, m_trackingSemaphore, nullptr);
 }
 
@@ -2046,7 +2082,6 @@ Result CommandQueueImpl::getOrCreateCommandBuffer(CommandBufferImpl** outCommand
     {
         commandBuffer = m_commandBuffersPool.front();
         m_commandBuffersPool.pop_front();
-        commandBuffer->setInternalReferenceCount(0);
     }
     returnRefPtr(outCommandBuffer, commandBuffer);
     return SLANG_OK;
@@ -2058,7 +2093,6 @@ void CommandQueueImpl::retireCommandBuffer(CommandBufferImpl* commandBuffer)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_commandBuffersPool.push_back(commandBuffer);
-        commandBuffer->setInternalReferenceCount(1);
     }
 }
 
@@ -2066,9 +2100,9 @@ void CommandQueueImpl::retireCommandBuffers()
 {
     uint64_t lastFinishedID = updateLastFinishedID();
 
-    // Splice finished buffers out under m_mutex but retire them outside it:
-    // retireCommandBuffer() takes m_mutex itself and std::mutex is not recursive.
-    std::list<RefPtr<CommandBufferImpl>> retired;
+    // submit() appends to the in-flight list under m_mutex, so finished buffers are spliced out under it
+    // and reset outside it.
+    std::list<InternalRefPtr<CommandBufferImpl>> retired;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         for (auto it = m_commandBuffersInFlight.begin(); it != m_commandBuffersInFlight.end();)
@@ -2085,9 +2119,13 @@ void CommandQueueImpl::retireCommandBuffers()
         }
     }
 
-    for (const auto& commandBuffer : retired)
+    while (!retired.empty())
     {
-        retireCommandBuffer(commandBuffer);
+        auto current = retired.begin();
+        CommandBufferImpl* commandBuffer = current->get();
+        commandBuffer->reset();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_commandBuffersPool.splice(m_commandBuffersPool.end(), retired, current);
     }
 
     // The internal device queue shares this VkQueue. Polling it here releases
@@ -2118,7 +2156,7 @@ void CommandQueueImpl::executeDeferredDeletes()
     std::lock_guard<std::mutex> lock(m_deferredDeleteQueueMutex);
     while (!m_deferredDeleteQueue.empty() && m_deferredDeleteQueue.front().submissionID <= lastFinishedID)
     {
-        // GPU is done with this resource - delete it.
+        // Destructors must not enqueue deferred deletes; release child resources in deleteThis().
         delete m_deferredDeleteQueue.front().resource;
         m_deferredDeleteQueue.pop();
     }
@@ -2407,7 +2445,6 @@ Result CommandEncoderImpl::finish(const CommandBufferDesc& desc, ICommandBuffer*
     CommandRecorder recorder(getDevice<DeviceImpl>());
     SLANG_RETURN_ON_FAIL(recorder.record(m_commandBuffer));
     returnComPtr(outCommandBuffer, m_commandBuffer);
-    m_commandBuffer = nullptr;
     m_commandList = nullptr;
     return SLANG_OK;
 }
