@@ -1821,7 +1821,7 @@ void CommandRecorder::commitBarriers()
     VkPipelineStageFlags activeBeforeStageFlags = VkPipelineStageFlags(0);
     VkPipelineStageFlags activeAfterStageFlags = VkPipelineStageFlags(0);
 
-    auto submitBufferBarriers = [&]()
+    auto submitBarriers = [&]()
     {
         m_api.vkCmdPipelineBarrier(
             m_cmdBuffer,
@@ -1832,25 +1832,13 @@ void CommandRecorder::commitBarriers()
             nullptr,
             (uint32_t)bufferBarriers.size(),
             bufferBarriers.data(),
-            0,
-            nullptr
-        );
-    };
-
-    auto submitImageBarriers = [&]()
-    {
-        m_api.vkCmdPipelineBarrier(
-            m_cmdBuffer,
-            activeBeforeStageFlags,
-            activeAfterStageFlags,
-            VkDependencyFlags(0),
-            0,
-            nullptr,
-            0,
-            nullptr,
             (uint32_t)imageBarriers.size(),
             imageBarriers.data()
         );
+        bufferBarriers.clear();
+        imageBarriers.clear();
+        activeBeforeStageFlags = VkPipelineStageFlags(0);
+        activeAfterStageFlags = VkPipelineStageFlags(0);
     };
 
     for (const auto& bufferBarrier : m_stateTracking.getBufferBarriers())
@@ -1862,15 +1850,8 @@ void CommandRecorder::commitBarriers()
         VkPipelineStageFlags afterStageFlags =
             calcPipelineStageFlags(m_api.m_supportedShaderStageFlags, bufferBarrier.stateAfter, false);
 
-        if ((beforeStageFlags != activeBeforeStageFlags || afterStageFlags != activeAfterStageFlags) &&
-            !bufferBarriers.empty())
-        {
-            submitBufferBarriers();
-            bufferBarriers.clear();
-        }
-
-        activeBeforeStageFlags = beforeStageFlags;
-        activeAfterStageFlags = afterStageFlags;
+        activeBeforeStageFlags |= beforeStageFlags;
+        activeAfterStageFlags |= afterStageFlags;
 
         VkBufferMemoryBarrier barrier = {};
         barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1882,13 +1863,6 @@ void CommandRecorder::commitBarriers()
 
         bufferBarriers.push_back(barrier);
     }
-    if (!bufferBarriers.empty())
-    {
-        submitBufferBarriers();
-    }
-
-    activeBeforeStageFlags = VkPipelineStageFlags(0);
-    activeAfterStageFlags = VkPipelineStageFlags(0);
 
     for (const auto& textureBarrier : m_stateTracking.getTextureBarriers())
     {
@@ -1899,15 +1873,23 @@ void CommandRecorder::commitBarriers()
         VkPipelineStageFlags afterStageFlags =
             calcPipelineStageFlags(m_api.m_supportedShaderStageFlags, textureBarrier.stateAfter, false);
 
-        if ((beforeStageFlags != activeBeforeStageFlags || afterStageFlags != activeAfterStageFlags) &&
-            !imageBarriers.empty())
+        // A second transition of the same subresource must not share a call with the first.
+        for (const VkImageMemoryBarrier& pending : imageBarriers)
         {
-            submitImageBarriers();
-            imageBarriers.clear();
+            bool sameSubresource = pending.subresourceRange.baseMipLevel == textureBarrier.mip &&
+                                   pending.subresourceRange.baseArrayLayer == textureBarrier.layer;
+
+            if (pending.image == texture->m_image &&
+                (textureBarrier.entireTexture || pending.subresourceRange.levelCount == VK_REMAINING_MIP_LEVELS ||
+                 sameSubresource))
+            {
+                submitBarriers();
+                break;
+            }
         }
 
-        activeBeforeStageFlags = beforeStageFlags;
-        activeAfterStageFlags = afterStageFlags;
+        activeBeforeStageFlags |= beforeStageFlags;
+        activeAfterStageFlags |= afterStageFlags;
 
         VkImageMemoryBarrier barrier = {};
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1932,9 +1914,10 @@ void CommandRecorder::commitBarriers()
         barrier.dstAccessMask = calcAccessFlags(textureBarrier.stateAfter);
         imageBarriers.push_back(barrier);
     }
-    if (!imageBarriers.empty())
+
+    if (!bufferBarriers.empty() || !imageBarriers.empty())
     {
-        submitImageBarriers();
+        submitBarriers();
     }
 
     m_stateTracking.clearBarriers();
@@ -2014,7 +1997,7 @@ void CommandQueueImpl::init(VkQueue queue, uint32_t queueFamilyIndex)
     constantBufferHeapDesc.maxPageSize = 4 * 1024 * 1024;
     constantBufferHeapDesc.maxRetainedSize = 4 * 1024 * 1024;
     constantBufferHeapDesc.memoryType = MemoryType::Upload;
-    constantBufferHeapDesc.usage = BufferUsage::ConstantBuffer;
+    constantBufferHeapDesc.usage = BufferUsage::ConstantBuffer | BufferUsage::CopySource;
     constantBufferHeapDesc.defaultState = ResourceState::ConstantBuffer;
     constantBufferHeapDesc.alignment = constantBufferAlignment;
     constantBufferHeapDesc.allocationGranularity = constantBufferAlignment;
@@ -2098,6 +2081,7 @@ void CommandQueueImpl::retireCommandBuffer(CommandBufferImpl* commandBuffer)
 
 void CommandQueueImpl::retireCommandBuffers()
 {
+    ZoneScopedN("rhi.retire"); // TEMP-TRACY-SUBMIT
     uint64_t lastFinishedID = updateLastFinishedID();
 
     // submit() appends to the in-flight list under m_mutex, so finished buffers are spliced out under it
@@ -2123,7 +2107,10 @@ void CommandQueueImpl::retireCommandBuffers()
     {
         auto current = retired.begin();
         CommandBufferImpl* commandBuffer = current->get();
-        commandBuffer->reset();
+        {
+            ZoneScopedN("rhi.retire.reset"); // TEMP-TRACY-SUBMIT
+            commandBuffer->reset();
+        }
         std::lock_guard<std::mutex> lock(m_mutex);
         m_commandBuffersPool.splice(m_commandBuffersPool.end(), retired, current);
     }
@@ -2133,8 +2120,12 @@ void CommandQueueImpl::retireCommandBuffers()
     getDevice<DeviceImpl>()->m_deviceQueue.retireCompletedResources();
 
     // Delete deferred resources that are no longer in use by the GPU.
-    executeDeferredDeletes();
+    {
+        ZoneScopedN("rhi.retire.deferredDeletes"); // TEMP-TRACY-SUBMIT
+        executeDeferredDeletes();
+    }
 
+    ZoneNamedN(retireEvict, "rhi.retire.evict", true); // TEMP-TRACY-SUBMIT
     evictParameterBlockSets(lastFinishedID);
 
     // Flush all device heaps
@@ -2228,6 +2219,7 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
     // Held through vkQueueSubmit: VkQueue is externally synchronized, and the tracking
     // semaphore must be signaled with strictly increasing values.
     std::unique_lock<std::mutex> lock(m_mutex);
+    ZoneNamedN(submitLocked, "rhi.submit.locked", true); // TEMP-TRACY-SUBMIT
 
     // Increment last submitted ID which is used to track command buffer completion.
     ++m_lastSubmittedID;
@@ -2426,6 +2418,11 @@ Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingD
         checked_cast<RootShaderObjectLayoutImpl*>(specializedLayout),
         (BindingDataImpl*&)outBindingData
     );
+}
+
+TransientBufferArena* CommandEncoderImpl::getTransientBufferArena()
+{
+    return &m_commandBuffer->m_constantBufferArena;
 }
 
 Result CommandEncoderImpl::finish(const CommandBufferDesc& desc, ICommandBuffer** outCommandBuffer)

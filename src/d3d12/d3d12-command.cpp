@@ -2053,7 +2053,7 @@ Result CommandQueueImpl::init(uint32_t queueIndex)
     constantBufferHeapDesc.maxPageSize = 4 * 1024 * 1024;
     constantBufferHeapDesc.maxRetainedSize = 4 * 1024 * 1024;
     constantBufferHeapDesc.memoryType = MemoryType::Upload;
-    constantBufferHeapDesc.usage = BufferUsage::ConstantBuffer;
+    constantBufferHeapDesc.usage = BufferUsage::ConstantBuffer | BufferUsage::CopySource;
     constantBufferHeapDesc.defaultState = ResourceState::ConstantBuffer;
     constantBufferHeapDesc.alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
     constantBufferHeapDesc.allocationGranularity = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
@@ -2337,6 +2337,11 @@ Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingD
         checked_cast<RootShaderObjectLayoutImpl*>(specializedLayout),
         (BindingDataImpl*&)outBindingData
     );
+}
+
+TransientBufferArena* CommandEncoderImpl::getTransientBufferArena()
+{
+    return &m_commandBuffer->m_constantBufferArena;
 }
 
 Result CommandEncoderImpl::finish(const CommandBufferDesc& desc, ICommandBuffer** outCommandBuffer)

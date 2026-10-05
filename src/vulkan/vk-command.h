@@ -98,6 +98,7 @@ public:
     Result init();
 
     virtual Result getBindingData(RootShaderObject* rootObject, BindingData*& outBindingData) override;
+    virtual TransientBufferArena* getTransientBufferArena() override;
 
     // ICommandEncoder implementation
 

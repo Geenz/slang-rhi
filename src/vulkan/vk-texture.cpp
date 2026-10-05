@@ -413,8 +413,10 @@ Result DeviceImpl::createTexture(const TextureDesc& desc_, const SubresourceData
     if (defaultLayout != VK_IMAGE_LAYOUT_UNDEFINED)
     {
         _transitionImageLayout(texture->m_image, format, texture->m_desc, VK_IMAGE_LAYOUT_UNDEFINED, defaultLayout);
+        // Same-queue submission order covers later use, as in uploadBufferInitData; no queue-idle wait.
+        m_deviceQueue.retainResource(texture.get());
+        m_deviceQueue.flush();
     }
-    m_deviceQueue.flushAndWait();
 
     // Upload init data if we have some
     if (initData)

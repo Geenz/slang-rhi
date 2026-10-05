@@ -241,6 +241,9 @@ public:
 
     virtual Result getBindingData(RootShaderObject* rootObject, BindingData*& outBindingData) = 0;
 
+    /// Command-buffer-local arena for small staging uploads, or nullptr to use the device upload heap.
+    virtual TransientBufferArena* getTransientBufferArena() { return nullptr; }
+
     Result getPipelineSpecializationArgs(
         IPipeline* pipeline,
         IShaderObject* object,

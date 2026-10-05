@@ -745,19 +745,32 @@ Result CommandEncoder::uploadTextureData(
 
 Result CommandEncoder::uploadBufferData(IBuffer* dst, Offset offset, Size size, const void* data)
 {
+    commands::CopyBuffer cmd;
+    cmd.dst = dst;
+    cmd.dstOffset = offset;
+    cmd.size = size;
+
+    // Small uploads bump-allocate from the command buffer's arena instead of taking the upload heap's device-wide lock.
+    constexpr Size kMaxArenaUploadSize = 64 * 1024;
+    TransientBufferArena* arena = getTransientBufferArena();
+    TransientBufferArena::Allocation allocation;
+    if (arena && size <= kMaxArenaUploadSize && SLANG_SUCCEEDED(arena->allocate(size, &allocation)))
+    {
+        memcpy(allocation.mappedData, data, size);
+        cmd.src = allocation.buffer;
+        cmd.srcOffset = allocation.offset;
+        m_commandList->write(std::move(cmd));
+        return SLANG_OK;
+    }
+
     RefPtr<StagingHeap::Handle> handle;
     // Buffer copy offsets must be aligned to four bytes.
     SLANG_RETURN_ON_FAIL(getDevice()->m_uploadHeap.stageHandle(data, size, 4, {}, handle.writeRef()));
 
     m_commandList->retainResource(handle);
 
-    commands::CopyBuffer cmd;
-
-    cmd.dst = dst;
-    cmd.dstOffset = offset;
     cmd.src = handle->getBuffer();
     cmd.srcOffset = handle->getOffset();
-    cmd.size = size;
 
     m_commandList->write(std::move(cmd));
     return SLANG_OK;
