@@ -1,6 +1,7 @@
 #include "vk-texture.h"
 #include "vk-device.h"
 #include "vk-buffer.h"
+#include "vk-command.h"
 #include "vk-utils.h"
 
 #if SLANG_WINDOWS_FAMILY
@@ -49,6 +50,18 @@ void TextureImpl::deleteThis()
         delete this;
         return;
     }
+
+    if (m_deviceQueueFenceValue != 0)
+    {
+        DeviceImpl* device = getDevice<DeviceImpl>();
+        std::vector<InternalRefPtr<RefObject>> retiredResources;
+
+        {
+            std::lock_guard<std::mutex> lock(device->m_queue->m_mutex);
+            device->m_deviceQueue.waitForFenceValue(m_deviceQueueFenceValue, retiredResources);
+        }
+    }
+
     m_sampler.setNull();
     getDevice<DeviceImpl>()->deferDelete(this);
 }
@@ -412,9 +425,10 @@ Result DeviceImpl::createTexture(const TextureDesc& desc_, const SubresourceData
     auto defaultLayout = getImageLayoutFromState(desc.defaultState);
     if (defaultLayout != VK_IMAGE_LAYOUT_UNDEFINED)
     {
+        std::lock_guard<std::mutex> lock(m_queue->m_mutex);
         _transitionImageLayout(texture->m_image, format, texture->m_desc, VK_IMAGE_LAYOUT_UNDEFINED, defaultLayout);
         // Same-queue submission order covers later use, as in uploadBufferInitData; no queue-idle wait.
-        m_deviceQueue.retainResource(texture.get());
+        texture->m_deviceQueueFenceValue = m_deviceQueue.getNextFenceValue();
         m_deviceQueue.flush();
     }
 

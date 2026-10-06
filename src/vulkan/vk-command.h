@@ -24,8 +24,8 @@ public:
     } m_surfaceSync;
 
     VkSemaphore m_trackingSemaphore;
-    uint64_t m_lastSubmittedID = 0;
-    uint64_t m_lastFinishedID = 0;
+    std::atomic<uint64_t> m_lastSubmittedID = 0;
+    std::atomic<uint64_t> m_lastFinishedID = 0;
 
     std::mutex m_mutex;
 

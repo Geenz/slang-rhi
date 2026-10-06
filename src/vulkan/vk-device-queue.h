@@ -34,15 +34,20 @@ struct VulkanDeviceQueue
     /// Release resources associated with completed submissions without blocking.
     void retireCompleted();
 
-    /// Release retained resources associated with completed submissions without
+    /// Move retained resources associated with completed submissions into outRetired without
     /// polling fence slots that do not retain resources.
-    void retireCompletedResources();
+    void retireCompletedResources(std::vector<InternalRefPtr<RefObject>>& outRetired);
+
+    /// Caller holds the queue mutex and releases outRetired after unlocking.
+    void waitForFenceValue(uint64_t value, std::vector<InternalRefPtr<RefObject>>& outRetired);
 
     /// Blocks until all work submitted to GPU has completed
     void waitForIdle() { m_api->vkQueueWaitIdle(m_queue); }
 
     /// Get the graphics queue index (as set on init)
     int getQueueIndex() const { return m_queueIndex; }
+
+    uint64_t getNextFenceValue() const { return m_nextFenceValue; }
 
     /// Make the specified event 'current' - meaning it's semaphore must be waited on
     VkSemaphore makeCurrent(EventType eventType);
@@ -87,7 +92,11 @@ protected:
         std::vector<InternalRefPtr<RefObject>> retainedResources;
     };
 
-    void _updateFenceAtIndex(int fenceIndex, bool blocking);
+    void _updateFenceAtIndex(
+        int fenceIndex,
+        bool blocking,
+        std::vector<InternalRefPtr<RefObject>>* outRetired = nullptr
+    );
 
     VkQueue m_queue = VK_NULL_HANDLE;
 

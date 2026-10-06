@@ -2117,7 +2117,14 @@ void CommandQueueImpl::retireCommandBuffers()
 
     // The internal device queue shares this VkQueue. Polling it here releases
     // initialization staging allocations even if no further internal work occurs.
-    getDevice<DeviceImpl>()->m_deviceQueue.retireCompletedResources();
+    {
+        std::vector<InternalRefPtr<RefObject>> retiredResources;
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            getDevice<DeviceImpl>()->m_deviceQueue.retireCompletedResources(retiredResources);
+        }
+    }
 
     // Delete deferred resources that are no longer in use by the GPU.
     {
@@ -2202,8 +2209,18 @@ void CommandQueueImpl::evictParameterBlockSets(uint64_t lastFinishedID)
 
 uint64_t CommandQueueImpl::updateLastFinishedID()
 {
-    m_api.vkGetSemaphoreCounterValue(m_api.m_device, m_trackingSemaphore, &m_lastFinishedID);
-    return m_lastFinishedID;
+    uint64_t counterValue = 0;
+    m_api.vkGetSemaphoreCounterValue(m_api.m_device, m_trackingSemaphore, &counterValue);
+    // Concurrent retirers may read the counter out of order; publish only the max.
+    uint64_t lastFinishedID = m_lastFinishedID.load();
+    while (lastFinishedID < counterValue)
+    {
+        if (m_lastFinishedID.compare_exchange_weak(lastFinishedID, counterValue))
+        {
+            return counterValue;
+        }
+    }
+    return lastFinishedID;
 }
 
 Result CommandQueueImpl::createCommandEncoder(const CommandEncoderDesc& desc, ICommandEncoder** outEncoder)
@@ -2325,9 +2342,16 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
 
 Result CommandQueueImpl::waitOnHost()
 {
-    DeviceImpl* device = getDevice<DeviceImpl>();
-    auto& api = device->m_api;
-    SLANG_VK_RETURN_ON_FAIL_REPORT(api.vkQueueWaitIdle(m_queue), device);
+    // Signals the tracking semaphore after all earlier work on this VkQueue, device-queue submits included.
+    SubmitDesc submitDesc = {};
+    SLANG_RETURN_ON_FAIL(submit(submitDesc));
+
+    uint64_t target = m_lastSubmittedID;
+    VkSemaphoreWaitInfo waitInfo = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    waitInfo.semaphoreCount = 1;
+    waitInfo.pSemaphores = &m_trackingSemaphore;
+    waitInfo.pValues = &target;
+    SLANG_VK_RETURN_ON_FAIL_REPORT(m_api.vkWaitSemaphores(m_api.m_device, &waitInfo, UINT64_MAX), m_device);
     retireCommandBuffers();
     return SLANG_OK;
 }

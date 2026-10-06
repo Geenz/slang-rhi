@@ -37,6 +37,8 @@ public:
     bool m_isSwapchainTexture = false;
     bool m_isSwapchainInitialState = false;
 
+    uint64_t m_deviceQueueFenceValue = 0;
+
     struct ViewKey
     {
         Format format;

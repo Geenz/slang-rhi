@@ -405,7 +405,7 @@ Result SurfaceImpl::createSwapchain()
 void SurfaceImpl::destroySwapchain()
 {
     auto& api = m_device->m_api;
-    api.vkQueueWaitIdle(m_device->m_queue->m_queue);
+    m_device->m_queue->waitOnHost();
     m_textures.clear();
     for (FrameData& frameData : m_frameData)
     {
@@ -542,12 +542,15 @@ Result SurfaceImpl::acquireNextImage(ITexture** outTexture)
     }
 
     // Setup queue's next submit for synchronization with the swapchain.
-    m_device->m_queue->m_surfaceSync.fence = frameData.fence;
-    m_device->m_queue->m_surfaceSync.imageAvailableSemaphore = frameData.imageAvailableSemaphore;
-    // Present consumes this semaphore outside the submitted command buffer's fence.
-    // Reuse it only when the same swapchain image is acquired again.
-    m_device->m_queue->m_surfaceSync.renderFinishedSemaphore =
-        m_frameData[m_currentTextureIndex].renderFinishedSemaphore;
+    {
+        std::lock_guard<std::mutex> lock(m_device->m_queue->m_mutex);
+        m_device->m_queue->m_surfaceSync.fence = frameData.fence;
+        m_device->m_queue->m_surfaceSync.imageAvailableSemaphore = frameData.imageAvailableSemaphore;
+        // Present consumes this semaphore outside the submitted command buffer's fence.
+        // Reuse it only when the same swapchain image is acquired again.
+        m_device->m_queue->m_surfaceSync.renderFinishedSemaphore =
+            m_frameData[m_currentTextureIndex].renderFinishedSemaphore;
+    }
 
     // Mark texture to be in swapchain initial state.
     // This is used by the first image barrier to transition the texture from the correct state.
@@ -573,11 +576,16 @@ Result SurfaceImpl::present()
     m_currentFrameIndex = (m_currentFrameIndex + 1) % m_frameData.size();
     VkSemaphore renderFinishedSemaphore = m_frameData[m_currentTextureIndex].renderFinishedSemaphore;
 
+    bool surfaceSyncPending = false;
+    {
+        std::lock_guard<std::mutex> lock(m_device->m_queue->m_mutex);
+        surfaceSyncPending = m_device->m_queue->m_surfaceSync.fence != VK_NULL_HANDLE;
+    }
+
     // m_isSwapchainInitialState means no barrier has touched this image yet, so it is still
     // UNDEFINED regardless of submit count; submit a dummy command buffer to transition it
     // (this also covers the original no-submit-at-all case).
-    if (m_textures[m_currentTextureIndex]->m_isSwapchainInitialState ||
-        m_device->m_queue->m_surfaceSync.fence != VK_NULL_HANDLE)
+    if (m_textures[m_currentTextureIndex]->m_isSwapchainInitialState || surfaceSyncPending)
     {
         ICommandQueue* queue = m_device->m_queue.get();
         ComPtr<ICommandEncoder> encoder;
@@ -597,7 +605,11 @@ Result SurfaceImpl::present()
     presentInfo.pImageIndices = &m_currentTextureIndex;
     presentInfo.waitSemaphoreCount = 1;
     presentInfo.pWaitSemaphores = &renderFinishedSemaphore;
-    VkResult result = api.vkQueuePresentKHR(m_device->m_queue->m_queue, &presentInfo);
+    VkResult result;
+    {
+        std::lock_guard<std::mutex> lock(m_device->m_queue->m_mutex);
+        result = api.vkQueuePresentKHR(m_device->m_queue->m_queue, &presentInfo);
+    }
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
     {
         reportVulkanError(result, "vkQueuePresentKHR", SLANG_RHI_SOURCE_LOCATION(), m_device);

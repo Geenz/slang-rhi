@@ -1817,27 +1817,29 @@ void CommandQueueImpl::shutdown()
 
 void CommandQueueImpl::retireCommandBuffers()
 {
-    std::list<InternalRefPtr<CommandBufferImpl>> commandBuffers = std::move(m_commandBuffersInFlight);
-    m_commandBuffersInFlight.clear();
-
-    for (auto it = commandBuffers.begin(); it != commandBuffers.end();)
+    std::list<InternalRefPtr<CommandBufferImpl>> retired;
     {
-        auto current = it++;
-        CommandBufferImpl* commandBuffer = current->get();
-        auto status = commandBuffer->m_commandBuffer->status();
-        // Error diagnostic is surfaced by the `addCompletedHandler`
-        // installed in `submit()` — that fires per-CB at completion
-        // time with the real `NS::Error`, before Metal overwrites
-        // subsequent-CB errors with the "Ignored (for causing prior
-        // /excessive GPU errors)" cascade reason.
-        if (status == MTL::CommandBufferStatusCompleted || status == MTL::CommandBufferStatusError)
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto it = m_commandBuffersInFlight.begin(); it != m_commandBuffersInFlight.end();)
         {
-            commandBuffer->reset();
+            auto current = it++;
+            CommandBufferImpl* commandBuffer = current->get();
+            auto status = commandBuffer->m_commandBuffer->status();
+            // Error diagnostic is surfaced by the `addCompletedHandler`
+            // installed in `submit()` — that fires per-CB at completion
+            // time with the real `NS::Error`, before Metal overwrites
+            // subsequent-CB errors with the "Ignored (for causing prior
+            // /excessive GPU errors)" cascade reason.
+            if (status == MTL::CommandBufferStatusCompleted || status == MTL::CommandBufferStatusError)
+            {
+                retired.splice(retired.end(), m_commandBuffersInFlight, current);
+            }
         }
-        else
-        {
-            m_commandBuffersInFlight.splice(m_commandBuffersInFlight.end(), commandBuffers, current);
-        }
+    }
+
+    for (const auto& commandBuffer : retired)
+    {
+        commandBuffer->reset();
     }
 
     // Delete deferred resources that are no longer in use by the GPU.
@@ -1868,8 +1870,9 @@ void CommandQueueImpl::executeDeferredDeletes()
 
 uint64_t CommandQueueImpl::updateLastFinishedID()
 {
-    m_lastFinishedID = m_trackingEvent->signaledValue();
-    return m_lastFinishedID;
+    uint64_t lastFinishedID = m_trackingEvent->signaledValue();
+    m_lastFinishedID = lastFinishedID;
+    return lastFinishedID;
 }
 
 Result CommandQueueImpl::createCommandEncoder(const CommandEncoderDesc& desc, ICommandEncoder** outEncoder)
@@ -1886,7 +1889,21 @@ Result CommandQueueImpl::waitOnHost()
 {
     AUTORELEASEPOOL
 
-    if (updateLastFinishedID() < m_lastSubmittedID)
+    uint64_t target = 0;
+    std::list<InternalRefPtr<CommandBufferImpl>> commandBuffers;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        target = m_lastSubmittedID;
+        for (const auto& commandBuffer : m_commandBuffersInFlight)
+        {
+            if (commandBuffer->m_submissionID <= target)
+            {
+                commandBuffers.push_back(commandBuffer);
+            }
+        }
+    }
+
+    if (updateLastFinishedID() < target)
     {
         // Create a semaphore to synchronize the notification
         dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
@@ -1897,7 +1914,7 @@ Result CommandQueueImpl::waitOnHost()
         };
 
         // Set up notification handler before creating command buffer
-        m_trackingEvent->notifyListener(m_trackingEventListener.get(), m_lastSubmittedID, block);
+        m_trackingEvent->notifyListener(m_trackingEventListener.get(), target, block);
 
         // Wait for the device with timeout
         dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
@@ -1906,16 +1923,12 @@ Result CommandQueueImpl::waitOnHost()
         updateLastFinishedID();
     }
 
-    for (const auto& commandBuffer : m_commandBuffersInFlight)
+    for (const auto& commandBuffer : commandBuffers)
     {
         commandBuffer->m_commandBuffer->waitUntilCompleted();
     }
 
     retireCommandBuffers();
-
-    // Should now have no command buffers in flight and have finished submitting
-    SLANG_RHI_ASSERT(m_lastFinishedID == m_lastSubmittedID);
-    SLANG_RHI_ASSERT(m_commandBuffersInFlight.size() == 0);
 
     return SLANG_OK;
 }
@@ -1930,6 +1943,10 @@ Result CommandQueueImpl::getNativeHandle(NativeHandle* outHandle)
 Result CommandQueueImpl::submit(const SubmitDesc& desc)
 {
     AUTORELEASEPOOL
+
+    // Held through the last commit: tracking-event values must be committed in increasing order,
+    // and every in-flight command buffer must already be committed.
+    std::unique_lock<std::mutex> queueLock(m_mutex);
 
     // If there are any wait fences, encode them to a new command buffer.
     // Metal ensures that command buffers are executed in the order they are committed.
@@ -2084,6 +2101,8 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
         addErrorHandler(commandBuffer);
         commandBuffer->commit();
     }
+
+    queueLock.unlock();
 
     // Retire command buffers that are finished
     retireCommandBuffers();

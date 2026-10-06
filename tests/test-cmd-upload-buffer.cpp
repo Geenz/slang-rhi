@@ -54,8 +54,21 @@ void testUploadToBuffer(IDevice* device, Size size, Offset offset, int tests, bo
     // Ensure any previous operations have finished so we can safely check heap usage.
     device->getQueue(QueueType::Graphics)->waitOnHost();
 
-    StagingHeap& heap = getUnderlyingDevice(device)->m_uploadHeap;
-    CHECK_EQ(heap.getUsed(), 0);
+    StagingHeap& stagingHeap = getUnderlyingDevice(device)->m_uploadHeap;
+    CHECK_EQ(stagingHeap.getUsed(), 0);
+
+    // Small uploads on Vulkan/D3D12 are served from the queue's transient arena, not the staging heap.
+    bool arenaPath = (device->getDeviceType() == DeviceType::Vulkan || device->getDeviceType() == DeviceType::D3D12) &&
+                     size <= 64 * 1024;
+    ComPtr<ICommandQueue> innerQueue;
+    TransientBufferHeap* transientHeap = nullptr;
+    Size transientUsedBefore = 0;
+    if (arenaPath)
+    {
+        REQUIRE_CALL(getUnderlyingDevice(device)->getQueue(QueueType::Graphics, innerQueue.writeRef()));
+        transientHeap = &checked_cast<CommandQueue*>(innerQueue.get())->m_constantBufferHeap;
+        transientUsedBefore = transientHeap->getUsed();
+    }
 
     std::vector<UploadData> uploads(tests);
 
@@ -70,7 +83,15 @@ void testUploadToBuffer(IDevice* device, Size size, Offset offset, int tests, bo
             auto encoder = queue->createCommandEncoder();
             for (int i = 0; i < tests; i++)
                 encoder->uploadBufferData(uploads[i].dst, uploads[i].offset, uploads[i].size, uploads[i].data.data());
-            CHECK_EQ(heap.getUsed(), heap.alignAllocationSize(uploads[0].size) * tests);
+            if (arenaPath)
+            {
+                CHECK_EQ(stagingHeap.getUsed(), 0);
+                CHECK_GT(transientHeap->getUsed(), 0);
+            }
+            else
+            {
+                CHECK_EQ(stagingHeap.getUsed(), stagingHeap.alignAllocationSize(uploads[0].size) * tests);
+            }
             queue->submit(encoder->finish());
         }
         else
@@ -79,7 +100,15 @@ void testUploadToBuffer(IDevice* device, Size size, Offset offset, int tests, bo
             {
                 auto encoder = queue->createCommandEncoder();
                 encoder->uploadBufferData(uploads[i].dst, uploads[i].offset, uploads[i].size, uploads[i].data.data());
-                CHECK_EQ(heap.getUsed(), heap.alignAllocationSize(uploads[0].size) * tests);
+                if (arenaPath)
+                {
+                    CHECK_EQ(stagingHeap.getUsed(), 0);
+                    CHECK_GT(transientHeap->getUsed(), 0);
+                }
+                else
+                {
+                    CHECK_EQ(stagingHeap.getUsed(), stagingHeap.alignAllocationSize(uploads[0].size) * tests);
+                }
                 queue->submit(encoder->finish());
             }
         }
@@ -87,7 +116,11 @@ void testUploadToBuffer(IDevice* device, Size size, Offset offset, int tests, bo
         queue->waitOnHost();
 
         // Having waited, command buffers should be reset so heap memory should be free.
-        CHECK_EQ(heap.getUsed(), 0);
+        CHECK_EQ(stagingHeap.getUsed(), 0);
+        if (arenaPath)
+        {
+            CHECK_EQ(transientHeap->getUsed(), transientUsedBefore);
+        }
 
         // Download buffer data and validate it.
         for (int i = 0; i < tests; i++)

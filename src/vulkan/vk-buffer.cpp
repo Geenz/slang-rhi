@@ -1,5 +1,6 @@
 #include "vk-buffer.h"
 #include "vk-device.h"
+#include "vk-command.h"
 #include "vk-utils.h"
 
 #if SLANG_WINDOWS_FAMILY
@@ -349,6 +350,7 @@ Result DeviceImpl::uploadBufferInitData(IBuffer* buffer, Offset offset, Size siz
     SLANG_RETURN_ON_FAIL(m_uploadHeap.stageHandle(data, size, 4, {}, stagingHandle.writeRef()));
     BufferImpl* srcBuffer = checked_cast<BufferImpl*>(stagingHandle->getBuffer());
 
+    std::lock_guard<std::mutex> lock(m_queue->m_mutex);
     VkCommandBuffer commandBuffer = m_deviceQueue.getCommandBuffer();
 
     VkBufferCopy copy = {};

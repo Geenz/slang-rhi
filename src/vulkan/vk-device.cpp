@@ -1974,6 +1974,7 @@ Result DeviceImpl::readBuffer(IBuffer* buffer, Offset offset, Size size, void* o
     ));
 
     // Copy from real buffer to staging buffer
+    std::unique_lock<std::mutex> lock(m_queue->m_mutex);
     VkCommandBuffer commandBuffer = m_deviceQueue.getCommandBuffer();
 
     VkBufferMemoryBarrier barrier = {};
@@ -2023,7 +2024,10 @@ Result DeviceImpl::readBuffer(IBuffer* buffer, Offset offset, Size size, void* o
         nullptr
     );
 
-    m_deviceQueue.flushAndWait();
+    m_deviceQueue.flush();
+    lock.unlock();
+
+    SLANG_RETURN_ON_FAIL(m_queue->waitOnHost());
 
     // Write out the data from the buffer
     void* mappedData = nullptr;

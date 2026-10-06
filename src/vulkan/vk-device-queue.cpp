@@ -135,7 +135,11 @@ void VulkanDeviceQueue::flushStepA()
     makeCompleted(EventType::EndFrame);
 }
 
-void VulkanDeviceQueue::_updateFenceAtIndex(int fenceIndex, bool blocking)
+void VulkanDeviceQueue::_updateFenceAtIndex(
+    int fenceIndex,
+    bool blocking,
+    std::vector<InternalRefPtr<RefObject>>* outRetired
+)
 {
     FenceInfo& fence = m_fences[fenceIndex];
 
@@ -156,6 +160,13 @@ void VulkanDeviceQueue::_updateFenceAtIndex(int fenceIndex, bool blocking)
 
             if (!fence.retainedResources.empty())
             {
+                if (outRetired)
+                {
+                    for (auto& resource : fence.retainedResources)
+                    {
+                        outRetired->push_back(std::move(resource));
+                    }
+                }
                 fence.retainedResources.clear();
                 SLANG_RHI_ASSERT(m_pendingResourceRetirements > 0);
                 --m_pendingResourceRetirements;
@@ -181,7 +192,7 @@ void VulkanDeviceQueue::retireCompleted()
     }
 }
 
-void VulkanDeviceQueue::retireCompletedResources()
+void VulkanDeviceQueue::retireCompletedResources(std::vector<InternalRefPtr<RefObject>>& outRetired)
 {
     if (m_pendingResourceRetirements == 0)
         return;
@@ -189,7 +200,24 @@ void VulkanDeviceQueue::retireCompletedResources()
     for (int i = 0; i < m_numCommandBuffers; ++i)
     {
         if (!m_fences[i].retainedResources.empty())
-            _updateFenceAtIndex(i, false);
+            _updateFenceAtIndex(i, false, &outRetired);
+    }
+}
+
+void VulkanDeviceQueue::waitForFenceValue(uint64_t value, std::vector<InternalRefPtr<RefObject>>& outRetired)
+{
+    if (value <= m_lastFenceCompleted)
+    {
+        return;
+    }
+
+    for (int fenceIndex = 0; fenceIndex < m_numCommandBuffers; ++fenceIndex)
+    {
+        if (m_fences[fenceIndex].active && m_fences[fenceIndex].value == value)
+        {
+            _updateFenceAtIndex(fenceIndex, true, &outRetired);
+            return;
+        }
     }
 }
 
