@@ -16,8 +16,6 @@
 
 #include "core/static_vector.h"
 #include <algorithm>
-#include <tracy/Tracy.hpp> // TEMP-TRACY
-#include <tracy/TracyC.h> // TEMP-TRACY
 
 namespace rhi::vk {
 
@@ -142,7 +140,6 @@ public:
 
 Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
 {
-    ZoneScopedN("rhi.record"); // TEMP-TRACY
     m_cmdBuffer = commandBuffer->m_commandBuffer;
 
 #if SLANG_RHI_ENABLE_AFTERMATH
@@ -155,10 +152,7 @@ Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
 
     VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    { // TEMP-TRACY
-    ZoneNamedN(rhiZoneVkBegin, "rhi.vkBegin", true); // TEMP-TRACY
     SLANG_VK_RETURN_ON_FAIL_REPORT(m_api.vkBeginCommandBuffer(m_cmdBuffer, &beginInfo), m_device);
-    } // TEMP-TRACY
 
     CommandList& commandList = commandBuffer->m_commandList;
 
@@ -171,7 +165,6 @@ Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
         //
         if (slot->id == CommandID::BeginRenderPass)
         {
-            ZoneNamedN(rhiZonePrepRenderPass, "rhi.record.prepRenderPass", true); // TEMP-TRACY
             m_renderPassCachedBlocks.clear();
             for (auto subCmdSlot = slot->next; subCmdSlot; subCmdSlot = subCmdSlot->next)
             {
@@ -201,17 +194,11 @@ Result CommandRecorder::record(CommandBufferImpl* commandBuffer)
     }
 
     // Transition all resources back to their default states.
-    { // TEMP-TRACY
-    ZoneNamedN(rhiZoneDefaultStates, "rhi.record.defaultStates", true); // TEMP-TRACY
     m_stateTracking.requireDefaultStates();
     commitBarriers();
     m_stateTracking.clear();
-    } // TEMP-TRACY
 
-    { // TEMP-TRACY
-    ZoneNamedN(rhiZoneVkEnd, "rhi.vkEnd", true); // TEMP-TRACY
     SLANG_VK_RETURN_ON_FAIL_REPORT(m_api.vkEndCommandBuffer(m_cmdBuffer), m_device);
-    } // TEMP-TRACY
 
     return SLANG_OK;
 }
@@ -789,7 +776,6 @@ void CommandRecorder::prepareSetRenderState(const commands::SetRenderState& cmd)
 
 void CommandRecorder::cmdSetRenderState(const commands::SetRenderState& cmd)
 {
-    ZoneScopedN("rhi.cmdSetRenderState"); // TEMP-TRACY
     if (!m_renderPassActive)
         return;
 
@@ -1044,7 +1030,6 @@ void CommandRecorder::cmdDrawMeshTasks(const commands::DrawMeshTasks& cmd)
 
 void CommandRecorder::cmdDrawMeshTasksIndirect(const commands::DrawMeshTasksIndirect& cmd)
 {
-    ZoneScopedN("rhi.cmdDrawMeshTasksIndirect"); // TEMP-TRACY
     if (!m_renderStateValid)
         return;
 
@@ -1717,7 +1702,6 @@ void CommandRecorder::cmdExecuteCallback(const commands::ExecuteCallback& cmd)
 
 void CommandRecorder::setBindings(BindingDataImpl* bindingData, VkPipelineBindPoint bindPoint)
 {
-    ZoneScopedN("rhi.setBindings"); // TEMP-TRACY
     // Set push constants.
     for (uint32_t i = 0; i < bindingData->pushConstantCount; ++i)
     {
@@ -1751,7 +1735,6 @@ void CommandRecorder::setBindings(BindingDataImpl* bindingData, VkPipelineBindPo
 
 void CommandRecorder::requireBindingStates(BindingDataImpl* bindingData, bool oncePerRenderPass)
 {
-    ZoneScopedN("rhi.requireBindingStates"); // TEMP-TRACY
     for (uint32_t i = 0; i < bindingData->bufferStateCount; ++i)
     {
         const auto& bufferState = bindingData->bufferStates[i];
@@ -1811,7 +1794,6 @@ void CommandRecorder::requireTextureState(TextureImpl* texture, SubresourceRange
 
 void CommandRecorder::commitBarriers()
 {
-    ZoneScopedN("rhi.commitBarriers"); // TEMP-TRACY
     if (testing::gDebugDisableStateTracking)
         return;
 
@@ -2081,7 +2063,6 @@ void CommandQueueImpl::retireCommandBuffer(CommandBufferImpl* commandBuffer)
 
 void CommandQueueImpl::retireCommandBuffers()
 {
-    ZoneScopedN("rhi.retire"); // TEMP-TRACY-SUBMIT
     uint64_t lastFinishedID = updateLastFinishedID();
 
     // submit() appends to the in-flight list under m_mutex, so finished buffers are spliced out under it
@@ -2107,10 +2088,7 @@ void CommandQueueImpl::retireCommandBuffers()
     {
         auto current = retired.begin();
         CommandBufferImpl* commandBuffer = current->get();
-        {
-            ZoneScopedN("rhi.retire.reset"); // TEMP-TRACY-SUBMIT
-            commandBuffer->reset();
-        }
+        commandBuffer->reset();
         std::lock_guard<std::mutex> lock(m_mutex);
         m_commandBuffersPool.splice(m_commandBuffersPool.end(), retired, current);
     }
@@ -2127,12 +2105,8 @@ void CommandQueueImpl::retireCommandBuffers()
     }
 
     // Delete deferred resources that are no longer in use by the GPU.
-    {
-        ZoneScopedN("rhi.retire.deferredDeletes"); // TEMP-TRACY-SUBMIT
-        executeDeferredDeletes();
-    }
+    executeDeferredDeletes();
 
-    ZoneNamedN(retireEvict, "rhi.retire.evict", true); // TEMP-TRACY-SUBMIT
     evictParameterBlockSets(lastFinishedID);
 
     // Flush all device heaps
@@ -2165,13 +2139,10 @@ static const uint64_t kParameterBlockSetRetainSubmits = 64;
 
 void CommandQueueImpl::evictParameterBlockSets(uint64_t lastFinishedID)
 {
-    ZoneScopedN("rhi.pbq.sweep"); // TEMP-TRACY
     std::vector<RefPtr<CachedParameterBlock>> evicted;
 
     {
-        TracyCZoneN(rhiPbqSweepLockWait, "rhi.pbq.lockWait", 1); // TEMP-TRACY
         std::lock_guard<std::mutex> lock(m_parameterBlockCacheMutex);
-        TracyCZoneEnd(rhiPbqSweepLockWait); // TEMP-TRACY
 
         if (lastFinishedID < m_nextParameterBlockSweepID)
         {
@@ -2236,7 +2207,6 @@ Result CommandQueueImpl::submit(const SubmitDesc& desc)
     // Held through vkQueueSubmit: VkQueue is externally synchronized, and the tracking
     // semaphore must be signaled with strictly increasing values.
     std::unique_lock<std::mutex> lock(m_mutex);
-    ZoneNamedN(submitLocked, "rhi.submit.locked", true); // TEMP-TRACY-SUBMIT
 
     // Increment last submitted ID which is used to track command buffer completion.
     ++m_lastSubmittedID;
@@ -2426,7 +2396,6 @@ Result CommandEncoderImpl::init()
 
 Result CommandEncoderImpl::getBindingData(RootShaderObject* rootObject, BindingData*& outBindingData)
 {
-    ZoneScopedN("rhi.getBindingData"); // TEMP-TRACY
     BindingDataBuilder builder;
     builder.m_device = getDevice<DeviceImpl>();
     builder.m_allocator = &m_commandBuffer->m_allocator;

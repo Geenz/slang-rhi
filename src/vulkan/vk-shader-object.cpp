@@ -11,8 +11,6 @@
 #include "../state-tracking.h"
 
 #include <string>
-#include <tracy/Tracy.hpp> // TEMP-TRACY
-#include <tracy/TracyC.h> // TEMP-TRACY
 
 namespace rhi::vk {
 
@@ -65,7 +63,6 @@ static uint64_t computeRootBindingKey(RootShaderObject* rootObject)
 
 inline void writeDescriptor(DeviceImpl* device, const VkWriteDescriptorSet& write)
 {
-    ZoneScopedN("rhi.descWrite"); // TEMP-TRACY
     device->m_api.vkUpdateDescriptorSets(device->m_device, 1, &write, 0, nullptr);
 }
 
@@ -333,7 +330,6 @@ Result BindingDataBuilder::bindAsRoot(
         return SLANG_OK;
     }
 
-    ZoneNamedN(rhiZoneRootBuild, "rhi.root.build", true); // TEMP-TRACY
     // TODO(shaderobject): we should count number of buffers/textures in the layout and allocate appropriately
     // For now we use a fixed starting capacity and grow as needed.
     m_bindingData->bufferStateCapacity = 1024;
@@ -887,7 +883,6 @@ bool BindingDataBuilder::reuseRootBinding(
     VkBuffer ordinaryDataBuffer
 )
 {
-    ZoneScopedN("rhi.root.reuse"); // TEMP-TRACY
     auto it = m_bindingCache->rootBindings.find(shaderObject);
     if (it == m_bindingCache->rootBindings.end())
         return false;
@@ -969,7 +964,6 @@ bool BindingDataBuilder::reuseParameterBlock(
     uint64_t version
 )
 {
-    ZoneScopedN("rhi.pb.reuse"); // TEMP-TRACY
     for (const ParameterBlockCacheEntry& entry : m_bindingCache->parameterBlocks)
     {
         if (entry.object != shaderObject || entry.layout != specializedLayout || entry.version != version)
@@ -1071,10 +1065,7 @@ CachedParameterBlock::~CachedParameterBlock()
 {
     if (m_descriptorSet.handle != VK_NULL_HANDLE)
     {
-        ZoneScopedN("rhi.pbq.free"); // TEMP-TRACY
-        TracyCZoneN(rhiPbqFreeLockWait, "rhi.pbq.lockWait", 1); // TEMP-TRACY
         std::lock_guard<std::mutex> lock(m_queue->m_parameterBlockCacheMutex);
-        TracyCZoneEnd(rhiPbqFreeLockWait); // TEMP-TRACY
         m_queue->m_parameterBlockSetAllocator.free(m_descriptorSet);
     }
 }
@@ -1125,7 +1116,6 @@ Result BindingDataBuilder::bindAsParameterBlock(
         }
     }
 
-    ZoneNamedN(rhiZonePbBuild, "rhi.pb.build", true); // TEMP-TRACY
     const uint32_t pushConstantCount = m_bindingData->pushConstantCount;
 
     // Note: Interface-type binding handling has been simplified
@@ -1173,9 +1163,7 @@ Result BindingDataBuilder::bindSharedParameterBlock(
     RefPtr<CachedParameterBlock> entry;
 
     {
-        TracyCZoneN(rhiPbqLookupLockWait, "rhi.pbq.lockWait", 1); // TEMP-TRACY
         std::lock_guard<std::mutex> lock(m_queue->m_parameterBlockCacheMutex);
-        TracyCZoneEnd(rhiPbqLookupLockWait); // TEMP-TRACY
 
         auto contentIt = m_queue->m_parameterBlockContents.find(shaderObject);
 
@@ -1204,18 +1192,13 @@ Result BindingDataBuilder::bindSharedParameterBlock(
 
     if (!haveContentHash)
     {
-        {
-            ZoneNamedN(rhiZonePbqHash, "rhi.pbq.hash", true); // TEMP-TRACY
-            contentHash = hashSlots(shaderObject);
-        }
+        contentHash = hashSlots(shaderObject);
 
         key = specializedLayout->m_ownSetIdentity;
         hash_combine(key, contentHash);
 
         {
-            TracyCZoneN(rhiPbqStoreLockWait, "rhi.pbq.lockWait", 1); // TEMP-TRACY
             std::lock_guard<std::mutex> lock(m_queue->m_parameterBlockCacheMutex);
-            TracyCZoneEnd(rhiPbqStoreLockWait); // TEMP-TRACY
 
             ParameterBlockContent& content = m_queue->m_parameterBlockContents[shaderObject];
             content = {shaderObject->m_uid, shaderObject->m_version, contentHash, stamp};
@@ -1232,7 +1215,6 @@ Result BindingDataBuilder::bindSharedParameterBlock(
 
     if (entry)
     {
-        ZoneNamedN(rhiZonePbqHit, "rhi.pbq.hit", true); // TEMP-TRACY
         m_bindingData->descriptorSets[m_bindingData->descriptorSetCount++] = entry->m_descriptorSet.handle;
 
         writeCachedBlock(this, entry.get());
@@ -1242,13 +1224,10 @@ Result BindingDataBuilder::bindSharedParameterBlock(
         return SLANG_OK;
     }
 
-    ZoneNamedN(rhiZonePbqMiss, "rhi.pbq.miss", true); // TEMP-TRACY
     VulkanDescriptorSet descriptorSet = {};
 
     {
-        TracyCZoneN(rhiPbqAllocLockWait, "rhi.pbq.lockWait", 1); // TEMP-TRACY
         std::lock_guard<std::mutex> lock(m_queue->m_parameterBlockCacheMutex);
-        TracyCZoneEnd(rhiPbqAllocLockWait); // TEMP-TRACY
 
         descriptorSet = m_queue->m_parameterBlockSetAllocator.allocate(
             specializedLayout->getOwnDescriptorSets()[0].descriptorSetLayout
@@ -1300,9 +1279,7 @@ Result BindingDataBuilder::bindSharedParameterBlock(
     RefPtr<CachedParameterBlock> replaced;
 
     {
-        TracyCZoneN(rhiPbqPublishLockWait, "rhi.pbq.lockWait", 1); // TEMP-TRACY
         std::lock_guard<std::mutex> lock(m_queue->m_parameterBlockCacheMutex);
-        TracyCZoneEnd(rhiPbqPublishLockWait); // TEMP-TRACY
 
         RefPtr<CachedParameterBlock>& cached = m_queue->m_parameterBlockSets[uint64_t(key)];
         replaced = cached;

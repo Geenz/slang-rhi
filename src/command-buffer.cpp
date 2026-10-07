@@ -4,7 +4,6 @@
 #include "device.h"
 #include "format-conversion.h"
 #include "pipeline-resolver.h"
-#include <tracy/Tracy.hpp> // TEMP-TRACY
 
 namespace rhi {
 
@@ -26,13 +25,9 @@ RenderPassEncoder::RenderPassEncoder(CommandEncoder* commandEncoder)
 
 void RenderPassEncoder::writeRenderState()
 {
-    ZoneScopedN("rhi.writeRenderState"); // TEMP-TRACY
     commands::SetRenderState cmd;
-    { // TEMP-TRACY
-    ZoneNamedN(rhiZoneCopyState, "rhi.rs.copyState", true); // TEMP-TRACY
     cmd.state = m_renderState;
     cmd.pipeline = m_pipeline;
-    } // TEMP-TRACY
     m_commandEncoder->getPipelineSpecializationArgs(m_pipeline, m_rootObject, cmd.specializationArgs);
 
     uint64_t compositeVersion = m_rootObject->getCompositeVersion();

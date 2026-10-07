@@ -2,7 +2,6 @@
 #include "vk-utils.h"
 
 #include "core/static_vector.h"
-#include <tracy/Tracy.hpp> // TEMP-TRACY
 
 namespace rhi::vk {
 
@@ -50,7 +49,6 @@ VkDescriptorPool DescriptorSetAllocator::newPool()
 
 VulkanDescriptorSet DescriptorSetAllocator::allocate(VkDescriptorSetLayout layout)
 {
-    ZoneScopedN("rhi.descSetAlloc"); // TEMP-TRACY
     VulkanDescriptorSet rs = {};
     VkDescriptorSetAllocateInfo allocInfo = {};
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
